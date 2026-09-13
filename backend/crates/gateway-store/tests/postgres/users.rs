@@ -828,7 +828,12 @@ async fn reset_serializes_with_settlement_and_keeps_the_cutoff_after_lock_acquis
 
 #[tokio::test]
 async fn continuous_budget_migration_rebuilds_new_periods_and_refuses_missing_ledger() {
-    let Some(db) = TestDatabase::create_at("budget_period_upgrade", 8).await else {
+    let Some(db) = TestDatabase::create_at(
+        "budget_period_upgrade",
+        super::migrations::USER_DELETION_VERSION,
+    )
+    .await
+    else {
         return;
     };
     // 旧窗口从六天前起算，新窗口从三天前起算；五天前的费用保留在账本但不计入新周期。

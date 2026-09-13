@@ -19,6 +19,7 @@ mod client_keys;
 mod execution;
 mod execution_buffer;
 mod health;
+mod migrations;
 mod observability;
 mod ops_events;
 mod provider_accounts;
@@ -62,6 +63,20 @@ impl TestDatabase {
     }
 
     pub(super) async fn create_at(label: &str, version: i64) -> Option<Self> {
+        let migrator = sqlx::migrate::Migrator::with_migrations(
+            TEST_MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .cloned()
+                .collect(),
+        );
+        Self::create_with_migrator(label, &migrator).await
+    }
+
+    pub(super) async fn create_with_migrator(
+        label: &str,
+        migrator: &sqlx::migrate::Migrator,
+    ) -> Option<Self> {
         let database_url = crate::support::test_env("CPR_TEST_DATABASE_URL")?;
         let schema = format!("cpr_store_{label}_{}", Uuid::new_v4().simple());
         let admin = PgPoolOptions::new()
@@ -89,16 +104,7 @@ impl TestDatabase {
             .connect(&database_url)
             .await
             .expect("connect isolated test schema");
-        sqlx::migrate::Migrator::with_migrations(
-            TEST_MIGRATOR
-                .iter()
-                .filter(|migration| migration.version <= version)
-                .cloned()
-                .collect(),
-        )
-        .run(&pool)
-        .await
-        .expect("apply test migrations");
+        migrator.run(&pool).await.expect("apply test migrations");
         sqlx::query("insert into admin_users(id,password_hash,created_at,updated_at) values('test-owner','test-only-hash',now(),now())")
             .execute(&pool).await.expect("seed test key owner");
         Some(Self {
