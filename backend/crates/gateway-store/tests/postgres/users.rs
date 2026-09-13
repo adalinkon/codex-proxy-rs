@@ -77,6 +77,33 @@ async fn owned_key_identity_updates_preserve_policy_and_check_owner() {
     assert_eq!(key.budget.limits.weekly_usd.canonical(), "8");
     assert_eq!(key.limits.max_concurrency, 3);
     assert_eq!(key.limits.requests_per_minute, 12);
+    create_key(&db, "bob", "reserved-name").await;
+    let revision: i64 = sqlx::query_scalar("select config_revision from runtime_settings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let error = keys
+        .mutate_owned_key(
+            "alice",
+            OwnedKeyMutation::UpdateIdentity {
+                id: ClientApiKeyId::new("identity-key").unwrap(),
+                name: "  RESERVED-NAME  ".into(),
+                label: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        gateway_admin::ports::store::AdminStoreErrorKind::DuplicateName
+    );
+    let unchanged: (String, i64) = sqlx::query_as(
+        "select name, (select config_revision from runtime_settings) from client_api_keys where id='identity-key'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, ("renamed".to_owned(), revision));
     let mut disabled = policy("alice", "5", "10");
     disabled.enabled = false;
     users.save(disabled, None).await.unwrap();
@@ -534,6 +561,31 @@ async fn migration_assigns_legacy_keys_and_preserves_password_limits_and_recorde
 }
 
 #[tokio::test]
+async fn upstream_custom_key_migration_upgrades_to_user_ownership_without_changing_credentials() {
+    let Some(db) = TestDatabase::create_at("upstream_user_upgrade", 6).await else {
+        return;
+    };
+    sqlx::query(
+        "insert into client_api_keys(id,name,key,created_at,updated_at)
+         values('upstream-custom','Upstream custom','q',now(),now())",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    super::TEST_MIGRATOR.run(&db.pool).await.unwrap();
+    let secret = PgAdminClientKeyStore::new(db.pool.clone())
+        .reveal_client_key(&ClientApiKeyId::new("upstream-custom").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(secret.expose_for_response(), "q");
+    assert_eq!(secret.record.user_id, "test-owner");
+    assert!(secret.record.prefix.is_empty());
+    assert!(secret.record.budget.weekly_resets_at.is_some());
+    db.close().await;
+}
+
+#[tokio::test]
 async fn fixed_budget_periods_follow_creation_without_any_requests() {
     let Some(db) = TestDatabase::create("fixed_budget_periods").await else {
         return;
@@ -776,7 +828,7 @@ async fn reset_serializes_with_settlement_and_keeps_the_cutoff_after_lock_acquis
 
 #[tokio::test]
 async fn continuous_budget_migration_rebuilds_new_periods_and_refuses_missing_ledger() {
-    let Some(db) = TestDatabase::create_at("budget_period_upgrade", 7).await else {
+    let Some(db) = TestDatabase::create_at("budget_period_upgrade", 8).await else {
         return;
     };
     // 旧窗口从六天前起算，新窗口从三天前起算；五天前的费用保留在账本但不计入新周期。

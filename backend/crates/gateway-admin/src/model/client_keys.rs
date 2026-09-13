@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 
 use gateway_core::{
     engine::budget::{ClientBudgetLimits, ClientBudgetStatus},
-    policy::{ClientApiKeyId, RateLimits},
+    policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits},
     routing::{AccountGroupId, ProviderKind},
 };
 
@@ -147,6 +147,7 @@ impl fmt::Debug for ClientKeySecret {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateClientKey {
     pub user_id: Option<String>,
+    pub custom_key: Option<PlaintextClientApiKey>,
     pub name: String,
     pub label: Option<String>,
     pub group_ids: Vec<AccountGroupId>,
