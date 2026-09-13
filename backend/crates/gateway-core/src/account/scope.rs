@@ -210,6 +210,15 @@ pub enum ClientRoutingScope {
 }
 
 impl ClientRoutingScope {
+    /// 用户授权为空时仍保留受限语义，不能退回全部账号。
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::Restricted {
+            bound_groups: Arc::from([]),
+            enabled_group_ids: Arc::new(BTreeSet::new()),
+            provider_kinds: Arc::new(BTreeSet::new()),
+        }
+    }
     #[must_use]
     pub fn all_accounts() -> Self {
         Self::AllAccounts

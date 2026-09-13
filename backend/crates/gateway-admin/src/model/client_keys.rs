@@ -77,6 +77,7 @@ pub struct ClientKeyCursor {
 /// Client Key 列表查询。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeyListQuery {
+    pub user_id: Option<String>,
     pub cursor: Option<ClientKeyCursor>,
     pub page_size: ClientKeyPageSize,
     pub search: Option<String>,
@@ -86,6 +87,7 @@ pub struct ClientKeyListQuery {
 /// 不含完整明文 Key 的管理投影。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeyRecord {
+    pub user_id: String,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -144,6 +146,7 @@ impl fmt::Debug for ClientKeySecret {
 /// API 提交的 Client Key 创建命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateClientKey {
+    pub user_id: Option<String>,
     pub name: String,
     pub label: Option<String>,
     pub group_ids: Vec<AccountGroupId>,
@@ -154,6 +157,7 @@ pub struct CreateClientKey {
 /// 管理用例生成 ID 与明文后的持久化命令。
 #[derive(Clone, PartialEq, Eq)]
 pub struct NewClientKey {
+    pub user_id: Option<String>,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -198,6 +202,18 @@ pub struct SetClientKeyEnabled {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteClientKey {
     pub id: ClientApiKeyId,
+}
+
+#[derive(Debug, Clone)]
+pub enum OwnedKeyMutation {
+    Create(NewClientKey),
+    UpdateIdentity {
+        id: ClientApiKeyId,
+        name: String,
+        label: Option<String>,
+    },
+    SetEnabled(SetClientKeyEnabled),
+    Delete(DeleteClientKey),
 }
 
 /// Client Key 创建结果；完整明文仅存在于该一次性结果中。

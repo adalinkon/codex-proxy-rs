@@ -32,6 +32,7 @@ pub struct ClientAdmissionRunningRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAdmissionRecovery {
+    pub user_id: Option<String>,
     pub client_api_key_ref: String,
     pub recent_requests: Vec<ClientAdmissionRecentRequest>,
     pub running_requests: Vec<ClientAdmissionRunningRequest>,
@@ -63,8 +64,18 @@ impl ClientAdmissionRecoveryRepository for PgClientAdmissionRecoveryRepository {
         &self,
         window_started_at: DateTime<Utc>,
     ) -> StoreResult<Vec<ClientAdmissionRecovery>> {
-        let rows = sqlx::query_as::<_, (String, String, DateTime<Utc>, DateTime<Utc>, String)>(
-            "select client_api_key_ref, id, started_at, deadline_at, outcome
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                String,
+                Option<String>,
+            ),
+        >(
+            "select client_api_key_ref, id, started_at, deadline_at, outcome, user_id
              from model_requests
              where started_at >= $1 or outcome = 'running'
              order by client_api_key_ref, started_at, id",
@@ -74,10 +85,13 @@ impl ClientAdmissionRecoveryRepository for PgClientAdmissionRecoveryRepository {
         .await
         .map_err(|_| postgres_unavailable("load client admission recovery"))?;
         let mut recoveries = BTreeMap::<String, ClientAdmissionRecovery>::new();
-        for (client_api_key_ref, model_request_id, started_at, deadline_at, outcome) in rows {
+        for (client_api_key_ref, model_request_id, started_at, deadline_at, outcome, user_id) in
+            rows
+        {
             let recovery = recoveries
                 .entry(client_api_key_ref.clone())
                 .or_insert_with(|| ClientAdmissionRecovery {
+                    user_id,
                     client_api_key_ref,
                     recent_requests: Vec::new(),
                     running_requests: Vec::new(),
@@ -138,6 +152,7 @@ impl ClientAdmissionRecoveryPort for PgClientAdmissionRecoveryRepository {
                         })
                         .collect::<Result<Vec<_>, ClientAdmissionError>>()?;
                     Ok(CoreAdmissionRecovery {
+                        user_id: recovery.user_id,
                         client_api_key_id,
                         recent_requests,
                         running_requests,

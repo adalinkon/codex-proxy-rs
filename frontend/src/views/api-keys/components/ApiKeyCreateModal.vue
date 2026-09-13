@@ -18,6 +18,7 @@ const props = defineProps<{
   editing: boolean
   createdKey: string
   saving: boolean
+  policyReadonly?: boolean
 }>()
 const emit = defineEmits<{
   save: []
@@ -52,7 +53,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         />
       </BaseFormItem>
 
-      <BaseFormItem label="标签（可选）">
+      <BaseFormItem v-if="!policyReadonly || editing" label="标签（可选）">
         <BaseInput
           v-model="form.label"
           aria-label="标签（可选）"
@@ -61,7 +62,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         />
       </BaseFormItem>
 
-      <BaseFormItem label="分组">
+      <BaseFormItem v-if="!policyReadonly" label="分组">
         <AccountGroupCheckboxGrid
           v-model="form.groupIds"
           :groups="groups"
@@ -70,7 +71,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         />
       </BaseFormItem>
 
-      <div class="grid gap-6 sm:grid-cols-2">
+      <div v-if="!policyReadonly" class="grid gap-6 sm:grid-cols-2">
         <BaseFormItem label="日限额">
           <BaseInput
             v-model="form.dailyLimitUsd"
@@ -103,7 +104,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         </BaseFormItem>
       </div>
 
-      <div class="grid gap-6 sm:grid-cols-2">
+      <div v-if="!policyReadonly" class="grid gap-6 sm:grid-cols-2">
         <BaseFormItem label="最大并发">
           <BaseInput
             v-model="form.maxConcurrency"

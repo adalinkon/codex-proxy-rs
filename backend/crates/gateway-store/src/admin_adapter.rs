@@ -3,6 +3,7 @@
 use super::*;
 
 pub(crate) struct AdminAuthStoreAdapter {
+    pub(crate) users: postgres::PgUserRepository,
     pub(crate) security: postgres::PgAdminSecurityAuditRepository,
     pub(crate) settings: postgres::PgRuntimeSettingsRepository,
     pub(crate) state: redis::RedisAdminAuthStateRepository,
@@ -10,6 +11,53 @@ pub(crate) struct AdminAuthStoreAdapter {
 
 pub(crate) struct AdminSettingsStoreAdapter {
     pub(crate) control_plane: postgres::PgControlPlaneRepository,
+}
+
+pub(crate) struct AdminRequestUsageStoreAdapter {
+    pub(crate) pool: sqlx::PgPool,
+    pub(crate) admissions: redis::RedisClientAdmissionRepository,
+}
+
+#[async_trait::async_trait]
+impl gateway_admin::ports::store::RequestUsageStore for AdminRequestUsageStoreAdapter {
+    async fn request_usage(
+        &self,
+        scope: gateway_admin::model::users::RequestUsageScope,
+        ids: Vec<String>,
+    ) -> AdminStoreResult<Vec<gateway_admin::model::users::RequestUsage>> {
+        use gateway_admin::model::users::{RequestUsage, RequestUsageScope};
+        let users = matches!(scope, RequestUsageScope::Users);
+        let allowed = match scope {
+            RequestUsageScope::Users => sqlx::query_scalar::<_,String>("select id from admin_users where id=any($1) and deleted_at is null")
+                .bind(&ids).fetch_all(&self.pool).await,
+            RequestUsageScope::Keys { user_id } => sqlx::query_scalar::<_,String>("select id from client_api_keys where id=any($1) and ($2::text is null or user_id=$2)")
+                .bind(&ids).bind(user_id).fetch_all(&self.pool).await,
+        }.map_err(|_| gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,"request usage","resource lookup unavailable"))?;
+        if allowed.len() != ids.len() {
+            return Err(gateway_admin::ports::store::AdminStoreError::new(
+                gateway_admin::ports::store::AdminStoreErrorKind::NotFound,
+                "request usage",
+                "resource not found",
+            ));
+        }
+        let counts = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.admissions.request_counts(&ids, users),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        Ok(ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| RequestUsage {
+                id,
+                current_concurrency: counts.as_ref().map(|rows| rows[index].0),
+                current_rpm: counts.as_ref().map(|rows| rows[index].1),
+            })
+            .collect())
+    }
 }
 
 #[async_trait::async_trait]
@@ -186,6 +234,55 @@ pub(crate) fn store_model_mappings(
 
 #[async_trait::async_trait]
 impl AuthStore for AdminAuthStoreAdapter {
+    async fn load_user_identity(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserIdentity>> {
+        self.users.load_identity(id).await
+    }
+
+    async fn load_user(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserRecord>> {
+        self.users.load(id).await
+    }
+
+    async fn list_users(&self) -> AdminStoreResult<Vec<gateway_admin::model::users::UserRecord>> {
+        self.users.list().await
+    }
+
+    async fn delete_user(&self, id: &str) -> AdminStoreResult<gateway_admin::model::Revision> {
+        self.users.delete(id).await
+    }
+
+    async fn reset_user_budget(
+        &self,
+        id: &str,
+        operation_id: &str,
+    ) -> AdminStoreResult<chrono::DateTime<chrono::Utc>> {
+        self.users.reset_budget(id, operation_id).await
+    }
+
+    async fn save_user(
+        &self,
+        policy: gateway_admin::model::users::UserPolicyUpdate,
+        initial_hash: Option<&str>,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        self.users.save(policy, initial_hash).await
+    }
+
+    async fn change_password(
+        &self,
+        id: &str,
+        expected_hash: Option<&str>,
+        new_hash: &str,
+    ) -> AdminStoreResult<bool> {
+        self.users
+            .change_password(id, expected_hash, new_hash)
+            .await
+    }
+
     async fn load_password_hash(&self, admin_user_id: &str) -> AdminStoreResult<Option<String>> {
         postgres::AdminSecurityAuditRepository::password_hash(&self.security, admin_user_id)
             .await
@@ -219,6 +316,7 @@ impl AuthStore for AdminAuthStoreAdapter {
             .map(|session| {
                 session.map(|record| AdminSession {
                     admin_user_id: record.admin_user_id,
+                    auth_revision: record.auth_revision,
                     expires_at: record.expires_at,
                 })
             })
@@ -235,6 +333,7 @@ impl AuthStore for AdminAuthStoreAdapter {
             session_id,
             &redis::AdminSessionRecord {
                 admin_user_id: session.admin_user_id.clone(),
+                auth_revision: session.auth_revision,
                 expires_at: session.expires_at,
             },
         )
@@ -248,6 +347,7 @@ impl AuthStore for AdminAuthStoreAdapter {
             .map(|session| {
                 session.map(|record| AdminSession {
                     admin_user_id: record.admin_user_id,
+                    auth_revision: record.auth_revision,
                     expires_at: record.expires_at,
                 })
             })

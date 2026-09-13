@@ -968,6 +968,7 @@ async fn renaming_account_should_not_rewrite_historical_snapshots() {
 
 fn new_request(id: &str, started_at: DateTime<Utc>) -> NewModelRequest {
     NewModelRequest {
+        user_id: Some("test-owner".to_owned()),
         admission_decision_ms: None,
         id: id.to_owned(),
         client_api_key_id: None,
@@ -1098,8 +1099,8 @@ async fn finalize_request_without_client_status(
 
 async fn seed_api_key(pool: &PgPool, id: &str, name: &str, now: DateTime<Utc>) {
     sqlx::query(
-        "insert into client_api_keys (id, name, key, enabled, created_at, updated_at)
-         values ($1, $2, 'sk_' || $3, true, $4, $4)",
+        "insert into client_api_keys (user_id, id, name, key, enabled, created_at, updated_at)
+         values ('test-owner', $1, $2, 'sk_' || $3, true, $4, $4)",
     )
     .bind(id)
     .bind(name)

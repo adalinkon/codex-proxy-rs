@@ -44,6 +44,7 @@ pub(crate) const MAX_REDIS_EXACT_INTEGER: u64 = (1_u64 << 53) - 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminSessionRecord {
     pub admin_user_id: String,
+    pub auth_revision: i64,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -162,12 +163,15 @@ impl AdminAuthStateRepository for RedisAdminAuthStateRepository {
 #[serde(deny_unknown_fields)]
 struct AdminSessionWire {
     admin_user_id: String,
+    #[serde(default)]
+    auth_revision: i64,
     expires_at: String,
 }
 
 fn encode_admin_session(session: &AdminSessionRecord) -> StoreResult<String> {
     serde_json::to_string(&AdminSessionWire {
         admin_user_id: session.admin_user_id.clone(),
+        auth_revision: session.auth_revision,
         expires_at: session
             .expires_at
             .to_rfc3339_opts(SecondsFormat::Nanos, true),
@@ -184,6 +188,7 @@ fn decode_admin_session(value: &str) -> StoreResult<AdminSessionRecord> {
         .with_timezone(&Utc);
     Ok(AdminSessionRecord {
         admin_user_id: wire.admin_user_id,
+        auth_revision: wire.auth_revision,
         expires_at,
     })
 }

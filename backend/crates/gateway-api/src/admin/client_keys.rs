@@ -90,6 +90,7 @@ impl ListClientKeysQuery {
         let page_size = ClientKeyPageSize::new(self.limit.unwrap_or(DEFAULT_PAGE_SIZE))
             .map_err(|_| WireValidationError::new("limit"))?;
         Ok(ClientKeyListQuery {
+            user_id: None,
             cursor,
             page_size,
             search: search.filter(|search| !search.is_empty()),
@@ -146,6 +147,7 @@ impl ClientKeySort {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateClientKeyRequest {
+    user_id: Option<String>,
     name: String,
     label: Option<String>,
     group_ids: Vec<String>,
@@ -164,6 +166,7 @@ impl CreateClientKeyRequest {
         validate_limit(self.max_concurrency, "maxConcurrency")?;
         validate_limit(self.requests_per_minute, "requestsPerMinute")?;
         Ok(CreateClientKey {
+            user_id: self.user_id,
             name: self.name,
             label: self.label,
             group_ids,
@@ -260,6 +263,7 @@ impl ClientKeyMutationRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeyView {
     id: String,
+    user_id: String,
     name: String,
     label: Option<String>,
     routing_scope: &'static str,
@@ -298,6 +302,7 @@ impl From<ClientKeyRecord> for ClientKeyView {
         };
         Self {
             id: record.id.to_string(),
+            user_id: record.user_id,
             name: record.name,
             label: record.label,
             routing_scope,
@@ -333,6 +338,17 @@ impl From<ClientKeyRecord> for ClientKeyView {
     }
 }
 
+impl ClientKeyView {
+    pub(crate) fn owned(record: ClientKeyRecord) -> Self {
+        let inherited = record.groups.is_empty();
+        let mut view = Self::from(record);
+        if inherited {
+            view.routing_scope = "inherit";
+        }
+        view
+    }
+}
+
 /// Client Key 列表响应数据。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,19 +374,24 @@ impl TryFrom<ClientKeyPage> for ClientKeyListData {
     type Error = WireValidationError;
 
     fn try_from(page: ClientKeyPage) -> Result<Self, Self::Error> {
-        let next_cursor = page
-            .next_cursor
-            .map(wire_cursor)
-            .transpose()?
-            .as_ref()
-            .map(encode_client_key_cursor)
-            .transpose()?;
+        let next_cursor = encode_page_cursor(page.next_cursor)?;
         Ok(Self::new(
             page.items.into_iter().map(Into::into).collect(),
             next_cursor,
             page.total,
         ))
     }
+}
+
+pub(super) fn encode_page_cursor(
+    cursor: Option<ClientKeyCursor>,
+) -> Result<Option<String>, WireValidationError> {
+    cursor
+        .map(wire_cursor)
+        .transpose()?
+        .as_ref()
+        .map(encode_client_key_cursor)
+        .transpose()
 }
 
 /// Client Key 创建响应；完整值只允许出现在本次序列化结果中。

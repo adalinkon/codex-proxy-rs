@@ -27,6 +27,7 @@ export interface ApiKeyFormValue {
 }
 
 export function useApiKeyMutations(options: {
+  scope?: 'admin' | 'user'
   selectedIds: Ref<Set<string>>
   reload: () => Promise<unknown>
 }) {
@@ -75,7 +76,7 @@ export function useApiKeyMutations(options: {
   function requestSave() {
     if (!validateForm() || savingKey.value)
       return
-    if (form.value.groupIds.length === 0) {
+    if (options.scope !== 'user' && form.value.groupIds.length === 0) {
       showAllAccountsConfirm.value = true
       return
     }
@@ -104,10 +105,10 @@ export function useApiKeyMutations(options: {
         }
         const current = editingKey.value
         if (current) {
-          await updateApiKey({ id: current.id, ...payload })
+          await updateApiKey({ id: current.id, ...payload }, {}, options.scope)
         }
         else {
-          const result = await createApiKey(payload)
+          const result = await createApiKey(payload, {}, options.scope)
           createdKey.value = result.plaintextKey
           createdKeyName.value = payload.name
         }
@@ -166,7 +167,7 @@ export function useApiKeyMutations(options: {
 
     await deletingKeyAction.run(
       async () => {
-        await deleteApiKey({ id: keyId })
+        await deleteApiKey({ id: keyId }, {}, options.scope)
         const remaining = new Set(options.selectedIds.value)
         remaining.delete(keyId)
         options.selectedIds.value = remaining
@@ -187,7 +188,7 @@ export function useApiKeyMutations(options: {
       async () => {
         const deleteCount = options.selectedIds.value.size
         for (const keyId of [...options.selectedIds.value]) {
-          await deleteApiKey({ id: keyId })
+          await deleteApiKey({ id: keyId }, {}, options.scope)
           const remaining = new Set(options.selectedIds.value)
           remaining.delete(keyId)
           options.selectedIds.value = remaining
@@ -204,7 +205,7 @@ export function useApiKeyMutations(options: {
     await updatingStatusKeys.run(key.id, async () => {
       try {
         const mutation = key.enabled ? disableApiKey : enableApiKey
-        await mutation({ id: key.id })
+        await mutation({ id: key.id }, {}, options.scope)
         await options.reload()
         toast.success(key.enabled ? '已禁用' : '已启用')
       }
@@ -220,7 +221,7 @@ export function useApiKeyMutations(options: {
 
   async function revealPlaintextKey(apiKey: ApiKeyRow) {
     try {
-      const result = await revealingKeys.run(apiKey.id, () => revealApiKey({ id: apiKey.id }))
+      const result = await revealingKeys.run(apiKey.id, () => revealApiKey({ id: apiKey.id }, {}, options.scope))
       if (!result)
         return undefined
       if (!result.plaintextKey) {

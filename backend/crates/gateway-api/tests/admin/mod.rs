@@ -84,6 +84,7 @@ mod observability;
 mod proxies;
 mod settings;
 mod system;
+mod users;
 mod wire;
 
 pub(super) struct AdminTestFixture {
@@ -91,6 +92,7 @@ pub(super) struct AdminTestFixture {
     pub auth: Arc<MemoryAuthStore>,
     pub settings: Arc<MemorySettingsStore>,
     pub usage_records: Arc<Mutex<Vec<UsageListRecord>>>,
+    pub usage_filters: Arc<Mutex<Vec<UsageFilter>>>,
     pub usage_detail: Arc<Mutex<Option<UsageDetail>>>,
     pub diagnostics: Arc<Mutex<Vec<DiagnosticObservation>>>,
     pub ops_errors: Arc<Mutex<Vec<OpsError>>>,
@@ -112,6 +114,7 @@ impl AdminTestFixture {
         let client_keys = Arc::new(MemoryClientKeyStore);
         let account_groups = Arc::new(MemoryAccountGroupStore::new());
         let usage_records = Arc::new(Mutex::new(Vec::new()));
+        let usage_filters = Arc::new(Mutex::new(Vec::new()));
         let usage_detail = Arc::new(Mutex::new(None));
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let ops_errors = Arc::new(Mutex::new(Vec::new()));
@@ -120,6 +123,7 @@ impl AdminTestFixture {
         let provider_error = Arc::new(Mutex::new(None));
         let account = Arc::new(Mutex::new(None));
         let unused = Arc::new(UnusedStore {
+            usage_filters: Arc::clone(&usage_filters),
             usage_records: Arc::clone(&usage_records),
             usage_detail: Arc::clone(&usage_detail),
             diagnostics: Arc::clone(&diagnostics),
@@ -140,7 +144,8 @@ impl AdminTestFixture {
             unused,
             settings.clone(),
             gateway_admin::ports::backup::BackupStorePorts::disabled(),
-        );
+        )
+        .with_request_usage(Arc::new(users::TestRequestUsageStore));
         let providers: Vec<Arc<dyn ProviderAdmin>> = vec![
             Arc::new(UnusedProvider::new("openai", Arc::clone(&provider_error))),
             Arc::new(UnusedProvider::new("xai", Arc::clone(&provider_error))),
@@ -165,6 +170,7 @@ impl AdminTestFixture {
             auth,
             settings,
             usage_records,
+            usage_filters,
             usage_detail,
             diagnostics,
             ops_errors,
@@ -213,8 +219,24 @@ impl AdminSessionState for AdminTestState {
     }
 }
 
+fn test_user(id: &str) -> gateway_admin::model::users::UserRecord {
+    gateway_admin::model::users::UserRecord {
+        identity: gateway_admin::model::users::UserIdentity {
+            id: id.to_owned(),
+            role: gateway_admin::model::users::UserRole::Admin,
+            enabled: true,
+            auth_revision: 0,
+        },
+        all_groups: true,
+        groups: Vec::new(),
+        limits: Default::default(),
+        budget: Default::default(),
+        key_count: 0,
+    }
+}
+
 pub(super) struct MemoryAuthStore {
-    password_hash: Mutex<Option<String>>,
+    users: Mutex<BTreeMap<String, (gateway_admin::model::users::UserRecord, String)>>,
     sessions: Mutex<BTreeMap<String, AdminSession>>,
     audits: Mutex<Vec<AdminAuditEvent>>,
     api_key: Arc<Mutex<Option<AdminApiKey>>>,
@@ -224,7 +246,7 @@ pub(super) struct MemoryAuthStore {
 impl MemoryAuthStore {
     fn new(api_key: Arc<Mutex<Option<AdminApiKey>>>) -> Self {
         Self {
-            password_hash: Mutex::new(None),
+            users: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(BTreeMap::new()),
             audits: Mutex::new(Vec::new()),
             api_key,
@@ -237,6 +259,7 @@ impl MemoryAuthStore {
             session_id.to_owned(),
             AdminSession {
                 admin_user_id: "admin_1".to_owned(),
+                auth_revision: 0,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         );
@@ -261,20 +284,116 @@ impl MemoryAuthStore {
 
 #[async_trait]
 impl AuthStore for MemoryAuthStore {
-    async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
-        Ok(self.password_hash.lock().expect("password hash").clone())
+    async fn load_user_identity(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserIdentity>> {
+        Ok(self
+            .users
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|(user, _)| user.identity.clone()))
+    }
+
+    async fn reset_user_budget(
+        &self,
+        id: &str,
+        _: &str,
+    ) -> AdminStoreResult<chrono::DateTime<chrono::Utc>> {
+        let mut users = self.users.lock().unwrap();
+        let (user, _) = users.get_mut(id).ok_or_else(|| {
+            AdminStoreError::new(AdminStoreErrorKind::NotFound, "user", "user not found")
+        })?;
+        user.budget.daily_used_usd = Default::default();
+        user.budget.weekly_used_usd = Default::default();
+        Ok(chrono::Utc::now())
+    }
+    async fn delete_user(&self, id: &str) -> AdminStoreResult<Revision> {
+        self.users.lock().unwrap().remove(id).ok_or_else(|| {
+            AdminStoreError::new(AdminStoreErrorKind::NotFound, "user", "user not found")
+        })?;
+        Ok(Revision::new(2).unwrap())
+    }
+    async fn load_user(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserRecord>> {
+        Ok(self
+            .users
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|(user, _)| user.clone()))
+    }
+    async fn list_users(&self) -> AdminStoreResult<Vec<gateway_admin::model::users::UserRecord>> {
+        Ok(self
+            .users
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(user, _)| user.clone())
+            .collect())
+    }
+    async fn save_user(
+        &self,
+        policy: gateway_admin::model::users::UserPolicyUpdate,
+        hash: Option<&str>,
+    ) -> AdminStoreResult<Revision> {
+        let mut users = self.users.lock().unwrap();
+        let id = policy.id.clone();
+        let (user, password) = users
+            .entry(id.clone())
+            .or_insert_with(|| (test_user(&id), String::new()));
+        if user.identity.enabled != policy.enabled || user.identity.role != policy.role {
+            user.identity.auth_revision += 1;
+        }
+        user.identity.enabled = policy.enabled;
+        user.identity.role = policy.role;
+        user.all_groups = policy.all_groups;
+        user.limits = policy.limits;
+        user.budget.limits = policy.budget;
+        if let Some(hash) = hash {
+            *password = hash.to_owned();
+        }
+        Ok(Revision::new(2).unwrap())
+    }
+    async fn change_password(
+        &self,
+        id: &str,
+        expected: Option<&str>,
+        hash: &str,
+    ) -> AdminStoreResult<bool> {
+        let mut users = self.users.lock().unwrap();
+        let Some((user, password)) = users.get_mut(id) else {
+            return Ok(false);
+        };
+        if expected.is_some_and(|expected| expected != password) {
+            return Ok(false);
+        }
+        *password = hash.to_owned();
+        user.identity.auth_revision += 1;
+        Ok(true)
+    }
+    async fn load_password_hash(&self, id: &str) -> AdminStoreResult<Option<String>> {
+        Ok(self
+            .users
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|(_, hash)| hash.clone()))
     }
 
     async fn create_password_hash_if_absent(
         &self,
-        _: &str,
+        id: &str,
         password_hash: &str,
     ) -> AdminStoreResult<bool> {
-        let mut stored = self.password_hash.lock().expect("password hash");
-        if stored.is_some() {
+        let mut stored = self.users.lock().unwrap();
+        if stored.contains_key(id) {
             return Ok(false);
         }
-        *stored = Some(password_hash.to_owned());
+        stored.insert(id.to_owned(), (test_user(id), password_hash.to_owned()));
         Ok(true)
     }
 
@@ -636,6 +755,13 @@ fn mutation(
 
 #[async_trait]
 impl ClientKeyStore for MemoryClientKeyStore {
+    async fn mutate_owned_key(
+        &self,
+        _: &str,
+        _: gateway_admin::model::client_keys::OwnedKeyMutation,
+    ) -> AdminStoreResult<Revision> {
+        unreachable!()
+    }
     async fn list_client_keys(&self, _: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage> {
         Ok(ClientKeyPage {
             config_revision: Revision::new(1).expect("revision"),
@@ -652,6 +778,7 @@ impl ClientKeyStore for MemoryClientKeyStore {
         let now = Utc::now();
         Ok(Some(ClientKeySecret::new(
             ClientKeyRecord {
+                user_id: "admin_1".to_owned(),
                 budget: Default::default(),
                 id: id.clone(),
                 name: "revealed".to_owned(),
@@ -703,6 +830,7 @@ impl ClientKeyStore for MemoryClientKeyStore {
 }
 
 struct UnusedStore {
+    usage_filters: Arc<Mutex<Vec<UsageFilter>>>,
     usage_records: Arc<Mutex<Vec<UsageListRecord>>>,
     usage_detail: Arc<Mutex<Option<UsageDetail>>>,
     diagnostics: Arc<Mutex<Vec<DiagnosticObservation>>>,
@@ -886,22 +1014,28 @@ impl ObservabilityStore for UnusedStore {
     async fn usage_trend(
         &self,
         _: TimeRange,
-        _: UsageFilter,
+        filter: UsageFilter,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
+        self.usage_filters.lock().unwrap().push(filter);
         Err(unavailable("usage trend"))
     }
 
     fn usage_calculated_billing_facts(
         &self,
         _: TimeRange,
-        _: UsageFilter,
+        filter: UsageFilter,
     ) -> gateway_admin::ports::store::UsageCalculatedBillingStream<'_> {
+        self.usage_filters.lock().unwrap().push(filter);
         Box::pin(futures::stream::once(async {
             Err(unavailable("usage billing facts"))
         }))
     }
 
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage> {
+        self.usage_filters
+            .lock()
+            .unwrap()
+            .push(query.filter.clone());
         let items = self.usage_records.lock().expect("usage records").clone();
         Ok(UsagePage {
             current_page: query.current_page,
@@ -919,16 +1053,22 @@ impl ObservabilityStore for UnusedStore {
             .ok_or_else(|| unavailable("usage detail"))
     }
 
-    async fn usage_summary(&self, _: TimeRange, _: UsageFilter) -> AdminStoreResult<UsageOverview> {
+    async fn usage_summary(
+        &self,
+        _: TimeRange,
+        filter: UsageFilter,
+    ) -> AdminStoreResult<UsageOverview> {
+        self.usage_filters.lock().unwrap().push(filter);
         Err(unavailable("usage summary"))
     }
 
     async fn usage_diagnostics(
         &self,
         _: TimeRange,
-        _: UsageFilter,
+        filter: UsageFilter,
         _: DiagnosticDimension,
     ) -> AdminStoreResult<Vec<DiagnosticObservation>> {
+        self.usage_filters.lock().unwrap().push(filter);
         Ok(self.diagnostics.lock().expect("diagnostics").clone())
     }
 

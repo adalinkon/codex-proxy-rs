@@ -7,6 +7,7 @@ export interface LoginResponse {
 
 export interface AuthStatusResponse {
   authenticated: boolean
+  user: { id: string, username: string, role: 'admin' | 'user' } | null
 }
 
 export interface LogoutResponse {

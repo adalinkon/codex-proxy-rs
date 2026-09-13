@@ -5,12 +5,11 @@ import { computed, shallowRef } from 'vue'
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
-import BaseMotionIcon from '@/components/base/BaseMotionIcon.vue'
 
 type ThemeName = 'light' | 'dark'
-type PasswordInputType = 'password' | 'text'
 
 const props = defineProps<{
   loading: boolean
@@ -26,97 +25,84 @@ const emit = defineEmits<{
 const username = defineModel<string>('username', { required: true })
 const password = defineModel<string>('password', { required: true })
 const isPasswordVisible = shallowRef(false)
-
-const passwordType = computed<PasswordInputType>(() => (isPasswordVisible.value ? 'text' : 'password'))
-const passwordToggleLabel = computed<string>(() => (isPasswordVisible.value ? '隐藏密码' : '显示密码'))
-const submitLabel = computed<string>(() => (props.loading ? '正在进入...' : '进入控制台'))
-const themeToggleLabel = computed<string>(() => (props.effectiveTheme === 'dark' ? '切换浅色模式' : '切换暗黑模式'))
-const themeToggleClasses = computed<Record<string, boolean>>(() => ({
-  'is-dark': props.effectiveTheme === 'dark',
-}))
-
-function togglePasswordVisible(): void {
-  isPasswordVisible.value = !isPasswordVisible.value
-}
+const passwordType = computed(() => isPasswordVisible.value ? 'text' : 'password')
+const passwordToggleLabel = computed(() => isPasswordVisible.value ? '隐藏密码' : '显示密码')
+const themeToggleLabel = computed(() => props.effectiveTheme === 'dark' ? '切换浅色模式' : '切换深色模式')
 </script>
 
 <template>
   <BaseCard
     as="form"
     padding="none"
-    class="login-form relative grid min-h-120 w-[min(440px,100%)] gap-2.5 rounded-lg px-7.5 pt-6.5 pb-6 max-[560px]:min-h-auto max-[560px]:gap-4 max-[560px]:p-5.5"
+    class="login-form w-full max-w-110 rounded-lg px-7.5 pt-10.5 pb-10 max-[400px]:px-5 max-[400px]:py-8"
+    aria-labelledby="login-title"
     @submit.prevent="emit('submit')"
   >
-    <div class="login-form-line" />
-
-    <header class="flex min-w-0 items-center justify-between gap-4.5 max-[560px]:gap-3.5">
+    <header class="flex min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-4">
       <div class="flex min-w-0 items-center gap-3">
-        <BaseMotionIcon variant="brand" class="login-logo">
-          <AppBrandMark class="block size-9.5 select-none" />
-        </BaseMotionIcon>
+        <AppBrandMark class="block size-9.5 shrink-0 select-none" aria-hidden="true" />
         <span class="grid min-w-0 gap-1">
-          <strong
-            class="text-[17px] leading-[1.12] font-semibold text-(--cp-login-brand-title-color) max-[560px]:text-cp-xl"
-          >
+          <strong class="text-[17px] leading-tight font-semibold text-cp-text-heading">
             Codex Proxy RS
           </strong>
-          <span class="font-mono text-[10px] leading-[1.2] font-normal text-(--cp-login-brand-caption-color)">
-            ADMIN REALM
+          <span class="font-mono text-[10px] leading-tight text-cp-text-secondary">
+            ACCOUNT
           </span>
         </span>
       </div>
-
       <button
         class="login-theme-toggle"
-        :class="themeToggleClasses"
+        :class="{ 'is-dark': effectiveTheme === 'dark' }"
         type="button"
-        :aria-label="themeToggleLabel"
+        role="switch"
+        :aria-checked="effectiveTheme === 'dark'"
+        aria-label="深色模式"
         :title="themeToggleLabel"
         @click="emit('toggleTheme', $event)"
       >
-        <Sun :size="16" />
+        <Sun :size="17" aria-hidden="true" />
         <span class="login-theme-knob" />
-        <Moon :size="16" />
+        <Moon :size="17" aria-hidden="true" />
       </button>
     </header>
 
-    <section class="grid min-w-0 gap-1 max-[560px]:gap-2" aria-labelledby="login-title">
-      <h1
-        id="login-title"
-        class="m-0 text-[34px] leading-[1.02] font-semibold text-(--cp-login-title-color) max-[560px]:text-[30px]"
-      >
-        控制台登录
-      </h1>
-      <p class="m-0 -ml-2 text-sm leading-[1.45] font-normal text-(--cp-login-description-color) max-[560px]:py-2">
-        「 欢迎回来，登录以开始您的数据之旅 」
-      </p>
-    </section>
+    <h1 id="login-title" class="mt-7 mb-0 text-[34px] leading-tight font-bold text-cp-text-heading">
+      账户登录
+    </h1>
 
-    <div class="grid gap-3">
-      <div class="grid min-w-0 gap-2">
-        <span class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">管理员账号</span>
+    <div class="mt-10 grid gap-4">
+      <BaseFormItem control-id="login-username">
+        <template #label>
+          <span class="text-sm leading-tight font-bold text-cp-text">用户名</span>
+        </template>
         <BaseInput
+          id="login-username"
           v-model="username"
+          class="pt-1"
           name="username"
-          aria-label="管理员账号"
-          placeholder="输入会话账号"
+          placeholder="用户名"
           autocomplete="username"
+          :disabled="loading"
         >
           <template #prefix>
             <Mail :size="17" />
           </template>
         </BaseInput>
-      </div>
+      </BaseFormItem>
 
-      <div class="grid min-w-0 gap-2">
-        <span class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">访问密钥</span>
+      <BaseFormItem control-id="login-password">
+        <template #label>
+          <span class="text-sm leading-tight font-bold text-cp-text">密码</span>
+        </template>
         <BaseInput
+          id="login-password"
           v-model="password"
+          class="pt-1"
           name="password"
-          aria-label="访问密钥"
-          placeholder="输入会话密钥"
+          placeholder="密码"
           :type="passwordType"
           autocomplete="current-password"
+          :disabled="loading"
         >
           <template #prefix>
             <KeyRound :size="17" />
@@ -125,103 +111,45 @@ function togglePasswordVisible(): void {
             <BaseIconButton
               variant="ghost"
               size="sm"
-              class="login-password-toggle"
               :label="passwordToggleLabel"
+              :disabled="loading"
+              :aria-pressed="isPasswordVisible"
               @mousedown.prevent
-              @click="togglePasswordVisible"
+              @click="isPasswordVisible = !isPasswordVisible"
             >
               <EyeOff v-if="isPasswordVisible" :size="16" />
               <Eye v-else :size="16" />
             </BaseIconButton>
           </template>
         </BaseInput>
-      </div>
+      </BaseFormItem>
 
-      <div class="min-w-0 mb-2">
-        <BaseButton
-          variant="primary"
-          size="lg"
-          type="submit"
-          class="login-submit"
-          :loading="props.loading"
-          :disabled="props.submitDisabled"
-        >
-          <span>{{ submitLabel }}</span>
-        </BaseButton>
-      </div>
+      <BaseButton
+        variant="primary"
+        size="lg"
+        type="submit"
+        class="login-submit"
+        :loading="loading"
+        :disabled="submitDisabled"
+      >
+        {{ loading ? '登录中...' : '登录' }}
+      </BaseButton>
     </div>
   </BaseCard>
 </template>
 
 <style scoped>
 .login-form {
-  --cp-color-bg-container: transparent;
-  --cp-color-fill-quaternary: var(--cp-login-toggle-bg);
-  --cp-color-fill-tertiary: var(--cp-login-input-bg);
-  --cp-color-text: var(--cp-login-title-color);
-  --cp-color-text-secondary: var(--cp-login-description-color);
-  --cp-color-text-quaternary: var(--cp-login-placeholder-color);
-  --cp-color-error-container: var(--cp-login-error-bg);
-  --cp-color-error-border: transparent;
-  --cp-color-error-text: var(--cp-login-error-text-color);
-  --cp-color-error: var(--cp-login-error-icon-color);
-  --cp-color-bg-container-disabled: var(--cp-login-disabled-bg);
-  --cp-color-text-disabled: var(--cp-login-disabled-text-color);
-  --cp-input-bg: var(--cp-login-input-bg);
-  --cp-input-hover-bg: var(--cp-login-input-hover-bg);
-  --cp-input-active-bg: var(--cp-login-input-active-bg);
-  --cp-border-radius-sm: 6px;
+  --cp-control-height: 44px;
+  --cp-input-bg: var(--cp-color-fill-quaternary);
+  --cp-input-hover-bg: var(--cp-color-fill-tertiary);
+  --cp-input-active-bg: var(--cp-color-fill-quaternary);
+  --cp-color-text-quaternary: var(--cp-color-text-secondary);
   --cp-border-radius: 6px;
-  --cp-box-shadow-tertiary: none;
-  --cp-box-shadow: none;
-  --cp-control-height: 43px;
+  --cp-border-radius-sm: 6px;
 
-  background:
-    linear-gradient(
-      118deg,
-      var(--cp-login-panel-bg-start),
-      var(--cp-login-panel-bg-middle) 56%,
-      var(--cp-login-panel-bg-end)
-    ),
-    var(--cp-login-panel-bg-middle);
+  background: var(--cp-card-bg);
   box-shadow: 0 18px 38px -20px var(--cp-login-panel-shadow-color);
-  backdrop-filter: blur(18px) saturate(1.08);
-  -webkit-backdrop-filter: blur(18px) saturate(1.08);
-}
-
-.login-form-line {
-  position: absolute;
-  top: 0;
-  left: 22px;
-  width: calc(100% - 44px);
-  height: 2px;
-  background: linear-gradient(
-    90deg,
-    var(--cp-color-transparent),
-    var(--cp-login-panel-line-color),
-    var(--cp-color-transparent)
-  );
-  opacity: 0.42;
-  pointer-events: none;
-}
-
-:global(html[data-theme='dark'] .login-form-line) {
-  opacity: 0.3;
-}
-
-.login-logo {
-  display: inline-flex;
-  width: 38px;
-  height: 38px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  border-radius: 8px;
-  color: var(--cp-login-logo-color);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
 }
 
 .login-theme-toggle {
@@ -235,23 +163,13 @@ function togglePasswordVisible(): void {
   padding: 0;
   border: 0;
   border-radius: 20px;
-  background: var(--cp-login-toggle-bg);
-  color: var(--cp-login-toggle-moon-color);
+  background: var(--cp-color-fill-quaternary);
   cursor: pointer;
   outline: none;
-  transition:
-    background 0.16s ease,
-    color 0.16s ease;
-}
-
-@media (hover: hover) {
-  .login-theme-toggle:hover {
-    background: var(--cp-login-toggle-bg-hover);
-  }
 }
 
 .login-theme-toggle:focus-visible {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--cp-login-input-icon-color) 46%, transparent);
+  box-shadow: 0 0 0 2px var(--cp-control-outline);
 }
 
 .login-theme-toggle > svg {
@@ -260,11 +178,19 @@ function togglePasswordVisible(): void {
 }
 
 .login-theme-toggle > svg:first-child {
-  color: var(--cp-login-toggle-sun-color);
+  color: var(--cp-color-primary-text);
 }
 
 .login-theme-toggle > svg:last-child {
-  color: var(--cp-login-toggle-moon-color);
+  color: var(--cp-color-text-secondary);
+}
+
+.login-theme-toggle.is-dark > svg:first-child {
+  color: var(--cp-color-text-secondary);
+}
+
+.login-theme-toggle.is-dark > svg:last-child {
+  color: var(--cp-color-primary-text);
 }
 
 .login-theme-knob {
@@ -274,7 +200,7 @@ function togglePasswordVisible(): void {
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: var(--cp-login-toggle-knob);
+  background: var(--cp-color-bg-elevated);
   box-shadow: 0 0 10px var(--cp-login-toggle-shadow-color);
   transition: transform 0.2s ease;
 }
@@ -283,34 +209,19 @@ function togglePasswordVisible(): void {
   transform: translateX(33px);
 }
 
-.login-password-toggle {
-  --cp-color-fill-quaternary: color-mix(in srgb, var(--cp-input-hover-bg) 62%, transparent);
-  --cp-color-fill-tertiary: color-mix(in srgb, var(--cp-input-hover-bg) 88%, transparent);
-
-  color: var(--cp-login-placeholder-color);
-  border-radius: 6px;
-}
-
-.login-password-toggle:hover {
-  color: var(--cp-login-title-color);
-}
-
 .login-submit {
   width: 100%;
   height: 44px;
-  box-shadow: 0 14px 24px -18px var(--cp-login-button-shadow-color);
 }
 
 .login-submit:disabled {
-  background: var(--cp-login-disabled-bg);
+  background: var(--cp-color-fill-quaternary);
+  color: var(--cp-color-text-disabled);
   box-shadow: none;
-  transform: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .login-theme-knob,
-  .login-submit,
-  .login-theme-toggle {
+  .login-theme-knob {
     transition: none;
   }
 }

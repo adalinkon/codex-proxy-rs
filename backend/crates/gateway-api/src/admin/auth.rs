@@ -102,10 +102,11 @@ where
     match state
         .admin_services()
         .auth()
-        .resolve_admin_user_id(admin_session_cookie(headers).as_deref())
+        .resolve_user(admin_session_cookie(headers).as_deref())
         .await
     {
-        Ok(Some(admin_user_id)) => Ok(admin_user_id),
+        Ok(Some(user)) if user.role == gateway_admin::model::users::UserRole::Admin => Ok(user.id),
+        Ok(Some(_)) => Err(AdminError::administrator_required()),
         Ok(None) => Err(AdminError::admin_session_required()),
         Err(_) => Err(AdminError::internal()),
     }
@@ -179,16 +180,20 @@ impl AdminLoginData {
 }
 
 /// 管理员会话状态响应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminSessionStatusData {
     authenticated: bool,
+    user: Option<super::users::SessionUserView>,
 }
 
 impl AdminSessionStatusData {
     #[must_use]
     pub const fn new(authenticated: bool) -> Self {
-        Self { authenticated }
+        Self {
+            authenticated,
+            user: None,
+        }
     }
 }
 
@@ -263,15 +268,18 @@ async fn session_status<S>(
 where
     S: AdminSessionState + Send + Sync,
 {
-    let authenticated = state
+    let user = state
         .admin_services()
         .auth()
-        .validate_session(admin_session_cookie(&headers).as_deref())
+        .resolve_user(admin_session_cookie(&headers).as_deref())
         .await
         .map_err(|_| AdminError::internal())?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(AdminSessionStatusData::new(authenticated)),
+        AdminEnvelope::ok(AdminSessionStatusData {
+            authenticated: user.is_some(),
+            user: user.map(Into::into),
+        }),
     ))
 }
 
@@ -296,7 +304,7 @@ where
     Ok(response)
 }
 
-fn admin_session_cookie(headers: &HeaderMap) -> Option<String> {
+pub(super) fn admin_session_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get("cookie")?.to_str().ok()?;
     cookie.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;

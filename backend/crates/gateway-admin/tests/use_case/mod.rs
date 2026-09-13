@@ -10,6 +10,22 @@ mod settings;
 mod system;
 mod xai;
 
+fn test_user(id: &str) -> gateway_admin::model::users::UserRecord {
+    gateway_admin::model::users::UserRecord {
+        identity: gateway_admin::model::users::UserIdentity {
+            id: id.to_owned(),
+            role: gateway_admin::model::users::UserRole::Admin,
+            enabled: true,
+            auth_revision: 0,
+        },
+        all_groups: true,
+        groups: Vec::new(),
+        limits: Default::default(),
+        budget: Default::default(),
+        key_count: 0,
+    }
+}
+
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},
@@ -247,6 +263,42 @@ struct BootstrapAuthStore {
 
 #[async_trait]
 impl AuthStore for BootstrapAuthStore {
+    async fn load_user_identity(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserIdentity>> {
+        Ok((id == "admin").then(|| test_user(id).identity))
+    }
+
+    async fn reset_user_budget(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> AdminStoreResult<chrono::DateTime<chrono::Utc>> {
+        unreachable!()
+    }
+    async fn delete_user(&self, _: &str) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
+    async fn load_user(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserRecord>> {
+        Ok((id == "admin").then(|| test_user(id)))
+    }
+    async fn list_users(&self) -> AdminStoreResult<Vec<gateway_admin::model::users::UserRecord>> {
+        unreachable!()
+    }
+    async fn save_user(
+        &self,
+        _: gateway_admin::model::users::UserPolicyUpdate,
+        _: Option<&str>,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
+    async fn change_password(&self, _: &str, _: Option<&str>, _: &str) -> AdminStoreResult<bool> {
+        unreachable!()
+    }
     async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
         Ok(self.password_hash.lock().expect("password hash").clone())
     }
@@ -480,6 +532,13 @@ impl AccountRuntimeStore for UnavailableStore {
 
 #[async_trait]
 impl ClientKeyStore for UnavailableStore {
+    async fn mutate_owned_key(
+        &self,
+        _: &str,
+        _: gateway_admin::model::client_keys::OwnedKeyMutation,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
     async fn list_client_keys(&self, _: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage> {
         Err(unavailable("client key list"))
     }

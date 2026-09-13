@@ -18,6 +18,7 @@ const props = withDefaults(
   defineProps<{
     diagnostics: Diagnostics
     loading?: boolean
+    personal?: boolean
   }>(),
   {
     loading: false,
@@ -26,14 +27,14 @@ const props = withDefaults(
 
 const dimension = defineModel('dimension', { type: String, required: true })
 
-const dimensionOptions = [
+const dimensionOptions = computed(() => [
   { label: '模型', value: 'model' },
   { label: '账号', value: 'account' },
   { label: '密钥', value: 'apiKey' },
   { label: '上游', value: 'provider' },
   { label: '传输', value: 'transport' },
   { label: '错误', value: 'failureClass' },
-]
+].filter(option => !props.personal || option.value !== 'account'))
 
 const diagnosticColumns = defineTableColumns<DiagnosticDisplayItem>([
   {
@@ -70,12 +71,12 @@ const diagnosticColumns = defineTableColumns<DiagnosticDisplayItem>([
 ])
 
 const selectedDimensionLabel = computed(
-  () => dimensionOptions.find(option => option.value === dimension.value)?.label ?? '维度',
+  () => dimensionOptions.value.find(option => option.value === dimension.value)?.label ?? '维度',
 )
 
 const resultDimension = computed(() => props.diagnostics.dimension || dimension.value)
 const resultDimensionLabel = computed(
-  () => dimensionOptions.find(option => option.value === resultDimension.value)?.label ?? '维度',
+  () => dimensionOptions.value.find(option => option.value === resultDimension.value)?.label ?? '维度',
 )
 
 const sortedItems = computed(() =>

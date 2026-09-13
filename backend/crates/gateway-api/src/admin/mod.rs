@@ -19,6 +19,7 @@ pub mod presenter;
 pub mod proxies;
 pub mod settings;
 pub mod system;
+pub mod users;
 pub mod wire;
 
 pub use auth::{AdminAuth, AdminSessionState};
@@ -34,6 +35,7 @@ where
     S: AdminSessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .merge(users::router::<S>())
         .merge(account_groups::router::<S>())
         .merge(proxies::router::<S>())
         .merge(accounts::router::<S>())

@@ -615,6 +615,42 @@ impl FakeAuthStore {
 
 #[async_trait]
 impl AuthStore for FakeAuthStore {
+    async fn load_user_identity(
+        &self,
+        _: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserIdentity>> {
+        unreachable!()
+    }
+
+    async fn reset_user_budget(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> AdminStoreResult<chrono::DateTime<chrono::Utc>> {
+        unreachable!()
+    }
+    async fn delete_user(&self, _: &str) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
+    async fn load_user(
+        &self,
+        _: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserRecord>> {
+        unreachable!()
+    }
+    async fn list_users(&self) -> AdminStoreResult<Vec<gateway_admin::model::users::UserRecord>> {
+        unreachable!()
+    }
+    async fn save_user(
+        &self,
+        _: gateway_admin::model::users::UserPolicyUpdate,
+        _: Option<&str>,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
+    async fn change_password(&self, _: &str, _: Option<&str>, _: &str) -> AdminStoreResult<bool> {
+        unreachable!()
+    }
     async fn load_password_hash(&self, _admin_user_id: &str) -> AdminStoreResult<Option<String>> {
         Ok(None)
     }

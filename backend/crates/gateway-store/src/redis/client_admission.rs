@@ -23,31 +23,34 @@ local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 100
 local cutoff = now_ms - 60000
 local lease_ttl_ms = tonumber(ARGV[2])
 if now_ms + lease_ttl_ms > tonumber(ARGV[5]) then return 3 end
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
-redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', cutoff)
-
-if tonumber(ARGV[3]) > 0 and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
-  return 2
+for level = 0, 1 do
+  local active = KEYS[1 + level * 2]
+  local recent = KEYS[2 + level * 2]
+  local concurrency = tonumber(ARGV[3 + level * 3])
+  local rpm = tonumber(ARGV[4 + level * 3])
+  redis.call('ZREMRANGEBYSCORE', active, '-inf', now_ms)
+  redis.call('ZREMRANGEBYSCORE', recent, '-inf', cutoff)
+  if not redis.call('ZSCORE', active, ARGV[1]) then
+    if rpm > 0 and redis.call('ZCARD', recent) >= rpm then return 1 end
+    if concurrency > 0 and redis.call('ZCARD', active) >= concurrency then return 2 end
+  end
 end
-if tonumber(ARGV[4]) > 0 and redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[4]) then
-  return 1
-end
-
-redis.call('ZADD', KEYS[1], now_ms + lease_ttl_ms, ARGV[1])
-redis.call('ZADD', KEYS[2], now_ms, ARGV[1])
 
 local function extend_ttl(key, ttl)
   local current = redis.call('PTTL', key)
   if current < ttl then redis.call('PEXPIRE', key, ttl) end
 end
 
-local active_tail = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
-local active_ttl = 120000
-if #active_tail == 2 then
-  active_ttl = math.max(active_ttl, tonumber(active_tail[2]) - now_ms + 60000)
+for level = 0, 1 do
+  local active = KEYS[1 + level * 2]
+  local recent = KEYS[2 + level * 2]
+  redis.call('ZADD', active, 'NX', now_ms + lease_ttl_ms, ARGV[1])
+  redis.call('ZADD', recent, 'NX', now_ms, ARGV[1])
+  local active_tail = redis.call('ZRANGE', active, -1, -1, 'WITHSCORES')
+  local active_ttl = math.max(120000, tonumber(active_tail[2]) - now_ms + 60000)
+  extend_ttl(active, active_ttl)
+  extend_ttl(recent, 120000)
 end
-extend_ttl(KEYS[1], active_ttl)
-extend_ttl(KEYS[2], 120000)
 return 0
 "#;
 
@@ -119,6 +122,8 @@ pub struct ClientAdmissionLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAdmissionRequest {
+    pub user_id: String,
+    pub user_limits: ClientAdmissionLimits,
     pub model_request_id: String,
     pub client_api_key_ref: String,
     pub lease_ttl: Duration,
@@ -127,6 +132,9 @@ pub struct ClientAdmissionRequest {
 
 impl ClientAdmissionRequest {
     pub fn validate(&self) -> StoreResult<()> {
+        require_nonempty("client admission", "user_id", &self.user_id)?;
+        redis_integer(self.user_limits.max_concurrency, "user concurrency")?;
+        redis_integer(self.user_limits.requests_per_minute, "user RPM")?;
         require_nonempty(
             "client admission",
             "model_request_id",
@@ -223,6 +231,7 @@ pub trait ClientAdmissionRepository: Send + Sync {
     ) -> StoreResult<ClientAdmissionDecision>;
     async fn release_client_request(
         &self,
+        user_id: &str,
         client_api_key_ref: &str,
         model_request_id: &str,
     ) -> StoreResult<bool>;
@@ -240,6 +249,53 @@ pub struct RedisClientAdmissionRepository {
 }
 
 impl RedisClientAdmissionRepository {
+    pub async fn request_counts(
+        &self,
+        ids: &[String],
+        users: bool,
+    ) -> StoreResult<Vec<(u64, u64)>> {
+        if ids.len() > 100 {
+            return Err(invalid("too many request usage IDs"));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 只计数未过期成员，不清理或续期，不影响准入和恢复；所有 ID 使用同一次 Redis 时钟采样。
+        let script = Script::new(
+            r#"
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local result = {}
+for i = 1, #KEYS, 2 do
+  result[#result + 1] = {
+    redis.call('ZCOUNT', KEYS[i], '(' .. now, '+inf'),
+    redis.call('ZCOUNT', KEYS[i + 1], '(' .. (now - 60000), '+inf')
+  }
+end
+return result
+"#,
+        );
+        let mut command = script.prepare_invoke();
+        for id in ids {
+            let key = if users {
+                format!("user:{id}")
+            } else {
+                id.clone()
+            };
+            for key in self.keys(&key)? {
+                command.key(key);
+            }
+        }
+        let result: Vec<(u64, u64)> = command
+            .invoke_async(&mut self.connection.clone())
+            .await
+            .map_err(|_| redis_unavailable("read request usage"))?;
+        if result.len() != ids.len() {
+            return Err(invalid("invalid request usage result"));
+        }
+        Ok(result)
+    }
+
     pub fn new(connection: ConnectionManager, key_namespace: &str) -> StoreResult<Self> {
         Ok(Self {
             connection,
@@ -265,17 +321,22 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
     ) -> StoreResult<ClientAdmissionDecision> {
         request.validate()?;
         let keys = self.keys(&request.client_api_key_ref)?;
+        let user_keys = self.keys(&format!("user:{}", request.user_id))?;
         let lease_ttl_ms = u64::try_from(request.lease_ttl.as_millis())
             .map_err(|_| invalid("lease TTL is too large"))?;
         let mut connection = self.connection.clone();
         let code = Script::new(ADMIT_SCRIPT)
+            .key(&user_keys[0])
+            .key(&user_keys[1])
             .key(&keys[0])
             .key(&keys[1])
             .arg(&request.model_request_id)
             .arg(lease_ttl_ms)
+            .arg(request.user_limits.max_concurrency)
+            .arg(request.user_limits.requests_per_minute)
+            .arg(MAX_REDIS_EXACT_INTEGER)
             .arg(request.limits.max_concurrency)
             .arg(request.limits.requests_per_minute)
-            .arg(MAX_REDIS_EXACT_INTEGER)
             .invoke_async::<i64>(&mut connection)
             .await
             .map_err(|_| redis_unavailable("admit client request"))?;
@@ -294,16 +355,19 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
 
     async fn release_client_request(
         &self,
+        user_id: &str,
         client_api_key_ref: &str,
         model_request_id: &str,
     ) -> StoreResult<bool> {
         require_nonempty("client admission", "model_request_id", model_request_id)?;
         let keys = self.keys(client_api_key_ref)?;
+        let user_keys = self.keys(&format!("user:{user_id}"))?;
         let mut connection = self.connection.clone();
-        let removed = redis::cmd("ZREM")
-            .arg(&keys[0])
+        let removed = Script::new("local a=redis.call('ZREM',KEYS[1],ARGV[1]); local b=redis.call('ZREM',KEYS[2],ARGV[1]); return math.max(a,b)")
+            .key(&keys[0])
+            .key(&user_keys[0])
             .arg(model_request_id)
-            .query_async::<i64>(&mut connection)
+            .invoke_async::<i64>(&mut connection)
             .await
             .map_err(|_| redis_unavailable("release client request"))?;
         Ok(removed == 1)
@@ -378,6 +442,11 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
     ) -> futures::future::BoxFuture<'_, Result<CoreAdmissionDecision, CoreAdmissionError>> {
         Box::pin(async move {
             self.admit_client_request(&ClientAdmissionRequest {
+                user_id: request.user_id,
+                user_limits: ClientAdmissionLimits {
+                    max_concurrency: request.user_limits.max_concurrency,
+                    requests_per_minute: request.user_limits.requests_per_minute,
+                },
                 model_request_id: request.model_request_id.as_str().to_owned(),
                 client_api_key_ref: request.client_api_key_id.as_str().to_owned(),
                 lease_ttl: request.lease_ttl,
@@ -402,13 +471,18 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
 
     fn release<'a>(
         &'a self,
+        user_id: &'a str,
         client_api_key_id: &'a gateway_core::policy::ClientApiKeyId,
         model_request_id: &'a gateway_core::engine::ModelRequestId,
     ) -> futures::future::BoxFuture<'a, Result<bool, CoreAdmissionError>> {
         Box::pin(async move {
-            self.release_client_request(client_api_key_id.as_str(), model_request_id.as_str())
-                .await
-                .map_err(|_| CoreAdmissionError)
+            self.release_client_request(
+                user_id,
+                client_api_key_id.as_str(),
+                model_request_id.as_str(),
+            )
+            .await
+            .map_err(|_| CoreAdmissionError)
         })
     }
 
@@ -418,7 +492,7 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
     ) -> futures::future::BoxFuture<'_, Result<CoreAdmissionRestoreResult, CoreAdmissionError>>
     {
         Box::pin(async move {
-            self.restore_client_admission(&ClientAdmissionRestore {
+            let mut restore = ClientAdmissionRestore {
                 client_api_key_ref: recovery.client_api_key_id.as_str().to_owned(),
                 recent_requests: recovery
                     .recent_requests
@@ -436,13 +510,21 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
                         expires_at: DateTime::<Utc>::from(request.expires_at),
                     })
                     .collect(),
-            })
-            .await
-            .map(|restored| CoreAdmissionRestoreResult {
+            };
+            let restored = self
+                .restore_client_admission(&restore)
+                .await
+                .map_err(|_| CoreAdmissionError)?;
+            if let Some(user_id) = recovery.user_id {
+                restore.client_api_key_ref = format!("user:{user_id}");
+                self.restore_client_admission(&restore)
+                    .await
+                    .map_err(|_| CoreAdmissionError)?;
+            }
+            Ok(CoreAdmissionRestoreResult {
                 restored_recent_requests: restored.restored_recent_requests,
                 restored_running_requests: restored.restored_running_requests,
             })
-            .map_err(|_| CoreAdmissionError)
         })
     }
 }

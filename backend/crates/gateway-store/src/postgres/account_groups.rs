@@ -351,6 +351,8 @@ impl AccountGroupStore for PgAccountGroupRepository {
                          where g.id = $1
                            and not exists (
                              select 1 from client_api_key_groups k where k.account_group_id = g.id
+                           ) and not exists (
+                             select 1 from user_account_groups u where u.account_group_id = g.id
                            )",
                     )
                     .bind(command.id.as_str())

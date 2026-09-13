@@ -180,6 +180,12 @@ fn snapshot(plaintext: &str, provider_name: &str) -> RuntimeSnapshot {
             )),
             true,
             RateLimits::unlimited(),
+            gateway_core::policy::UserPolicy {
+                id: "test-owner".to_owned(),
+                enabled: true,
+                group_ids: None,
+                limits: Default::default(),
+            },
         )],
     )
     .expect("runtime snapshot")
@@ -275,6 +281,7 @@ impl ClientAdmissionPort for UnusedAdmissions {
 
     fn release<'a>(
         &'a self,
+        _: &'a str,
         _: &'a ClientApiKeyId,
         _: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {

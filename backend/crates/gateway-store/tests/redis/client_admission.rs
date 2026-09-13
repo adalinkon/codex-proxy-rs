@@ -16,6 +16,202 @@ fn client_admission_rejects_zero_ttl() {
     assert!(request.validate().is_err());
 }
 
+#[tokio::test]
+async fn request_counts_follow_shared_admission_without_mutating_expired_members() {
+    let Some((repo, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let first = admission_request("usage-first", "usage-key-a", Duration::from_secs(30));
+    let mut second = admission_request("usage-second", "usage-key-b", Duration::from_secs(30));
+    second.user_id = first.user_id.clone();
+    repo.admit_client_request(&first).await.unwrap();
+    repo.admit_client_request(&first).await.unwrap();
+    repo.admit_client_request(&second).await.unwrap();
+    let user_ids = vec![first.user_id.clone(), "another-user".into()];
+    let key_ids = vec!["usage-key-a".into(), "usage-key-b".into(), "empty".into()];
+    assert_eq!(
+        repo.request_counts(&user_ids, true).await.unwrap(),
+        vec![(2, 2), (0, 0)]
+    );
+    assert_eq!(
+        repo.request_counts(&key_ids, false).await.unwrap(),
+        vec![(1, 1), (1, 1), (0, 0)]
+    );
+    repo.release_client_request(
+        &first.user_id,
+        &first.client_api_key_ref,
+        &first.model_request_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.request_counts(&user_ids, true).await.unwrap(),
+        vec![(1, 2), (0, 0)]
+    );
+    assert_eq!(
+        repo.request_counts(&key_ids, false).await.unwrap(),
+        vec![(0, 1), (1, 1), (0, 0)]
+    );
+    let mut rejected = admission_request("usage-rejected", "usage-key-a", Duration::from_secs(30));
+    rejected.user_id = first.user_id.clone();
+    rejected.user_limits.max_concurrency = 1;
+    assert_eq!(
+        repo.admit_client_request(&rejected).await.unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::ConcurrencyLimited)
+    );
+    assert_eq!(
+        repo.request_counts(&user_ids, true).await.unwrap(),
+        vec![(1, 2), (0, 0)]
+    );
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{namespace}:client:*"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    for key in &keys {
+        redis::cmd("ZADD")
+            .arg(key)
+            .arg(1)
+            .arg("expired-sample")
+            .query_async::<i64>(&mut connection)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        repo.request_counts(&user_ids, true).await.unwrap(),
+        vec![(1, 2), (0, 0)]
+    );
+    assert_eq!(
+        repo.request_counts(&key_ids, false).await.unwrap(),
+        vec![(0, 1), (1, 1), (0, 0)]
+    );
+    for key in &keys {
+        let score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(key)
+            .arg("expired-sample")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(score, Some(1.0), "查询不得清理或修改限流状态");
+    }
+    assert!(
+        repo.request_counts(&vec!["id".into(); 101], true)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn user_concurrency_and_rpm_are_shared_and_rejections_do_not_partially_charge() {
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let mut first = admission_request("first", "key-a", Duration::from_secs(30));
+    first.user_limits = ClientAdmissionLimits {
+        max_concurrency: 1,
+        requests_per_minute: 2,
+    };
+    first.limits = ClientAdmissionLimits {
+        max_concurrency: 1,
+        requests_per_minute: 1,
+    };
+    assert_eq!(
+        repository.admit_client_request(&first).await.unwrap(),
+        ClientAdmissionDecision::Granted
+    );
+    assert_eq!(
+        repository.admit_client_request(&first).await.unwrap(),
+        ClientAdmissionDecision::Granted
+    );
+    let mut second = first.clone();
+    second.model_request_id = "second".to_owned();
+    second.client_api_key_ref = "key-b".to_owned();
+    assert_eq!(
+        repository.admit_client_request(&second).await.unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::ConcurrencyLimited)
+    );
+    repository
+        .release_client_request("test-owner", "key-a", "first")
+        .await
+        .unwrap();
+    let mut key_rejected = first.clone();
+    key_rejected.model_request_id = "key-rejected".to_owned();
+    assert_eq!(
+        repository
+            .admit_client_request(&key_rejected)
+            .await
+            .unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    // Key RPM 拒绝后，另一个 Key 仍可消费用户的第二个名额。
+    assert_eq!(
+        repository.admit_client_request(&second).await.unwrap(),
+        ClientAdmissionDecision::Granted
+    );
+    repository
+        .release_client_request("test-owner", "key-b", "second")
+        .await
+        .unwrap();
+    let mut third = second.clone();
+    third.model_request_id = "third".to_owned();
+    third.client_api_key_ref = "key-c".to_owned();
+    assert_eq!(
+        repository.admit_client_request(&third).await.unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    use sha2::{Digest as _, Sha256};
+    let user_hash = hex::encode(Sha256::digest(b"user:test-owner"));
+    let user_requests = format!("{namespace}:client:{{{user_hash}}}:requests");
+    assert_eq!(
+        zmembers(&mut connection, &user_requests).await,
+        vec!["first", "second"]
+    );
+    let rejected_hash = hex::encode(Sha256::digest(b"key-c"));
+    assert!(
+        !namespace_keys(&mut connection, &namespace)
+            .await
+            .iter()
+            .any(|key| key.contains(&rejected_hash))
+    );
+    delete_namespace_keys(&mut connection, &namespace).await;
+}
+
+#[tokio::test]
+async fn core_recovery_restores_shared_user_rpm_across_keys() {
+    use gateway_core::{
+        engine::{
+            ModelRequestId,
+            admission::{ClientAdmissionPort as _, ClientAdmissionRecovery, RecentAdmissionFact},
+        },
+        policy::ClientApiKeyId,
+    };
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let now = redis_now(&mut connection).await - Duration::from_secs(1);
+    for key in ["key-a", "key-b"] {
+        repository
+            .restore(ClientAdmissionRecovery {
+                user_id: Some("test-owner".to_owned()),
+                client_api_key_id: ClientApiKeyId::new(key).unwrap(),
+                recent_requests: vec![RecentAdmissionFact {
+                    model_request_id: ModelRequestId::new(format!("req_{key}")).unwrap(),
+                    started_at: now.into(),
+                }],
+                running_requests: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    let mut request = admission_request("new", "key-c", Duration::from_secs(30));
+    request.user_limits.requests_per_minute = 2;
+    assert_eq!(
+        repository.admit_client_request(&request).await.unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    delete_namespace_keys(&mut connection, &namespace).await;
+}
+
 #[test]
 fn client_admission_rejects_values_outside_redis_exact_integer_range() {
     let mut request = admission_request("request-1", "key-1", Duration::from_secs(30));
@@ -131,7 +327,7 @@ async fn restore_rebuilds_lost_cache_without_overwriting_new_admission() {
     );
     assert!(
         repository
-            .release_client_request(key_ref, "request-before-crash")
+            .release_client_request("test-owner", key_ref, "request-before-crash")
             .await
             .expect("release restored request by durable ID")
     );
@@ -144,7 +340,7 @@ async fn restore_rebuilds_lost_cache_without_overwriting_new_admission() {
     );
     assert!(
         repository
-            .release_client_request(key_ref, "request-after-crash")
+            .release_client_request("test-owner", key_ref, "request-after-crash")
             .await
             .expect("release admission created during recovery")
     );
@@ -211,7 +407,7 @@ async fn restore_uses_redis_time_for_window_and_running_expiry_boundaries() {
     assert!((230_000..=245_000).contains(&active_ttl));
     assert!(
         repository
-            .release_client_request(key_ref, "request-live")
+            .release_client_request("test-owner", key_ref, "request-live")
             .await
             .expect("release live recovered request")
     );
@@ -252,6 +448,11 @@ fn admission_request(
     lease_ttl: Duration,
 ) -> ClientAdmissionRequest {
     ClientAdmissionRequest {
+        user_id: "test-owner".to_owned(),
+        user_limits: ClientAdmissionLimits {
+            max_concurrency: 0,
+            requests_per_minute: 0,
+        },
         model_request_id: model_request_id.to_owned(),
         client_api_key_ref: client_api_key_ref.to_owned(),
         lease_ttl,
@@ -327,8 +528,10 @@ async fn delete_namespace_keys(connection: &mut ConnectionManager, namespace: &s
 }
 
 fn key_with_suffix<'a>(keys: &'a [String], suffix: &str) -> &'a str {
+    use sha2::{Digest as _, Sha256};
+    let user_fingerprint = hex::encode(Sha256::digest(b"user:test-owner"));
     keys.iter()
-        .find(|key| key.ends_with(suffix))
+        .find(|key| key.ends_with(suffix) && !key.contains(&user_fingerprint))
         .expect("admission key with expected suffix")
 }
 

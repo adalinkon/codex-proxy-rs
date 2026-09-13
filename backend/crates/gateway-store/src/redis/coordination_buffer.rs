@@ -86,10 +86,12 @@ impl ClientAdmissionPort for BufferedClientAdmissionPort {
 
     fn release<'a>(
         &'a self,
+        user_id: &'a str,
         client_api_key_id: &'a ClientApiKeyId,
         model_request_id: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
         let enqueued = self.enqueue(AdmissionRelease {
+            user_id: user_id.to_owned(),
             client_api_key_id: client_api_key_id.clone(),
             model_request_id: model_request_id.clone(),
         });
@@ -105,6 +107,7 @@ impl ClientAdmissionPort for BufferedClientAdmissionPort {
 }
 
 struct AdmissionRelease {
+    user_id: String,
     client_api_key_id: ClientApiKeyId,
     model_request_id: ModelRequestId,
 }
@@ -130,7 +133,11 @@ impl DaemonTask for ClientAdmissionReleaseWriter {
                 };
                 if let Err(error) = self
                     .inner
-                    .release(&release.client_api_key_id, &release.model_request_id)
+                    .release(
+                        &release.user_id,
+                        &release.client_api_key_id,
+                        &release.model_request_id,
+                    )
                     .await
                 {
                     tracing::warn!(%error, "Client admission 后台释放失败，依赖租约 TTL 收敛");

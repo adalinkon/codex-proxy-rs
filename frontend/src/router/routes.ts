@@ -10,6 +10,12 @@ export const routes: RouteRecordRaw[] = [
     path: '/',
     component: () => import('@/layout/index.vue'),
     children: [
+      { path: 'users', name: 'users', component: () => import('@/views/users/index.vue') },
+      { path: 'me/profile', name: 'my-profile', component: () => import('@/views/user/index.vue') },
+      { path: 'me/overview', name: 'my-overview', redirect: '/me/profile' },
+      { path: 'me/keys', name: 'my-keys', component: () => import('@/views/api-keys/index.vue'), props: { scope: 'user' } },
+      { path: 'me/usage', name: 'my-usage', component: () => import('@/views/usage/index.vue'), props: { scope: 'user' } },
+      { path: 'me/settings', name: 'my-settings', redirect: '/me/profile' },
       {
         path: '',
         name: 'dashboard',

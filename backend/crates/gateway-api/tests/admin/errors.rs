@@ -300,15 +300,11 @@ async fn admin_auth_failures_should_use_stable_chinese_contracts() {
     assert_eq!(
         actual.map(|(status, _, body)| (status, body["code"].clone(), body["message"].clone())),
         [
-            (
-                StatusCode::UNAUTHORIZED,
-                json!(40101),
-                json!("需要管理员登录")
-            ),
+            (StatusCode::UNAUTHORIZED, json!(40101), json!("需要登录")),
             (
                 StatusCode::UNAUTHORIZED,
                 json!(40102),
-                json!("管理员用户名或密码错误")
+                json!("用户名或密码错误")
             ),
             (
                 StatusCode::UNAUTHORIZED,

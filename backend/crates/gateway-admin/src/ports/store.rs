@@ -197,6 +197,32 @@ pub trait AccountRuntimeStore: Send + Sync {
 /// 管理员密码、会话和安全审计。
 #[async_trait]
 pub trait AuthStore: Send + Sync {
+    async fn load_user_identity(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<crate::model::users::UserIdentity>>;
+    async fn load_user(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<crate::model::users::UserRecord>>;
+    async fn list_users(&self) -> AdminStoreResult<Vec<crate::model::users::UserRecord>>;
+    async fn delete_user(&self, id: &str) -> AdminStoreResult<Revision>;
+    async fn reset_user_budget(
+        &self,
+        id: &str,
+        operation_id: &str,
+    ) -> AdminStoreResult<DateTime<Utc>>;
+    async fn save_user(
+        &self,
+        policy: crate::model::users::UserPolicyUpdate,
+        initial_hash: Option<&str>,
+    ) -> AdminStoreResult<Revision>;
+    async fn change_password(
+        &self,
+        id: &str,
+        expected_hash: Option<&str>,
+        new_hash: &str,
+    ) -> AdminStoreResult<bool>;
     async fn load_password_hash(&self, admin_user_id: &str) -> AdminStoreResult<Option<String>>;
 
     async fn create_password_hash_if_absent(
@@ -217,9 +243,23 @@ pub trait AuthStore: Send + Sync {
     async fn append_audit_event(&self, event: AdminAuditEvent) -> AdminStoreResult<()>;
 }
 
+#[async_trait]
+pub trait RequestUsageStore: Send + Sync {
+    async fn request_usage(
+        &self,
+        scope: crate::model::users::RequestUsageScope,
+        ids: Vec<String>,
+    ) -> AdminStoreResult<Vec<crate::model::users::RequestUsage>>;
+}
+
 /// Client API Key 管理写入。
 #[async_trait]
 pub trait ClientKeyStore: Send + Sync {
+    async fn mutate_owned_key(
+        &self,
+        user_id: &str,
+        mutation: crate::model::client_keys::OwnedKeyMutation,
+    ) -> AdminStoreResult<Revision>;
     async fn list_client_keys(&self, query: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage>;
 
     async fn reveal_client_key(
@@ -407,6 +447,7 @@ impl AdminAccountStorePorts {
 /// 字段保持私有，每个 getter 只交出一种明确能力。该类型不提供通用拆包入口。
 #[derive(Clone)]
 pub struct AdminStorePorts {
+    request_usage: Option<Arc<dyn RequestUsageStore>>,
     accounts: AdminAccountStorePorts,
     auth: Arc<dyn AuthStore>,
     client_keys: Arc<dyn ClientKeyStore>,
@@ -432,12 +473,24 @@ impl AdminStorePorts {
             observability,
             settings,
             backup,
+            request_usage: None,
         }
     }
 
     #[must_use]
     pub fn accounts(&self) -> Arc<dyn AccountStore> {
         self.accounts.accounts.clone()
+    }
+
+    #[must_use]
+    pub fn with_request_usage(mut self, store: Arc<dyn RequestUsageStore>) -> Self {
+        self.request_usage = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn request_usage(&self) -> Option<Arc<dyn RequestUsageStore>> {
+        self.request_usage.clone()
     }
 
     #[must_use]

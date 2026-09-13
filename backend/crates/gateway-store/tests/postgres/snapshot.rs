@@ -8,6 +8,12 @@ use super::TestDatabase;
 #[test]
 fn snapshot_client_policy_contains_only_common_limits() {
     let policy = ClientApiKeySnapshot {
+        user: gateway_core::policy::UserPolicy {
+            id: "test-owner".to_owned(),
+            enabled: true,
+            group_ids: None,
+            limits: RateLimits::unlimited(),
+        },
         id: ClientApiKeyId::new("key-1").expect("client key ID"),
         plaintext_key: PlaintextClientApiKey::new("sk_snapshot_secret").expect("plaintext key"),
         group_ids: Vec::new(),
@@ -28,9 +34,9 @@ async fn runtime_snapshot_loads_enabled_plaintext_key_without_debug_exposure() {
     };
     let plaintext = format!("sk_{}", "s".repeat(43));
     sqlx::query(
-        "insert into client_api_keys (
+        "insert into client_api_keys (user_id,
            id, name, key, enabled, max_concurrency, requests_per_minute, created_at, updated_at
-         ) values ('key_snapshot', 'snapshot', $1, true, 2, 60, now(), now())",
+         ) values ('test-owner', 'key_snapshot', 'snapshot', $1, true, 2, 60, now(), now())",
     )
     .bind(&plaintext)
     .execute(&database.pool)

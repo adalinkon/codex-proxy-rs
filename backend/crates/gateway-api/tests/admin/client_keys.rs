@@ -247,6 +247,7 @@ fn client_key_responses_should_keep_shape_and_redact_creation_debug() {
         .single()
         .expect("valid time");
     let view = ClientKeyView::from(gateway_admin::model::client_keys::ClientKeyRecord {
+        user_id: "admin_1".to_owned(),
         budget: Default::default(),
         id: gateway_core::policy::ClientApiKeyId::new("key_visible").expect("Client Key ID"),
         name: "visible".to_owned(),
@@ -270,6 +271,7 @@ fn client_key_responses_should_keep_shape_and_redact_creation_debug() {
     assert!(list.get("configRevision").is_none());
     assert_eq!(list["total"], 1);
     assert_eq!(list["items"][0]["id"], "key_visible");
+    assert_eq!(list["items"][0]["userId"], "admin_1");
     assert_eq!(
         list["items"][0]["providerKinds"],
         serde_json::json!(["openai"])

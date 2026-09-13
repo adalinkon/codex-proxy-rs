@@ -27,6 +27,7 @@ mod retention;
 mod runtime_settings;
 mod snapshot;
 mod usage_facts;
+mod users;
 
 pub use account_groups::*;
 pub use admin_security_audit::*;
@@ -47,6 +48,7 @@ pub(crate) use usage_facts::{
     completed_usage_fact_predicate, push_completed_usage_fact_filter,
     push_unrecovered_request_filter,
 };
+pub use users::PgUserRepository;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 

@@ -10,6 +10,8 @@ use super::{ExecutionStore, ModelRequestId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAdmissionRequest {
+    pub user_id: String,
+    pub user_limits: RateLimits,
     pub model_request_id: ModelRequestId,
     pub client_api_key_id: ClientApiKeyId,
     pub lease_ttl: Duration,
@@ -42,6 +44,7 @@ pub struct RunningAdmissionFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAdmissionRecovery {
+    pub user_id: Option<String>,
     pub client_api_key_id: ClientApiKeyId,
     pub recent_requests: Vec<RecentAdmissionFact>,
     pub running_requests: Vec<RunningAdmissionFact>,
@@ -65,6 +68,7 @@ pub trait ClientAdmissionPort: Send + Sync {
 
     fn release<'a>(
         &'a self,
+        user_id: &'a str,
         client_api_key_id: &'a ClientApiKeyId,
         model_request_id: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>>;

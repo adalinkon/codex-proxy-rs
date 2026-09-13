@@ -31,6 +31,7 @@ impl ClientAdmissionPort for Admissions {
     }
     fn release<'a>(
         &'a self,
+        _: &'a str,
         _: &'a ClientApiKeyId,
         _: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
@@ -54,6 +55,7 @@ impl ClientAdmissionPort for Admissions {
 #[derive(Default)]
 struct Budget {
     reject: bool,
+    admission_delay: Duration,
     active: Arc<AtomicBool>,
     charges: Mutex<Vec<ClientBudgetCharge>>,
     settlement_gate: Mutex<Option<oneshot::Receiver<()>>>,
@@ -62,9 +64,15 @@ struct Budget {
 }
 
 impl ClientBudgetPort for Budget {
-    fn admit(&self, _: ClientApiKeyId) -> BoxFuture<'_, Result<(), GatewayError>> {
+    fn admit(&self, _: String, _: ClientApiKeyId) -> BoxFuture<'_, Result<(), GatewayError>> {
         Box::pin(async {
-            assert!(self.active.load(Ordering::SeqCst));
+            if !self.admission_delay.is_zero() {
+                std::thread::sleep(self.admission_delay);
+            }
+            assert!(
+                !self.active.load(Ordering::SeqCst),
+                "金额检查在取得请求名额前执行"
+            );
             if self.reject {
                 Err(
                     GatewayError::new(GatewayErrorKind::RateLimited, "budget exhausted")
@@ -128,7 +136,7 @@ fn request(service: &DefaultExecutionService, transport: ClientTransport) -> Sta
 }
 
 #[test]
-fn budget_rejection_releases_client_concurrency_without_creating_a_charge() {
+fn budget_rejection_does_not_acquire_client_slots_or_create_a_charge() {
     let admissions = Arc::new(Admissions::default());
     let budget = Arc::new(Budget {
         reject: true,
@@ -148,6 +156,8 @@ fn budget_rejection_releases_client_concurrency_without_creating_a_charge() {
         );
         assert!(!admissions.active.load(Ordering::SeqCst));
         assert!(budget.charges.lock().unwrap().is_empty());
+        assert!(admissions.limits.lock().unwrap().is_empty());
+        assert_eq!(admissions.releases.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -346,6 +356,28 @@ fn assert_zero_cleanup_completed(
         store.finalizations.lock().unwrap()[0].completed_at,
         "settlement must retain the original failure completion time"
     );
+}
+
+#[test]
+fn admission_timing_includes_budget_check() {
+    block_on(async {
+        let store = Arc::new(TrackingExecutionStore::default());
+        let admissions = Arc::new(Admissions::default());
+        let budget = Arc::new(Budget {
+            active: admissions.active.clone(),
+            admission_delay: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let service = early_failure_service(store.clone(), admissions, budget);
+        let mut started = service
+            .start(request(&service, ClientTransport::HttpJson))
+            .await
+            .unwrap();
+        assert!(started.session.collect_uncommitted().await.is_err());
+        let requests = store.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].admission_decision_ms.unwrap() >= 20);
+    });
 }
 
 #[test]
@@ -1653,6 +1685,7 @@ impl ClientAdmissionPort for UnusedAdmissions {
 
     fn release<'a>(
         &'a self,
+        _: &'a str,
         _: &'a ClientApiKeyId,
         _: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
@@ -1837,6 +1870,12 @@ fn client_snapshot() -> RuntimeSnapshot {
             account_scope(&provider, "acct_usage"),
             true,
             RateLimits::unlimited(),
+            gateway_core::policy::UserPolicy {
+                id: "test-owner".to_owned(),
+                enabled: true,
+                group_ids: None,
+                limits: Default::default(),
+            },
         )],
     )
     .expect("client snapshot")
@@ -1869,6 +1908,12 @@ fn start_snapshot_with_policy(revision: u64, enabled: bool, limits: RateLimits) 
             account_scope(&provider, "acct_start"),
             enabled,
             limits,
+            gateway_core::policy::UserPolicy {
+                id: "test-owner".to_owned(),
+                enabled: true,
+                group_ids: None,
+                limits: Default::default(),
+            },
         )],
     )
     .expect("start snapshot")

@@ -315,6 +315,7 @@ async fn group_costs_should_include_statusless_websocket_but_reject_statusless_h
 fn new_key(id: &str, group_ids: Vec<AccountGroupId>) -> NewClientKey {
     let marker = char::from(id.as_bytes().last().copied().unwrap_or(b'k'));
     NewClientKey {
+        user_id: None,
         budget: Default::default(),
         id: client_key_id(id),
         name: id.to_owned(),

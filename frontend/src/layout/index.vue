@@ -4,6 +4,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vu
 import { RouterView, useRoute } from 'vue-router'
 
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import { useAuthStore } from '@/stores/modules/auth'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useUiStore } from '@/stores/modules/ui'
 
@@ -13,6 +14,7 @@ import FloatingSidebarToggle from './components/FloatingSidebarToggle.vue'
 import SystemUpdateModal from './components/SystemUpdateModal/index.vue'
 
 const uiStore = useUiStore()
+const authStore = useAuthStore()
 const systemUpdateStore = useSystemUpdateStore()
 const { sidebarCollapsed } = storeToRefs(uiStore)
 const { loadedOnce } = storeToRefs(systemUpdateStore)
@@ -33,6 +35,8 @@ function closeMobileSidebar() {
 }
 
 async function openSystemUpdate() {
+  if (!authStore.isAdmin)
+    return
   if (systemUpdateOpen.value || systemUpdateOpening.value)
     return
 
@@ -51,7 +55,8 @@ async function openSystemUpdate() {
 }
 
 onMounted(() => {
-  void systemUpdateStore.loadVersion().catch(() => undefined)
+  if (authStore.isAdmin)
+    void systemUpdateStore.loadVersion().catch(() => undefined)
 })
 
 onBeforeUnmount(() => {
@@ -82,7 +87,7 @@ watch(
       <BaseScrollbar ref="pageScrollbarRef">
         <div class="flex min-h-full min-w-0 flex-col p-4 min-[961px]:p-6">
           <RouterView v-slot="{ Component }">
-            <component :is="Component" class="min-h-0 flex-1" />
+            <component :is="Component" :key="String(route.name)" class="min-h-0 flex-1" />
           </RouterView>
         </div>
       </BaseScrollbar>

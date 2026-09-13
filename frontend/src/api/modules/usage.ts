@@ -472,9 +472,9 @@ interface UsageDetailQuery {
 
 type UsageDiagnosticsQuery = UsageRangeQuery & { dimension: string }
 
-export function getUsageRecords(data: UsagePageQuery, options: RequestOptions = {}) {
+export function getUsageRecords(data: UsagePageQuery, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
   return request<UsageRecordsResponse>({
-    url: '/api/admin/usage/records',
+    url: `/api/${scope}/usage/records`,
     method: 'GET',
     params: data,
     ...options,
@@ -499,27 +499,27 @@ export function getUsageRecordDetail(data: UsageDetailQuery, options: RequestOpt
   })
 }
 
-export function getUsageRecordSummary(data: UsageRangeQuery, options: RequestOptions = {}) {
+export function getUsageRecordSummary(data: UsageRangeQuery, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
   return request<UsageSummaryResponse>({
-    url: '/api/admin/usage/records/summary',
+    url: `/api/${scope}/usage/records/summary`,
     method: 'GET',
     params: data,
     ...options,
   })
 }
 
-export function getUsageRecordInsightsOverview(data: UsageRangeQuery, options: RequestOptions = {}) {
+export function getUsageRecordInsightsOverview(data: UsageRangeQuery, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
   return request<UsageInsightsOverviewResponse>({
-    url: '/api/admin/usage/insights/overview',
+    url: `/api/${scope}/usage/insights/overview`,
     method: 'GET',
     params: data,
     ...options,
   })
 }
 
-export function getUsageRecordInsightsDiagnostics(data: UsageDiagnosticsQuery, options: RequestOptions = {}) {
+export function getUsageRecordInsightsDiagnostics(data: UsageDiagnosticsQuery, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
   return request<UsageDiagnosticsResponse>({
-    url: '/api/admin/usage/insights/diagnostics',
+    url: `/api/${scope}/usage/insights/diagnostics`,
     method: 'GET',
     params: data,
     ...options,

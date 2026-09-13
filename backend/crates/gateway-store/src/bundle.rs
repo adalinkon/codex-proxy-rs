@@ -109,6 +109,7 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
             Arc::new(postgres::PgProxyRepository::new(pool.clone())),
         ),
         Arc::new(AdminAuthStoreAdapter {
+            users: postgres::PgUserRepository::new(pool.clone()),
             security: postgres::PgAdminSecurityAuditRepository::new(pool.clone()),
             settings: postgres::PgRuntimeSettingsRepository::new(pool.clone()),
             state: redis::RedisAdminAuthStateRepository::new(
@@ -127,7 +128,14 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
             control_plane: postgres::PgControlPlaneRepository::new(pool.clone()),
         }),
         backup_ports(pool.clone(), &config)?,
-    );
+    )
+    .with_request_usage(Arc::new(AdminRequestUsageStoreAdapter {
+        pool: pool.clone(),
+        admissions: redis::RedisClientAdmissionRepository::new(
+            redis_connection.clone(),
+            REDIS_NAMESPACE,
+        )?,
+    }));
 
     let execution_repository = Arc::new(postgres::PgExecutionStore::new(pool.clone()));
     let (execution, execution_writer) =

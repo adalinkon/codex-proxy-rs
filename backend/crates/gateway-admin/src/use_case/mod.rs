@@ -11,6 +11,7 @@ pub mod openai;
 pub mod proxies;
 pub mod settings;
 pub mod system;
+pub mod users;
 pub mod xai;
 
 use std::sync::Arc;

@@ -25,6 +25,16 @@ use super::map_store_error;
 /// API 鉴权与管理员登录消费的统一服务。
 #[async_trait]
 pub trait AuthService: Send + Sync {
+    async fn resolve_user(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<crate::model::users::UserIdentity>, AdminError>;
+    async fn change_password(
+        &self,
+        user_id: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), AdminError>;
     async fn ensure_default_admin(&self, password: &str) -> Result<bool, AdminError>;
     async fn resolve_admin_user_id(
         &self,
@@ -83,6 +93,60 @@ impl DefaultAuthService {
 
 #[async_trait]
 impl AuthService for DefaultAuthService {
+    async fn resolve_user(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<crate::model::users::UserIdentity>, AdminError> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let Some(session) = self
+            .store
+            .load_session(session_id)
+            .await
+            .map_err(|e| map_store_error(e, "session"))?
+        else {
+            return Ok(None);
+        };
+        if session.expires_at <= Utc::now() {
+            return Ok(None);
+        }
+        Ok(self
+            .store
+            .load_user_identity(&session.admin_user_id)
+            .await
+            .map_err(|e| map_store_error(e, "user"))?
+            .filter(|user| user.enabled && user.auth_revision == session.auth_revision))
+    }
+
+    async fn change_password(
+        &self,
+        user_id: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), AdminError> {
+        validate_password(new_password)?;
+        let hash = self
+            .store
+            .load_password_hash(user_id)
+            .await
+            .map_err(|e| map_store_error(e, "user"))?
+            .ok_or_else(|| AdminError::not_found("用户不存在"))?;
+        if !verify_admin_password(current_password, &hash)? {
+            return Err(AdminError::invalid("当前密码不正确"));
+        }
+        let new_hash = hash_admin_password(new_password)?;
+        if !self
+            .store
+            .change_password(user_id, Some(&hash), &new_hash)
+            .await
+            .map_err(|e| map_store_error(e, "user"))?
+        {
+            return Err(AdminError::invalid("用户状态已变化，请重新登录"));
+        }
+        Ok(())
+    }
+
     async fn ensure_default_admin(&self, password: &str) -> Result<bool, AdminError> {
         let hash = hash_admin_password(password)?;
         self.store
@@ -95,18 +159,11 @@ impl AuthService for DefaultAuthService {
         &self,
         session_id: Option<&str>,
     ) -> Result<Option<String>, AdminError> {
-        let Some(session_id) = session_id else {
-            return Ok(None);
-        };
-        self.store
-            .load_session(session_id)
-            .await
-            .map(|session| {
-                session
-                    .filter(|session| session.expires_at > Utc::now())
-                    .map(|session| session.admin_user_id)
-            })
-            .map_err(|error| map_store_error(error, "administrator session"))
+        Ok(self
+            .resolve_user(session_id)
+            .await?
+            .filter(|user| user.role == crate::model::users::UserRole::Admin)
+            .map(|user| user.id))
     }
 
     async fn verify_admin_api_key(&self, key: &str) -> Result<bool, AdminError> {
@@ -125,17 +182,23 @@ impl AuthService for DefaultAuthService {
     }
 
     async fn login(&self, command: LoginCommand) -> Result<LoginResult, LoginError> {
-        if command
+        let username = command
             .username
             .as_deref()
-            .unwrap_or(&self.default_admin_user_id)
-            != self.default_admin_user_id
-        {
+            .unwrap_or(&self.default_admin_user_id);
+        if command.password.len() > 1024 {
             return Err(LoginError::InvalidCredentials);
         }
+        let user = self
+            .store
+            .load_user_identity(username)
+            .await
+            .map_err(|_| LoginError::Unavailable)?
+            .filter(|user| user.enabled)
+            .ok_or(LoginError::InvalidCredentials)?;
         let hash = self
             .store
-            .load_password_hash(&self.default_admin_user_id)
+            .load_password_hash(&user.id)
             .await
             .map_err(|_| LoginError::Unavailable)?
             .ok_or(LoginError::InvalidCredentials)?;
@@ -149,17 +212,25 @@ impl AuthService for DefaultAuthService {
             .store_session(
                 &session_id,
                 &AdminSession {
-                    admin_user_id: self.default_admin_user_id.clone(),
+                    admin_user_id: user.id.clone(),
+                    auth_revision: user.auth_revision,
                     expires_at,
                 },
             )
             .await
             .map_err(|_| LoginError::Unavailable)?;
-        if self
-            .store
-            .append_audit_event(self.auth_audit("admin.login", Utc::now()))
-            .await
-            .is_err()
+        if user.role == crate::model::users::UserRole::Admin
+            && self
+                .store
+                .append_audit_event({
+                    let mut event = self.auth_audit("admin.login", Utc::now());
+                    event.actor_admin_user_id = Some(user.id.clone());
+                    event.actor_ref = crate::model::auth::admin_session_actor_ref(&user.id);
+                    event.entity_ref = user.id;
+                    event
+                })
+                .await
+                .is_err()
         {
             let _ = self.store.delete_session(&session_id).await;
             return Err(LoginError::Unavailable);
@@ -171,7 +242,7 @@ impl AuthService for DefaultAuthService {
     }
 
     async fn validate_session(&self, session_id: Option<&str>) -> Result<bool, AdminError> {
-        Ok(self.resolve_admin_user_id(session_id).await?.is_some())
+        Ok(self.resolve_user(session_id).await?.is_some())
     }
 
     async fn logout(&self, session_id: &str) -> Result<(), AdminError> {
@@ -181,6 +252,14 @@ impl AuthService for DefaultAuthService {
             .await
             .map_err(|error| map_store_error(error, "administrator session"))?;
         if let Some(session) = session {
+            let user = self
+                .store
+                .load_user_identity(&session.admin_user_id)
+                .await
+                .map_err(|e| map_store_error(e, "user"))?;
+            if !user.is_some_and(|user| user.role == crate::model::users::UserRole::Admin) {
+                return Ok(());
+            }
             let mut event = self.auth_audit("admin.logout", Utc::now());
             event.actor_admin_user_id = Some(session.admin_user_id.clone());
             event.actor_ref = crate::model::auth::admin_session_actor_ref(&session.admin_user_id);
@@ -194,7 +273,14 @@ impl AuthService for DefaultAuthService {
     }
 }
 
-fn hash_admin_password(password: &str) -> Result<String, AdminError> {
+pub(super) fn validate_password(password: &str) -> Result<(), AdminError> {
+    if password.len() < 12 || password.len() > 1024 {
+        return Err(AdminError::invalid("密码长度须为 12 至 1024 字节"));
+    }
+    Ok(())
+}
+
+pub(super) fn hash_admin_password(password: &str) -> Result<String, AdminError> {
     Argon2::default()
         .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())

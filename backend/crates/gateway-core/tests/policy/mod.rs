@@ -18,6 +18,29 @@ fn account_scope() -> Arc<FrozenAccountScope> {
 }
 
 #[test]
+fn enabled_key_requires_an_enabled_nonempty_owner() {
+    for (id, enabled) in [("", true), ("alice", false)] {
+        assert!(
+            ClientPolicy::new(
+                ClientApiKeyId::new("key_owned").unwrap(),
+                plaintext("sk_owned"),
+                account_scope(),
+                true,
+                RateLimits::unlimited(),
+                gateway_core::policy::UserPolicy {
+                    id: id.to_owned(),
+                    enabled,
+                    group_ids: None,
+                    limits: Default::default()
+                },
+            )
+            .authorize()
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn disabled_client_key_should_be_denied() {
     let policy = ClientPolicy::new(
         ClientApiKeyId::new("key_disabled").expect("valid key ID"),
@@ -25,6 +48,12 @@ fn disabled_client_key_should_be_denied() {
         account_scope(),
         false,
         RateLimits::unlimited(),
+        gateway_core::policy::UserPolicy {
+            id: "test-owner".to_owned(),
+            enabled: true,
+            group_ids: None,
+            limits: Default::default(),
+        },
     );
 
     assert!(policy.authorize().is_err());
@@ -38,6 +67,12 @@ fn enabled_client_key_should_be_authorized() {
         account_scope(),
         true,
         RateLimits::unlimited(),
+        gateway_core::policy::UserPolicy {
+            id: "test-owner".to_owned(),
+            enabled: true,
+            group_ids: None,
+            limits: Default::default(),
+        },
     );
 
     assert!(policy.authorize().is_ok());

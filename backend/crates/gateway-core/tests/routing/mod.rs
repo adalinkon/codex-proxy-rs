@@ -95,6 +95,12 @@ fn client_policy(id: &str, plaintext: &str, enabled: bool) -> ClientPolicy {
         account_scope(),
         enabled,
         RateLimits::unlimited(),
+        gateway_core::policy::UserPolicy {
+            id: "test-owner".to_owned(),
+            enabled: true,
+            group_ids: None,
+            limits: Default::default(),
+        },
     )
 }
 

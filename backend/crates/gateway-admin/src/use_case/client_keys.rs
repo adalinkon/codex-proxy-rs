@@ -26,6 +26,29 @@ use super::{map_store_error, publish_committed};
 /// API 消费的 Client Key 管理服务。
 #[async_trait]
 pub trait ClientKeyService: Send + Sync {
+    async fn update_owned_identity(
+        &self,
+        user_id: &str,
+        id: ClientApiKeyId,
+        name: String,
+        label: Option<String>,
+    ) -> Result<ClientKeyMutation, AdminError>;
+    async fn reveal_owned(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> Result<ClientKeySecret, AdminError>;
+    async fn create_owned(
+        &self,
+        user_id: &str,
+        name: String,
+    ) -> Result<CreatedClientKey, AdminError>;
+    async fn mutate_owned(
+        &self,
+        user_id: &str,
+        id: ClientApiKeyId,
+        enabled: Option<bool>,
+    ) -> Result<ClientKeyMutation, AdminError>;
     async fn list(&self, query: ClientKeyListQuery) -> Result<ClientKeyPage, AdminError>;
     async fn reveal(&self, id: &ClientApiKeyId) -> Result<ClientKeySecret, AdminError>;
     async fn create(
@@ -64,6 +87,122 @@ impl DefaultClientKeyService {
 
 #[async_trait]
 impl ClientKeyService for DefaultClientKeyService {
+    async fn update_owned_identity(
+        &self,
+        user_id: &str,
+        id: ClientApiKeyId,
+        name: String,
+        label: Option<String>,
+    ) -> Result<ClientKeyMutation, AdminError> {
+        if name.trim().is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || label
+                .as_ref()
+                .is_some_and(|value| value.len() > 128 || value.chars().any(char::is_control))
+        {
+            return Err(AdminError::invalid("Key 名称或标签不合法"));
+        }
+        let revision = self
+            .store
+            .mutate_owned_key(
+                user_id,
+                crate::model::client_keys::OwnedKeyMutation::UpdateIdentity {
+                    id: id.clone(),
+                    name: name.trim().to_owned(),
+                    label: label
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty()),
+                },
+            )
+            .await
+            .map_err(|error| map_store_error(error, "client key"))?;
+        publish_committed(self.snapshot.as_ref(), revision).await?;
+        Ok(ClientKeyMutation {
+            config_revision: revision,
+            record: None,
+            id,
+        })
+    }
+    async fn reveal_owned(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> Result<ClientKeySecret, AdminError> {
+        let secret = self.reveal(id).await?;
+        if secret.record.user_id != user_id {
+            return Err(AdminError::not_found("Key 不存在"));
+        }
+        Ok(secret)
+    }
+
+    async fn create_owned(
+        &self,
+        user_id: &str,
+        name: String,
+    ) -> Result<CreatedClientKey, AdminError> {
+        if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            return Err(AdminError::invalid("Key 名称不合法"));
+        }
+        let id = ClientApiKeyId::new(format!("key_{}", Uuid::now_v7().simple()))
+            .map_err(|_| AdminError::internal("Key ID 创建失败"))?;
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let plaintext = format!("sk_{}", URL_SAFE_NO_PAD.encode(bytes));
+        let revision = self
+            .store
+            .mutate_owned_key(
+                user_id,
+                crate::model::client_keys::OwnedKeyMutation::Create(NewClientKey {
+                    id: id.clone(),
+                    user_id: Some(user_id.to_owned()),
+                    name,
+                    label: None,
+                    group_ids: Vec::new(),
+                    limits: gateway_core::policy::RateLimits::unlimited(),
+                    budget: Default::default(),
+                    plaintext,
+                }),
+            )
+            .await
+            .map_err(|e| map_store_error(e, "client key"))?;
+        publish_committed(self.snapshot.as_ref(), revision).await?;
+        Ok(CreatedClientKey {
+            config_revision: revision,
+            secret: self.reveal_owned(user_id, &id).await?,
+        })
+    }
+
+    async fn mutate_owned(
+        &self,
+        user_id: &str,
+        id: ClientApiKeyId,
+        enabled: Option<bool>,
+    ) -> Result<ClientKeyMutation, AdminError> {
+        let mutation = match enabled {
+            Some(enabled) => {
+                crate::model::client_keys::OwnedKeyMutation::SetEnabled(SetClientKeyEnabled {
+                    id: id.clone(),
+                    enabled,
+                })
+            }
+            None => crate::model::client_keys::OwnedKeyMutation::Delete(DeleteClientKey {
+                id: id.clone(),
+            }),
+        };
+        let revision = self
+            .store
+            .mutate_owned_key(user_id, mutation)
+            .await
+            .map_err(|e| map_store_error(e, "client key"))?;
+        publish_committed(self.snapshot.as_ref(), revision).await?;
+        Ok(ClientKeyMutation {
+            config_revision: revision,
+            record: None,
+            id,
+        })
+    }
+
     async fn list(&self, query: ClientKeyListQuery) -> Result<ClientKeyPage, AdminError> {
         validate_cursor(&query)?;
         self.store
@@ -94,6 +233,12 @@ impl ClientKeyService for DefaultClientKeyService {
             .store
             .create_client_key(
                 NewClientKey {
+                    user_id: command.user_id.or_else(|| match &context.actor {
+                        crate::model::MutationActor::AdminSession { admin_user_id } => {
+                            Some(admin_user_id.clone())
+                        }
+                        _ => None,
+                    }),
                     id,
                     name: command.name,
                     label: command.label,

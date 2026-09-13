@@ -20,6 +20,42 @@ struct MemoryAuthStore {
 
 #[async_trait]
 impl AuthStore for MemoryAuthStore {
+    async fn load_user_identity(
+        &self,
+        id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserIdentity>> {
+        Ok((id == "admin").then(|| super::test_user(id).identity))
+    }
+
+    async fn reset_user_budget(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> AdminStoreResult<chrono::DateTime<chrono::Utc>> {
+        unreachable!()
+    }
+    async fn delete_user(&self, _: &str) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
+    async fn load_user(
+        &self,
+        _: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserRecord>> {
+        panic!("authentication must not depend on profile loading")
+    }
+    async fn list_users(&self) -> AdminStoreResult<Vec<gateway_admin::model::users::UserRecord>> {
+        unreachable!()
+    }
+    async fn save_user(
+        &self,
+        _: gateway_admin::model::users::UserPolicyUpdate,
+        _: Option<&str>,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
+    async fn change_password(&self, _: &str, _: Option<&str>, _: &str) -> AdminStoreResult<bool> {
+        unreachable!()
+    }
     async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
         Ok(self.password_hash.lock().expect("password hash").clone())
     }
@@ -94,6 +130,19 @@ async fn successful_login_should_create_expiring_session_and_audit() {
             .expect("validate")
     );
     assert_eq!(store.audits.lock().expect("audits").len(), 1);
+    services
+        .auth()
+        .logout(&result.session_id)
+        .await
+        .expect("logout");
+    assert!(
+        !services
+            .auth()
+            .validate_session(Some(&result.session_id))
+            .await
+            .expect("revoked session")
+    );
+    assert_eq!(store.audits.lock().expect("audits").len(), 2);
 }
 
 #[tokio::test]

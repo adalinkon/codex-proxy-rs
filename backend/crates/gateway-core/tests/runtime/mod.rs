@@ -601,6 +601,12 @@ fn scoped_facts(value: u64, allow_removed: bool) -> SnapshotFacts {
             PlaintextClientApiKey::new("sk_audit_synthetic_not_a_real_key").expect("synthetic key"),
             vec![group.clone()],
             RateLimits::unlimited(),
+            gateway_core::policy::UserPolicy {
+                id: "test-owner".to_owned(),
+                enabled: true,
+                group_ids: None,
+                limits: Default::default(),
+            },
         )],
         vec![SnapshotAccountGroupFacts::new(
             group,
@@ -641,6 +647,12 @@ fn facts(config_revision: u64, observed_current_revision: u64) -> SnapshotFacts 
             PlaintextClientApiKey::new("sk_test").expect("plaintext key"),
             Vec::new(),
             RateLimits::unlimited(),
+            gateway_core::policy::UserPolicy {
+                id: "test-owner".to_owned(),
+                enabled: true,
+                group_ids: None,
+                limits: Default::default(),
+            },
         )],
         Vec::<SnapshotAccountGroupFacts>::new(),
         Vec::<SnapshotProviderAccountFacts>::new(),

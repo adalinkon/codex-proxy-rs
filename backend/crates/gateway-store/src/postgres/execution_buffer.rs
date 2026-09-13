@@ -635,6 +635,7 @@ impl ExecutionObservationWrite {
 fn new_request_bytes(request: &NewModelRequest) -> usize {
     size_of::<NewModelRequest>().saturating_add(text_bytes([
         Some(request.id.as_str()),
+        request.user_id.as_deref(),
         request
             .client_api_key_id
             .as_ref()

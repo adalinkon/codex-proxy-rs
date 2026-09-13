@@ -17,6 +17,13 @@ struct UnusedClientKeyStore;
 
 #[async_trait]
 impl ClientKeyStore for UnusedClientKeyStore {
+    async fn mutate_owned_key(
+        &self,
+        _: &str,
+        _: gateway_admin::model::client_keys::OwnedKeyMutation,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        unreachable!()
+    }
     async fn list_client_keys(&self, query: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage> {
         assert_eq!(query.page_size.get(), u16::MAX);
         Ok(ClientKeyPage {
@@ -80,6 +87,7 @@ async fn client_key_cursor_should_reject_value_that_does_not_match_sort() {
     let error = services
         .client_keys()
         .list(ClientKeyListQuery {
+            user_id: None,
             cursor: Some(ClientKeyCursor {
                 sort,
                 value: ClientKeyCursorValue::Enabled(true),
@@ -104,6 +112,7 @@ async fn client_key_list_should_forward_the_full_nonzero_u16_page_size() {
     let page = services
         .client_keys()
         .list(ClientKeyListQuery {
+            user_id: None,
             cursor: None,
             page_size: ClientKeyPageSize::new(u16::MAX).expect("maximum page size"),
             search: None,

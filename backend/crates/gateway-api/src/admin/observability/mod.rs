@@ -17,6 +17,7 @@ use super::{
 mod presenter;
 mod query;
 mod routes;
+mod user_routes;
 mod wire;
 
 pub(crate) use presenter::*;

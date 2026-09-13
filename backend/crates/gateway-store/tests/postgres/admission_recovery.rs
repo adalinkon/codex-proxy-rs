@@ -54,6 +54,7 @@ async fn recovery_loads_precise_window_and_running_request_facts() {
         .await
         .expect("load precise admission recovery facts");
     let expected = vec![ClientAdmissionRecovery {
+        user_id: Some("test-owner".to_owned()),
         client_api_key_ref: "key-recovery".to_owned(),
         recent_requests: vec![
             ClientAdmissionRecentRequest {
@@ -91,12 +92,12 @@ async fn seed_request(
     let completed_at = (outcome != "running").then_some(started_at + Duration::seconds(1));
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
+           user_id, id, client_api_key_ref, config_revision, protocol, operation, endpoint,
            client_transport, requested_model_id, outcome,
            started_at, deadline_at, completed_at,
            routing_scope, routing_group_refs, routing_group_names_snapshot
          ) values (
-           $1, 'key-recovery', 1, 'openai', 'responses', '/v1/responses',
+           'test-owner', $1, 'key-recovery', 1, 'openai', 'responses', '/v1/responses',
            'http_sse', 'coding', $2, $3, $4, $5,
            'all', '{}'::text[], '[]'::jsonb
          )",

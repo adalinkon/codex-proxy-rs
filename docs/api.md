@@ -18,8 +18,8 @@ Codex 原生生图配置还会携带 `X-OpenAI-Actor-Authorization: proxy-manage
 它仅用于客户端识别服务端托管认证，不能代替 Client Key。网关和 OpenAI Provider 都会过滤该请求头，
 上游账号身份只由服务端选中的账号提供；不要把真实账号 token 放进该标记。
 
-Client Key 通过账号分组限定路由范围：未绑定分组时可使用全部账号，绑定一个或多个分组时只能使用
-已启用分组成员的并集。分组可以混合 `openai` 与 `xai` 账号；同一请求只会在模型能力明确匹配且满足
+Client Key 通过账号分组限定路由范围：未绑定分组时继承所属用户的授权，绑定分组时与用户授权取交集，
+只能使用其中已启用分组成员的并集。分组可以混合 `openai` 与 `xai` 账号；同一请求只会在模型能力明确匹配且满足
 重放安全边界时跨 Provider fallback。
 
 运行设置可以分别配置 `minCodexDesktopVersion` 与 `minCodexCliVersion`。两者只接受 SemVer，`null`
@@ -236,8 +236,87 @@ Responses wire 之间的协议转换层，转换只在 xAI Provider 内完成。
 | 方法 | 路由 | 请求 | 说明 |
 | --- | --- | --- | --- |
 | `POST` | `/api/admin/auth/login` | `{ username?, password }` | 创建管理员会话并设置 Cookie |
-| `GET` | `/api/admin/auth/status` | 无 | 返回当前 Cookie 是否已认证 |
+| `GET` | `/api/admin/auth/status` | 无 | 返回 `authenticated` 与 `user: { id, username, role }`，未登录时 `user` 为 `null` |
 | `POST` | `/api/admin/auth/logout` | 无 | 删除当前会话并清除 Cookie |
+
+上述登录、状态和退出接口由管理员与普通用户共用，沿用现有 Cookie 名称。
+`role` 为 `admin` 或 `user`。管理接口要求管理员角色，普通用户访问返回 HTTP `403` / 业务码 `40301`；
+缺少、过期或失效的会话返回 `401` / `40101`。密码修改、管理员重置密码、用户启停或角色变更会推进
+该用户的认证版本，所有旧会话立即失效，重新启用用户不会恢复旧会话。密码重置不自动删除或禁用 Key。
+
+### 用户与个人面板
+
+不提供自助注册、套餐或订阅接口。新增用户业务不写入操作审计；现有管理员认证及其它管理
+操作的审计保持原有行为。
+
+| 方法 | 路由 | 请求与行为 |
+| --- | --- | --- |
+| `GET` | `/api/admin/users` | 返回用户数组及共享额度、分组、Key 数量 |
+| `POST` | `/api/admin/users/request-usage` | `{ ids: string[] }`，批量读取指定用户共享的当前并发、滚动 RPM |
+| `POST` | `/api/admin/client-keys/request-usage` | `{ ids: string[] }`，批量读取指定 Key 的当前并发、滚动 RPM |
+| `GET` | `/api/user/request-usage` | 当前会话用户的共享并发、滚动 RPM，忽略外部用户 ID |
+| `POST` | `/api/user/client-keys/request-usage` | `{ ids: string[] }`，仅允许查询自己拥有的 Key |
+| `POST` | `/api/admin/users/create` | 用户策略字段及必填 `password`，创建用户 |
+| `POST` | `/api/admin/users/update` | 用户策略字段，修改角色、启停、额度、请求限制与分组 |
+| `POST` | `/api/admin/users/reset-password` | `{ id, password }`，重置密码并使旧会话失效 |
+| `POST` | `/api/admin/users/reset-budget` | `{ id, operationId }`，管理员清零用户日／周用量并从当天重新起算周周期；`operationId` 为 UUID |
+| `POST` | `/api/admin/users/delete` | `{ id }`，删除用户、撤销所属 Key 和会话，保留历史费用与用户标识 |
+| `GET` | `/api/user/profile` | 只返回当前会话用户；与管理员用户列表复用相同的额度投影 |
+| `POST` | `/api/user/password` | `{ currentPassword, newPassword }`，验证当前密码后修改 |
+| `GET` | `/api/user/client-keys` | 沿用 Key 列表的游标、排序和搜索参数，服务端固定当前用户过滤条件 |
+| `POST` | `/api/user/client-keys/create` | `{ name }`，创建归属当前用户、继承用户权限且 Key 附加限额为零的 Key |
+| `POST` | `/api/user/client-keys/update` | `{ id, name, label }`，只修改自己的 Key 名称与标签，不接受授权或限额字段 |
+| `GET` | `/api/user/client-keys/reveal` | `id`，显式读取自己的明文 Key |
+| `POST` | `/api/user/client-keys/enable` | `{ id }`，启用自己的 Key |
+| `POST` | `/api/user/client-keys/disable` | `{ id }`，禁用自己的 Key |
+| `POST` | `/api/user/client-keys/delete` | `{ id }`，删除自己的 Key，保留用户账本与请求归属 |
+| `GET` | `/api/user/usage` | `start`、`end` 为 RFC3339 时间，`page` 默认 1；每页 50 条自己的使用记录 |
+| `GET` | `/api/user/usage/records` | 同款明细表；`startTime`、`endTime`、`currentPage`、`pageSize`、`provider`、`model`、`statusCode`、`search` |
+| `GET` | `/api/user/usage/records/summary` | 同范围的个人请求和 Token 汇总，展示格式与管理员一致 |
+| `GET` | `/api/user/usage/insights/overview` | 同范围的个人健康、性能、费用趋势；账号容量数据置空 |
+| `GET` | `/api/user/usage/insights/diagnostics` | 同范围的个人聚合，另接受 `dimension`；不允许 `account` 维度 |
+
+用户策略字段为 `username`、`role`、`enabled`、`allGroups`、`groupIds`、`dailyLimitUsd`、
+`weeklyLimitUsd`、`maxConcurrency` 和 `requestsPerMinute`。用户名不可修改，新密码长度为 12 至 1024
+字节。至少保留一个启用的管理员。普通用户必须 `allGroups: false`，空 `groupIds` 表示无权限；
+管理员可显式设置 `allGroups: true`。金额为非负十进制字符串，精度与 Key 相同，零表示不限。
+
+删除用户后不再出现在用户列表中，也不能登录、编辑配置或重置密码。所属 Key 与用户分组关联一并删除，
+用户账本和历史请求归属保留，已开始的请求仍可向原用户幂等结算。同名用户不能重新创建，以免接管历史
+记录或重置额度；最后一个启用的管理员不能删除。此删除操作不新增操作审计。
+
+用户投影包含 `id`、`username`、`role`、`enabled`、`allGroups`、`groups`、`keyCount`、
+`maxConcurrency`、`requestsPerMinute`，以及 `dailyLimitUsd`、`weeklyLimitUsd`、`dailyUsedUsd`、
+`weeklyUsedUsd`、`dailyRemainingUsd`、`weeklyRemainingUsd`、`dailyResetsAt`、`weeklyResetsAt`。
+不限额时剩余金额为 `null`，超额后剩余金额为零。日／周重置时间从创建当天北京时间零点连续计算，
+即使从未请求、窗口已过期或用户已停用，也返回当前周期的确定结束时间。
+
+实时请求计数接口返回数组 `[{ id, currentConcurrency, currentRpm }]`。批量请求最多 100 个 ID，重复 ID
+去重；不存在的用户、Key 或非本人 Key 返回 `404`。Redis 状态不可用或读取超时，两项计数为 `null`，
+页面显示 `— / 限制`；有效空计数为 `0`，不限额显示 `当前 / ∞`。并发是尚未过期的执行名额数，RPM 是
+最近滚动 60 秒内已取得名额的请求数，包含之后失败的执行，不是自然分钟内的成功数。内部重试不重复计数，
+释放并发不会扣减 RPM。查询直接使用 Redis 时钟和未过期成员计数，不清理、续期或修改准入状态。
+用户管理、个人资料和 Key 页面可见时每 5 秒批量读取当前页计数；切页或隐藏页面时取消旧查询并暂停轮询。
+显示是最近一次采样，实际准入以服务端即时判断为准。
+
+重置额度返回 `{ resetAt }`，该时间为取得用户行锁后的实际清零时间。用户级日、周已用同时归零，
+周周期以操作当天北京时间零点重新起算；日周期下次在次日零点重置。原有限额、Key 自身用量及周期、
+会话和历史使用统计保持原状。正在执行的请求结束后正常累计；完成于清零前的延迟结算只记账本，
+不加回清零后的用户用量。相同 `operationId` 重试返回首次清零时间，不再次清零；用于不同用户返回 `409`。
+前端在当前浏览器会话保留尚未确认结果的操作 ID，刷新或重新打开弹窗后继续复用。操作不写入审计事件。
+
+个人 Key 列表复用管理员 Key 列表展示字段，包括名称、标签、前缀、启停、时间、附加金额限额、并发／RPM
+及分组标识、名称、颜色。空分组使用 `routingScope: "inherit"`，表示继承用户授权；不返回上游账号或凭据。
+读取、修改、启停和删除他人 Key 返回 `404`。客户端不能通过请求体或查询参数指定他人的用户 ID。
+使用记录按请求开始时保存的用户归属过滤，沿用现有完整交付统计口径和日志保留周期，返回请求 ID、模型、
+时间、输入／输出／总 Token、USD 费用以及同一时间范围的请求、Token 和费用合计；缺失费用仍为 `null`。
+使用记录统计与包含重试、失败尝试已知费用的限额账本有不同口径。
+
+个人 API 密钥与使用统计页面直接复用管理员页面及基础组件，通过固定个人 API 路径获取数据，管理员的
+个人入口也只返回自身范围。个人统计页面保留原顶部汇总、成本效率和请求明细，不展示请求健康、热点诊断、
+响应速度，也不请求热点诊断接口。个人统计的新接口复用管理员金额、Token 和时延展示，服务端注入用户归属，
+不接受账号过滤或用户 ID；搜索不匹配隐藏的上游账号身份。账号标识、名称、邮箱、认证类型置空，容量字段为空或省略，
+不开放原始请求详情、运维错误及诊断原文。旧 `/api/user/usage` 合同继续保留。
 
 ## 5. 账号
 
@@ -619,12 +698,16 @@ PostgreSQL 或 Redis。管理端只在用户打开弹窗或点击刷新时调用
 | `POST` | `/api/admin/client-keys/disable` | `{ id }` | 禁用 |
 | `POST` | `/api/admin/client-keys/delete` | `{ id }` | 删除 |
 
-创建字段为 `name`、可选 `label`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、可选
+创建字段为 `name`、可选 `label`、可选 `userId`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、可选
 `dailyLimitUsd` 和 `weeklyLimitUsd`，更新请求再增加
 `id`。`groupIds` 必须显式提交：空数组派生 `routingScope: "all"`，非空数组派生
 `routingScope: "groups"`。响应同时返回分组引用 `groups`，以及从当前有效账号池派生、仅供展示的
 `providerKinds`；Client Key 不再保存 `providerKind`。创建和 reveal 响应会返回完整明文 Key，调用方
 必须立即安全保存。
+
+每个 Key 必须有用户归属，创建时省略 `userId` 使用当前管理员；管理 API Key 调用省略时使用最早创建的
+管理员。Key 归属不可修改。空 `groupIds` 表示继承用户授权；非空分组必须在用户授权内，执行时继续与
+用户最新分组取交集。管理员 `allGroups: true` 且 Key 未绑定分组时仍可使用全部账号。
 
 金额字段为非负十进制字符串，最多 10 位整数与 10 位小数，`"0"` 表示不限额。
 创建时省略金额字段默认为零；更新时省略或 `null` 保留当前值，修改限额不会清空已用金额。
@@ -633,7 +716,8 @@ PostgreSQL 或 Redis。管理端只在用户打开弹窗或点击刷新时调用
 列表增加 `dailyLimitUsd`、`weeklyLimitUsd`、`dailyUsedUsd`、`weeklyUsedUsd`（均为字符串）、
 `dailyResetsAt`、`weeklyResetsAt`（RFC3339 或 `null`）。
 管理端日／周金额显示两位小数，悬停可查看原始值；记账和限额比较保留完整精度。
-日窗口按北京时间零点重置；周窗口从首次准入当天零点起持续七天，到期后在下一次使用时重新开启。
+日窗口每天北京时间零点重置；周窗口以 Key 创建当天北京时间零点为锚点，每七天连续推进。
+是否请求、启停或修改限额都不改变周期，首次读取即返回明确的日／周重置时间。
 费用按请求完成时间归属窗口。并发按同一 Key 的执行中请求累计，包含 SSE 与每个 WebSocket
 `response.create`；空闲连接不占名额，内部重试不重复占用。
 修改 Key 策略对既有 WebSocket 连接的下一次请求同样生效，已开始的请求保持原有快照。
@@ -647,6 +731,25 @@ HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly
 
 自动结算按网关请求 ID 幂等执行。账本独立于使用统计日志，记录保留至删除 Key，
 不受 `usageRetentionDays` 影响。
+
+用户级限制与上述 Key 限制同时生效。每次请求先进行 Key 鉴权与用户启用检查、基础参数和客户端最低
+版本校验、有效授权范围与 Provider 候选检查，再依次检查用户日限、用户周限、Key 日限、Key 周限，
+最后原子取得用户和 Key 两层 RPM／并发名额，再选择上游账号。用户金额拒绝的错误码为
+`user_daily_budget_exceeded` / `user_weekly_budget_exceeded`，同样返回 `429` 与 `Retry-After`。
+两层请求限制任一失败，不留下并发名额或部分 RPM 扣计。HTTP、SSE 和每个 WebSocket `response.create`
+复用相同流程；内部重试复用用户／Key 名额，并继续使用本次请求固定的用户及有效账号范围。
+
+用户日窗口与七天窗口沿用相同北京时间规则，以用户创建当天为锚点；主动重置后改用重置当天。
+用户与 Key 的周周期各自计算，所有所属 Key 跨账号、跨 Provider 汇总用户费用。修改用户限额、
+创建或删除 Key 均不清空用户已用金额。结算在同一事务中按请求 ID 幂等累计用户与仍存在的 Key 费用；
+删除 Key 后已开始请求仍可结算到用户账本。用户账本独立保存，不随 Key 或请求日志删除。
+
+常规查询读取当前窗口累计值，结算按请求 ID 幂等增量更新，不逐次扫描费用账本求和。用户列表、Key 列表
+和个人资料在周期边界重新获取额度；后台页面恢复可见时补检查。上游账号额度继续遵循 Provider 自身周期。
+
+金额检查不预占未来费用：已准入请求仍可使金额超额。费用缺失的尝试按零累计，不能据此推断上游免费。
+结算失败时进程内保留精确费用，在该用户任意 Key 的下一次请求前重试；进程退出后丢失的待重试金额无法
+恢复。此能力用于按已记录费用限制新请求，不是保证绝不超额的预付费扣款系统。
 
 English: Daily and weekly budgets use automatically recorded costs. Missing usage or interrupted requests
 do not block a Key, and no manual reconciliation is required. New requests receive `429` once recorded

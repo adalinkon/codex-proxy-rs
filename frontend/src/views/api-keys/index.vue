@@ -8,8 +8,10 @@ import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
+import RequestLimitsCell from '@/components/RequestLimitsCell.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { usePageSelection } from '@/composables/usePageSelection'
+import { useRequestUsage } from '@/composables/useRequestUsage'
 import ApiKeyActions from './components/ApiKeyActions.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
 import ApiKeyCreateModal from './components/ApiKeyCreateModal.vue'
@@ -24,6 +26,7 @@ import { useApiKeysQuery } from './composables/useApiKeysQuery'
 import { useApiKeyUse } from './composables/useApiKeyUse'
 import { apiKeyColumns } from './constants'
 
+const props = withDefaults(defineProps<{ scope?: 'admin' | 'user' }>(), { scope: 'admin' })
 const selectedIds = ref<Set<string>>(new Set())
 const {
   loading,
@@ -35,7 +38,8 @@ const {
   handlePageChange,
   handlePageSizeChange,
   handleSortChange,
-} = useApiKeysQuery()
+} = useApiKeysQuery(props.scope)
+const requestUsage = useRequestUsage(props.scope === 'user' ? 'my-keys' : 'keys', () => apiKeys.value.map(key => key.id))
 
 const {
   groups,
@@ -70,7 +74,7 @@ const {
   copyToClipboard,
   revealPlaintextKey,
   copyApiKey,
-} = useApiKeyMutations({ selectedIds, reload: loadApiKeys })
+} = useApiKeyMutations({ selectedIds, reload: loadApiKeys, scope: props.scope })
 
 const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll } = usePageSelection(
   apiKeys,
@@ -92,7 +96,7 @@ const {
 
 watch(
   showFormModal,
-  open => open && void loadGroups(),
+  open => open && props.scope === 'admin' && void loadGroups(),
 )
 </script>
 
@@ -161,20 +165,7 @@ watch(
               <ApiKeyBudgetCell :api-key="row" />
             </template>
             <template #limits="{ row }">
-              <dl class="m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs tabular-nums">
-                <dt class="text-cp-text-tertiary">
-                  并发
-                </dt>
-                <dd class="m-0 truncate text-cp-text" :title="String(row.maxConcurrency || '∞')">
-                  {{ row.maxConcurrency || '∞' }}
-                </dd>
-                <dt class="text-cp-text-tertiary">
-                  RPM
-                </dt>
-                <dd class="m-0 truncate text-cp-text" :title="String(row.requestsPerMinute || '∞')">
-                  {{ row.requestsPerMinute || '∞' }}
-                </dd>
-              </dl>
+              <RequestLimitsCell :max-concurrency="row.maxConcurrency" :requests-per-minute="row.requestsPerMinute" :current-concurrency="requestUsage.get(row.id)?.currentConcurrency" :current-rpm="requestUsage.get(row.id)?.currentRpm" />
             </template>
             <template #enabled="{ row }">
               <ApiKeyStatusBadge :api-key="row" />
@@ -213,6 +204,7 @@ watch(
       :groups="groups"
       :group-loading="loadingGroups"
       :editing="Boolean(editingKey)"
+      :policy-readonly="scope === 'user'"
       :created-key="createdKey"
       :saving="savingKey"
       @copy="copyToClipboard"

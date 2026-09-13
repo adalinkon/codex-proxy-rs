@@ -272,6 +272,12 @@ fn facts_with_min_versions(
             PlaintextClientApiKey::new("sk_test").expect("plaintext key"),
             Vec::new(),
             RateLimits::unlimited(),
+            gateway_core::policy::UserPolicy {
+                id: "test-owner".to_owned(),
+                enabled: true,
+                group_ids: None,
+                limits: Default::default(),
+            },
         )],
         Vec::<SnapshotAccountGroupFacts>::new(),
         Vec::<SnapshotProviderAccountFacts>::new(),
@@ -289,4 +295,64 @@ fn compiler(store: Arc<dyn SnapshotStorePort>) -> RuntimeSnapshotCompiler {
 
 fn revision(value: u64) -> ConfigRevision {
     ConfigRevision::new(value).expect("positive revision")
+}
+
+#[test]
+fn user_and_key_groups_intersect_without_widening_empty_permissions() {
+    use gateway_core::{
+        account::{ProviderAccountId, scope::AccountGroupId},
+        policy::UserPolicy,
+    };
+    let group = |id| AccountGroupId::new(format!("grp_{id:0>32}")).unwrap();
+    let account = |id| ProviderAccountId::new(format!("acct_{id}")).unwrap();
+    for (allowed, key_groups, expected) in [
+        (Some(vec![group("a")]), vec![], [true, false]),
+        (Some(vec![group("a")]), vec![group("b")], [false, false]),
+        (Some(vec![]), vec![], [false, false]),
+        (None, vec![], [true, true]),
+    ] {
+        let facts = SnapshotFacts::new(
+            revision(1),
+            revision(1),
+            SnapshotSettingsFacts::new(3, 50, "smart", BTreeMap::new(), None, None),
+            vec![SnapshotClientPolicyFacts::new(
+                ClientApiKeyId::new("key").unwrap(),
+                PlaintextClientApiKey::new("sk_test").unwrap(),
+                key_groups,
+                RateLimits::unlimited(),
+                UserPolicy {
+                    id: "alice".to_owned(),
+                    enabled: true,
+                    group_ids: allowed,
+                    limits: Default::default(),
+                },
+            )],
+            vec![
+                SnapshotAccountGroupFacts::new(group("a"), "A".to_owned(), true),
+                SnapshotAccountGroupFacts::new(group("b"), "B".to_owned(), true),
+            ],
+            vec![
+                SnapshotProviderAccountFacts::new(account("one"), "alpha"),
+                SnapshotProviderAccountFacts::new(account("two"), "alpha"),
+            ],
+            vec![
+                SnapshotAccountGroupMemberFacts::new(group("a"), account("one")),
+                SnapshotAccountGroupMemberFacts::new(group("b"), account("two")),
+            ],
+        );
+        let compiler = RuntimeSnapshotCompiler::new(
+            Arc::new(TestSnapshotStore::new(Ok(facts))),
+            Arc::new(TestCatalog::Empty),
+        );
+        let snapshot = block_on(compiler.compile()).unwrap();
+        let policy = snapshot.client_policies().next().unwrap();
+        assert_eq!(
+            [
+                policy.account_scope().allows(&account("one")),
+                policy.account_scope().allows(&account("two"))
+            ],
+            expected
+        );
+        assert_eq!(policy.user().id, "alice");
+    }
 }

@@ -497,13 +497,21 @@ impl DefaultExecutionService {
             operation,
             metadata,
         } = request;
+        let user = client.policy.user();
+        let admission_started_at = Instant::now();
+        if let Some(budget) = &self.budget {
+            budget
+                .admit(user.id.clone(), client.policy.key_id().clone())
+                .await?;
+        }
         let admission_request = ClientAdmissionRequest {
+            user_id: user.id.clone(),
+            user_limits: user.limits,
             model_request_id: request_id.clone(),
             client_api_key_id: client.policy.key_id().clone(),
             lease_ttl: MODEL_REQUEST_DEADLINE,
             limits: client.policy.limits(),
         };
-        let admission_started_at = Instant::now();
         match self
             .admissions
             .admit(admission_request)
@@ -527,16 +535,11 @@ impl DefaultExecutionService {
         }
         let admission_decision_ms = duration_ms(admission_started_at.elapsed());
         let admission = AdmissionLease {
+            user_id: user.id.clone(),
             port: Arc::clone(&self.admissions),
             client_api_key_id: client.policy.key_id().clone(),
             model_request_id: request_id.clone(),
         };
-        if let Some(budget) = &self.budget
-            && let Err(error) = budget.admit(client.policy.key_id().clone()).await
-        {
-            admission.release().await;
-            return Err(error);
-        }
         let observation = plan
             .candidates()
             .first()
@@ -548,6 +551,7 @@ impl DefaultExecutionService {
                 )
             });
         let new_request = NewModelRequest {
+            user_id: Some(user.id.clone()),
             id: request_id.clone(),
             client_api_key_id: Some(client.policy.key_id().clone()),
             client_api_key_ref: client.policy.key_id().clone(),
@@ -589,6 +593,7 @@ impl DefaultExecutionService {
                     settle_budget(
                         budget.as_ref(),
                         ClientBudgetCharge {
+                            user_id: Some(user.id.clone()),
                             key_id: client.policy.key_id().clone(),
                             request_id: request_id.clone(),
                             amount_usd: crate::metering::Decimal::ZERO,
@@ -706,6 +711,7 @@ impl DefaultExecutionService {
         let new_request = NewModelRequest {
             id: request_id,
             client_api_key_id: None,
+            user_id: None,
             client_api_key_ref: actor,
             config_revision: plan.config_revision(),
             routing: crate::routing::AccountRoutingSnapshot::all(),
@@ -1030,6 +1036,7 @@ impl AccountProbe for DefaultExecutionService {
 }
 
 struct AdmissionLease {
+    user_id: String,
     port: Arc<dyn ClientAdmissionPort>,
     client_api_key_id: ClientApiKeyId,
     model_request_id: ModelRequestId,
@@ -1045,7 +1052,11 @@ impl AdmissionLease {
     async fn release(self) {
         if let Err(error) = self
             .port
-            .release(&self.client_api_key_id, &self.model_request_id)
+            .release(
+                &self.user_id,
+                &self.client_api_key_id,
+                &self.model_request_id,
+            )
             .await
         {
             tracing::warn!(%error, "Client admission 释放失败，依赖租约 TTL 收敛");

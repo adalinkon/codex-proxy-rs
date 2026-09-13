@@ -24,6 +24,7 @@ use super::TestDatabase;
 #[test]
 fn client_key_requires_the_frozen_plaintext_format() {
     let key = NewClientApiKey {
+        user_id: None,
         budget: Default::default(),
         id: "key-1".to_owned(),
         name: "default".to_owned(),
@@ -48,10 +49,10 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
             char::from(b'a' + index as u8).to_string().repeat(43)
         );
         sqlx::query(
-            "insert into client_api_keys (
+            "insert into client_api_keys (user_id,
                id, name, label, key, enabled, max_concurrency, requests_per_minute,
                created_at, updated_at
-             ) values ($1, $2, $2, $3, true, 0, 0,
+             ) values ('test-owner', $1, $2, $2, $3, true, 0, 0,
                        now() - ($4::bigint * interval '1 minute'), now())",
         )
         .bind(id)
@@ -65,6 +66,7 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
     let repository = PgClientApiKeyRepository::new(database.pool.clone());
     let first = repository
         .list_client_api_keys(ClientApiKeyListQuery {
+            user_id: None,
             cursor: None,
             page_size: 2,
             search: None,
@@ -77,6 +79,7 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
     assert!(first.next_cursor.is_some());
     let second = repository
         .list_client_api_keys(ClientApiKeyListQuery {
+            user_id: None,
             cursor: first.next_cursor,
             page_size: 2,
             search: None,
@@ -89,6 +92,7 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
 
     let searched = repository
         .list_client_api_keys(ClientApiKeyListQuery {
+            user_id: None,
             cursor: None,
             page_size: 10,
             search: Some("needle".to_owned()),
@@ -107,6 +111,7 @@ fn client_key_cursor_is_bound_to_one_sort_contract() {
     let created_sort = ClientApiKeySort::default();
     assert!(
         ClientApiKeyListQuery {
+            user_id: None,
             cursor: None,
             page_size: u16::MAX,
             search: None,
@@ -122,6 +127,7 @@ fn client_key_cursor_is_bound_to_one_sort_contract() {
     )
     .expect("valid cursor");
     let query = ClientApiKeyListQuery {
+        user_id: None,
         cursor: Some(cursor),
         page_size: 10,
         search: None,
@@ -148,6 +154,7 @@ async fn admin_client_key_adapter_should_preserve_the_full_nonzero_u16_page_size
     };
     let page = PgAdminClientKeyStore::new(database.pool.clone())
         .list_client_keys(AdminClientKeyListQuery {
+            user_id: None,
             cursor: None,
             page_size: ClientKeyPageSize::new(u16::MAX).expect("maximum page size"),
             search: None,
@@ -190,10 +197,10 @@ async fn client_key_database_sort_is_stable_and_keeps_null_last_used_at_last() {
     .enumerate()
     {
         sqlx::query(
-            "insert into client_api_keys (
+            "insert into client_api_keys (user_id,
                id, name, key, enabled, max_concurrency, requests_per_minute,
                last_used_at, created_at, updated_at
-             ) values ($1, $2, $3, $4, 0, 0, $5::timestamptz, $6::timestamptz,
+             ) values ('test-owner', $1, $2, $3, $4, 0, 0, $5::timestamptz, $6::timestamptz,
                        $6::timestamptz)",
         )
         .bind(id)
@@ -252,6 +259,7 @@ async fn client_key_database_sort_is_stable_and_keeps_null_last_used_at_last() {
         loop {
             let page = repository
                 .list_client_api_keys(ClientApiKeyListQuery {
+                    user_id: None,
                     cursor,
                     page_size: 1,
                     search: None,
@@ -276,10 +284,10 @@ async fn client_key_usage_touch_should_preserve_the_latest_observed_timestamp() 
         return;
     };
     sqlx::query(
-        "insert into client_api_keys (
+        "insert into client_api_keys (user_id,
            id, name, key, enabled, max_concurrency, requests_per_minute,
            created_at, updated_at
-         ) values ('key_usage_touch', 'usage', $1, true, 0, 0, now(), now())",
+         ) values ('test-owner', 'key_usage_touch', 'usage', $1, true, 0, 0, now(), now())",
     )
     .bind(format!("sk_{}", "t".repeat(43)))
     .execute(&database.pool)
@@ -318,10 +326,10 @@ async fn client_key_usage_daemon_should_flush_pending_touch_on_shutdown() {
         return;
     };
     sqlx::query(
-        "insert into client_api_keys (
+        "insert into client_api_keys (user_id,
            id, name, key, enabled, max_concurrency, requests_per_minute,
            created_at, updated_at
-         ) values ('key_usage_daemon', 'usage', $1, true, 0, 0, now(), now())",
+         ) values ('test-owner', 'key_usage_daemon', 'usage', $1, true, 0, 0, now(), now())",
     )
     .bind(format!("sk_{}", "u".repeat(43)))
     .execute(&database.pool)
@@ -360,10 +368,10 @@ async fn dedicated_reveal_returns_plaintext_without_debug_exposure() {
     };
     let plaintext = format!("sk_{}", "r".repeat(43));
     sqlx::query(
-        "insert into client_api_keys (
+        "insert into client_api_keys (user_id,
            id, name, key, enabled, max_concurrency, requests_per_minute,
            created_at, updated_at
-         ) values ('key_reveal', 'reveal', $1, true, 1, 2, now(), now())",
+         ) values ('test-owner', 'key_reveal', 'reveal', $1, true, 1, 2, now(), now())",
     )
     .bind(&plaintext)
     .execute(&database.pool)
@@ -383,6 +391,7 @@ async fn dedicated_reveal_returns_plaintext_without_debug_exposure() {
 fn client_key_debug_redacts_plaintext() {
     let secret = format!("sk_{}", "s".repeat(43));
     let key = NewClientApiKey {
+        user_id: None,
         budget: Default::default(),
         id: "key-1".to_owned(),
         name: "default".to_owned(),

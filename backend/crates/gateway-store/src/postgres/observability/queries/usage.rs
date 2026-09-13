@@ -11,6 +11,11 @@ pub(crate) fn push_usage_filter(
     filter: &UsageRecordFilter,
     alias: &str,
 ) {
+    if let Some(value) = &filter.user_id {
+        query
+            .push(format!(" and {alias}.user_id = "))
+            .push_bind(value.clone());
+    }
     if let Some(value) = &filter.client_api_key_ref {
         query.push(format!(" and {alias}.client_api_key_ref = "));
         query.push_bind(value.clone());
@@ -91,6 +96,18 @@ pub(crate) fn push_usage_filter(
             "upstream_model_id",
             "upstream_request_id",
         ] {
+            // 个人查询不搜索账号身份，避免通过命中结果探测被隐藏的上游信息。
+            if filter.user_id.is_some()
+                && matches!(
+                    column,
+                    "provider_account_ref"
+                        | "provider_account_email_snapshot"
+                        | "provider_account_name_snapshot"
+                        | "upstream_request_id"
+                )
+            {
+                continue;
+            }
             query.push(format!(" escape '\\' or {alias}.{column} like "));
             query.push_bind(pattern.clone());
         }

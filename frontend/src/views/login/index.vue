@@ -55,7 +55,7 @@ async function handleSubmit(): Promise<void> {
     <LoginBackground />
 
     <section
-      class="grid min-h-dvh items-center justify-items-center px-5 py-[clamp(24px,5dvh,64px)] min-[980px]:justify-items-end min-[980px]:pr-[clamp(48px,17.3vw,332px)] max-[560px]:p-4.5"
+      class="grid min-h-dvh items-center justify-items-center px-5 py-8 max-[400px]:px-4"
       aria-label="Codex Proxy RS 登录"
     >
       <LoginPanel

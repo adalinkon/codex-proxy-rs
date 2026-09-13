@@ -25,7 +25,8 @@ pub use use_case::{
     account_groups::AccountGroupService, accounts::AccountsService, auth::AuthService,
     backup::BackupService, client_distribution::ClientDistributionService,
     client_keys::ClientKeyService, observability::ObservabilityService, openai::OpenAiService,
-    proxies::ProxiesService, settings::SettingsService, system::SystemService, xai::XaiService,
+    proxies::ProxiesService, settings::SettingsService, system::SystemService, users::UserService,
+    xai::XaiService,
 };
 
 use model::{AdminError, AdminErrorKind};
@@ -149,6 +150,7 @@ pub enum AdminConfigError {
 /// 字段全部私有；调用方经 accessor 直接调用能力，不需要命名内部 `use_case` 模块。
 #[derive(Clone)]
 pub struct AdminServices {
+    users: Arc<dyn UserService>,
     proxies: Arc<dyn ProxiesService>,
     auth: Arc<dyn AuthService>,
     accounts: Arc<dyn AccountsService>,
@@ -164,6 +166,10 @@ pub struct AdminServices {
 }
 
 impl AdminServices {
+    #[must_use]
+    pub fn users(&self) -> &dyn UserService {
+        self.users.as_ref()
+    }
     #[must_use]
     pub fn proxies(&self) -> &dyn ProxiesService {
         self.proxies.as_ref()
@@ -297,6 +303,11 @@ pub async fn initialize(
         backup_ports.object_store(),
     );
     let services = AdminServices {
+        users: Arc::new(use_case::users::DefaultUserService::new(
+            store.auth(),
+            snapshot.clone(),
+            store.request_usage(),
+        )),
         proxies: Arc::new(use_case::proxies::DefaultProxiesService::new(
             store.proxies(),
             proxy_probe,

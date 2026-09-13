@@ -102,6 +102,8 @@ impl AdminErrorCode {
     pub const INVALID_CREDENTIALS: Self = Self(40102);
     /// 管理 API Key 错误。
     pub const INVALID_API_KEY: Self = Self(40103);
+    /// 已登录用户缺少管理员角色。
+    pub const FORBIDDEN: Self = Self(40301);
     /// 资源不存在。
     pub const NOT_FOUND: Self = Self(40401);
     /// 配置 revision 或资源状态冲突。
@@ -202,12 +204,12 @@ const INVALID_TIME_RANGE: AdminErrorSpec = AdminErrorSpec::new(
 const SESSION_REQUIRED: AdminErrorSpec = AdminErrorSpec::new(
     StatusCode::UNAUTHORIZED,
     AdminErrorCode::SESSION_REQUIRED,
-    "需要管理员登录",
+    "需要登录",
 );
 const INVALID_CREDENTIALS: AdminErrorSpec = AdminErrorSpec::new(
     StatusCode::UNAUTHORIZED,
     AdminErrorCode::INVALID_CREDENTIALS,
-    "管理员用户名或密码错误",
+    "用户名或密码错误",
 );
 const INVALID_API_KEY: AdminErrorSpec = AdminErrorSpec::new(
     StatusCode::UNAUTHORIZED,
@@ -288,6 +290,14 @@ impl AdminError {
 
     pub fn admin_session_required() -> Self {
         Self::from_spec(SESSION_REQUIRED)
+    }
+
+    pub fn administrator_required() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            AdminErrorCode::FORBIDDEN,
+            "需要管理员权限",
+        )
     }
 
     pub fn invalid_admin_credentials() -> Self {

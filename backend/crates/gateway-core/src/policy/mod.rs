@@ -93,6 +93,7 @@ impl RateLimits {
 /// 从 `client_api_keys` 冻结的公开准入事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPolicy {
+    user: UserPolicy,
     key_id: ClientApiKeyId,
     plaintext_key: PlaintextClientApiKey,
     account_scope: Arc<FrozenAccountScope>,
@@ -108,14 +109,21 @@ impl ClientPolicy {
         account_scope: Arc<FrozenAccountScope>,
         enabled: bool,
         limits: RateLimits,
+        user: UserPolicy,
     ) -> Self {
         Self {
+            user,
             key_id,
             plaintext_key,
             account_scope,
             enabled,
             limits,
         }
+    }
+
+    #[must_use]
+    pub const fn user(&self) -> &UserPolicy {
+        &self.user
     }
 
     #[must_use]
@@ -149,7 +157,7 @@ impl ClientPolicy {
     ///
     /// Key 已禁用时返回稳定拒绝原因。
     pub fn authorize(&self) -> Result<(), PolicyError> {
-        if self.enabled {
+        if self.enabled && self.user.enabled && !self.user.id.is_empty() {
             Ok(())
         } else {
             Err(PolicyError::Denied {
@@ -157,4 +165,13 @@ impl ClientPolicy {
             })
         }
     }
+}
+
+/// 请求冻结的用户归属与授权；None 表示管理员明确拥有全部分组，空集合表示无权限。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPolicy {
+    pub id: String,
+    pub enabled: bool,
+    pub group_ids: Option<Vec<crate::account::scope::AccountGroupId>>,
+    pub limits: RateLimits,
 }

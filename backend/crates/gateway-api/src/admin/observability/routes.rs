@@ -7,6 +7,7 @@ where
     S: AdminSessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .merge(super::user_routes::router::<S>())
         .route("/api/admin/dashboard/summary", get(dashboard_summary::<S>))
         .route("/api/admin/dashboard/trend", get(dashboard_trend::<S>))
         .route("/api/admin/usage/records", get(usage_records::<S>))

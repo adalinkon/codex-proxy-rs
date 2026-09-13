@@ -20,6 +20,10 @@ import { useUsageRecordsTable } from './composables/useUsageRecordsTable'
 import { useUsageTimeRange } from './composables/useUsageTimeRange'
 import { usageRecordColumns, usageTimeRangeOptions } from './constants'
 
+const props = withDefaults(defineProps<{ scope?: 'admin' | 'user' }>(), { scope: 'admin' })
+const columns = computed(() => props.scope === 'user'
+  ? usageRecordColumns.filter(column => !['accountEmail', 'actions'].includes(column.key))
+  : usageRecordColumns)
 const recordView = shallowRef('success')
 const recordViewOptions = [
   { label: '成功记录', value: 'success' },
@@ -45,6 +49,7 @@ const {
   handlePageChange,
   handlePageSizeChange,
 } = useUsageRecordsTable({
+  scope: props.scope,
   timeRangeParams,
   latestTimeRangeParams,
   active: computed(() => recordView.value === 'success'),
@@ -75,6 +80,7 @@ watch(timeRange, () => {
     <UsageSummaryCards :summary="summary" />
     <UsageInsightsGrid
       v-model:diagnostic-dimension="diagnosticDimension"
+      :personal="scope === 'user'"
       :overview="insights.overview"
       :diagnostics="insights.diagnostics"
       :loading="analyticsLoading"
@@ -95,7 +101,7 @@ watch(timeRange, () => {
               成功请求与失败请求明细
             </p>
           </div>
-          <BaseSegmented v-model="recordView" label="请求明细类型" :options="recordViewOptions" class="w-52" />
+          <BaseSegmented v-if="scope === 'admin'" v-model="recordView" label="请求明细类型" :options="recordViewOptions" class="w-52" />
         </div>
       </template>
 
@@ -106,6 +112,7 @@ watch(timeRange, () => {
         >
           <UsageFilters
             v-model:search="searchQuery"
+            :personal="scope === 'user'"
             :loading="loading"
             :refreshing="refreshingList"
             @refresh="refreshUsageRecords"
@@ -114,12 +121,12 @@ watch(timeRange, () => {
           <div class="flex min-h-0 min-w-0 flex-col">
             <UsageRecordsTable
               class="min-h-0 flex-1"
-              :columns="usageRecordColumns"
+              :columns="columns"
               :rows="records"
               :loading="loading"
               empty-text="暂无使用记录"
             >
-              <template #actions="{ row }">
+              <template v-if="scope === 'admin'" #actions="{ row }">
                 <div class="flex items-center justify-start">
                   <BaseIconButton
                     variant="ghost"
@@ -141,7 +148,7 @@ watch(timeRange, () => {
           </div>
         </div>
 
-        <div v-show="recordView === 'errors'" class="min-h-130 min-w-0 flex-1">
+        <div v-if="scope === 'admin'" v-show="recordView === 'errors'" class="min-h-130 min-w-0 flex-1">
           <OpsErrorPanel
             :time-range-params="timeRangeParams"
             :latest-time-range-params="latestTimeRangeParams"

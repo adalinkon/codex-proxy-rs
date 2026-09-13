@@ -341,8 +341,8 @@ async fn usage_search_should_match_client_api_key_prefix() {
         .expect("seed observability facts");
     let plaintext_key = format!("sk_{}", "K".repeat(43));
     sqlx::query(
-        "insert into client_api_keys (id, name, key, enabled, created_at, updated_at)
-         values ('key_observe', 'usage search', $1, true, $2, $2)",
+        "insert into client_api_keys (user_id, id, name, key, enabled, created_at, updated_at)
+         values ('test-owner', 'key_observe', 'usage search', $1, true, $2, $2)",
     )
     .bind(&plaintext_key)
     .bind(now)
@@ -1040,6 +1040,7 @@ async fn admin_observability_adapter_preserves_utc_queries_metrics_costs_and_det
         .list_usage_records(admin_observability::UsageQuery {
             range,
             filter: admin_observability::UsageFilter {
+                user_id: None,
                 client_api_key_ref: Some("key_observe".to_owned()),
                 request_id: Some("req_observe_success".to_owned()),
                 provider_account_ref: Some("acct_observe".to_owned()),
@@ -1737,6 +1738,95 @@ async fn seed_observability_facts(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn user_usage_scope_survives_key_deletion_and_excludes_other_users() {
+    let Some(database) = TestDatabase::create("user_usage_scope").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_observability_facts(&database.pool, now).await.unwrap();
+    sqlx::query("update model_requests set user_id='test-owner' where id='req_observe_success'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("insert into client_api_keys(user_id,id,name,key,created_at,updated_at) values('test-owner','key_observe','owned','sk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',now(),now())").execute(&database.pool).await.unwrap();
+    sqlx::query(
+        "update model_requests set client_api_key_id='key_observe' where id='req_observe_success'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let range =
+        ObservabilityRange::new(now - TimeDelta::hours(1), now + TimeDelta::hours(1)).unwrap();
+    for deleted in [false, true] {
+        if deleted {
+            sqlx::query("delete from client_api_keys where id='key_observe'")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+        for (user, total) in [("test-owner", 1), ("different-user", 0)] {
+            let page = observability_repository(&database.pool)
+                .list_usage_records(UsageRecordQuery {
+                    range,
+                    filter: UsageRecordFilter {
+                        user_id: Some(user.to_owned()),
+                        ..Default::default()
+                    },
+                    current_page: 1,
+                    page_size: ObservabilityPageSize::new(10).unwrap(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(page.total, total);
+            if total == 1 {
+                assert_eq!(page.items[0].id, "req_observe_success");
+            }
+            let repository = observability_repository(&database.pool);
+            let filter = UsageRecordFilter {
+                user_id: Some(user.to_owned()),
+                ..Default::default()
+            };
+            let summary = repository
+                .usage_summary(range, filter.clone())
+                .await
+                .unwrap();
+            assert_eq!(summary.requests.request_count, total);
+            let diagnostics = repository
+                .usage_diagnostics(range, filter.clone(), DiagnosticDimension::Model)
+                .await
+                .unwrap();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|item| item.request_count)
+                    .sum::<u64>(),
+                total
+            );
+            for (search, expected) in [
+                ("req_observe_success", total),
+                ("account@example", 0),
+                ("acct_observe", 0),
+            ] {
+                let page = repository
+                    .list_usage_records(UsageRecordQuery {
+                        range,
+                        filter: UsageRecordFilter {
+                            search: Some(search.to_owned()),
+                            ..filter.clone()
+                        },
+                        current_page: 1,
+                        page_size: ObservabilityPageSize::new(10).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, expected, "user={user}, search={search}");
+            }
+        }
+    }
+    database.close().await;
 }
 
 async fn seed_calculated_billing_facts(

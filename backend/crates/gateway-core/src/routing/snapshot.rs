@@ -59,6 +59,7 @@ impl SnapshotSettingsFacts {
 /// Store 读取到的一个启用 Client API Key 策略事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotClientPolicyFacts {
+    user: crate::policy::UserPolicy,
     key_id: ClientApiKeyId,
     plaintext_key: PlaintextClientApiKey,
     group_ids: Vec<AccountGroupId>,
@@ -72,8 +73,10 @@ impl SnapshotClientPolicyFacts {
         plaintext_key: PlaintextClientApiKey,
         group_ids: Vec<AccountGroupId>,
         limits: RateLimits,
+        user: crate::policy::UserPolicy,
     ) -> Self {
         Self {
+            user,
             key_id,
             plaintext_key,
             group_ids,
@@ -363,16 +366,29 @@ async fn compile_runtime_snapshot(
     );
     let mut client_policies = Vec::with_capacity(facts.client_policies.len());
     for policy in facts.client_policies {
-        let account_scope = if policy.group_ids.is_empty() {
+        let user = policy.user;
+        if user.id.is_empty() {
+            return Err(RuntimeSnapshotCompileError::InvalidData);
+        }
+        let group_ids = match &user.group_ids {
+            None => policy.group_ids,
+            Some(allowed) if policy.group_ids.is_empty() => allowed.clone(),
+            Some(allowed) => policy
+                .group_ids
+                .into_iter()
+                .filter(|group| allowed.contains(group))
+                .collect(),
+        };
+        let account_scope = if group_ids.is_empty() && user.group_ids.is_none() {
             FrozenAccountScope::new(
                 Arc::clone(&account_directory),
                 ClientRoutingScope::all_accounts(),
             )
         } else {
             let mut seen = BTreeSet::new();
-            let mut bound_groups = Vec::with_capacity(policy.group_ids.len());
+            let mut bound_groups = Vec::with_capacity(group_ids.len());
             let mut enabled_group_ids = BTreeSet::new();
-            for group_id in policy.group_ids {
+            for group_id in group_ids {
                 if !seen.insert(group_id.clone()) {
                     return Err(RuntimeSnapshotCompileError::InvalidData);
                 }
@@ -391,8 +407,12 @@ async fn compile_runtime_snapshot(
             let provider_kinds = account_directory.providers_for_groups(&enabled_group_ids);
             FrozenAccountScope::new(
                 Arc::clone(&account_directory),
-                ClientRoutingScope::restricted(bound_groups, enabled_group_ids, provider_kinds)
-                    .map_err(|_| RuntimeSnapshotCompileError::InvalidData)?,
+                if bound_groups.is_empty() {
+                    ClientRoutingScope::empty()
+                } else {
+                    ClientRoutingScope::restricted(bound_groups, enabled_group_ids, provider_kinds)
+                        .map_err(|_| RuntimeSnapshotCompileError::InvalidData)?
+                },
             )
         };
         client_policies.push(ClientPolicy::new(
@@ -401,6 +421,7 @@ async fn compile_runtime_snapshot(
             Arc::new(account_scope),
             true,
             policy.limits,
+            user,
         ));
     }
 

@@ -131,6 +131,7 @@ where
     ) -> Result<ResponseExecutionSession<S>, EngineError> {
         let request_id = request.id.clone();
         let client_api_key_ref = request.client_api_key_ref.clone();
+        let user_id = request.user_id.clone();
         let timing_started_at = Instant::now();
         let deadline = request.deadline_at;
         let account_state_owner = continuation
@@ -166,6 +167,7 @@ where
             engine: Arc::clone(&self.engine),
             request_id,
             client_api_key_ref,
+            user_id,
             observation: ResponseObservation::new(timing_started_at),
             budget_prior_attempts_usd: Decimal::ZERO,
             budget_attempt_already_counted: false,
@@ -267,6 +269,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     engine: Arc<GatewayEngine<S>>,
     request_id: ModelRequestId,
     client_api_key_ref: crate::policy::ClientApiKeyId,
+    user_id: Option<String>,
     observation: ResponseObservation,
     budget_prior_attempts_usd: Decimal,
     budget_attempt_already_counted: bool,
@@ -508,6 +511,7 @@ where
             .checked_add(self.budget_attempt_usd())
             .unwrap_or(Decimal::MAX);
         super::budget::ClientBudgetCharge {
+            user_id: self.user_id.clone(),
             key_id: self.client_api_key_ref.clone(),
             request_id: self.request_id.clone(),
             amount_usd,

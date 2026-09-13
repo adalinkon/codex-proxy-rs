@@ -14,6 +14,7 @@ import { withMinimumDuration } from '@/utils/async'
 import { usageSearchParam } from '../utils/search'
 
 interface UseUsageRecordsTableOptions {
+  scope?: 'admin' | 'user'
   timeRangeParams: Readonly<Ref<UsageTimeRangeParams>>
   latestTimeRangeParams: () => UsageTimeRangeParams
   active: Readonly<Ref<boolean>>
@@ -95,7 +96,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
         currentPage: currentPage.value,
         pageSize: pageSize.value,
         ...tableParams,
-      }, { signal: tableController.signal })
+      }, { signal: tableController.signal }, options.scope)
       if (requestId !== tableRequestId)
         return
 
@@ -123,12 +124,14 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     analyticsLoading.value = !background
     try {
       const [nextSummary, overview, diagnostics] = await Promise.all([
-        getUsageRecordSummary(globalParams, requestOptions),
-        getUsageRecordInsightsOverview(globalParams, requestOptions),
-        getUsageRecordInsightsDiagnostics({
-          ...globalParams,
-          dimension,
-        }, requestOptions),
+        getUsageRecordSummary(globalParams, requestOptions, options.scope),
+        getUsageRecordInsightsOverview(globalParams, requestOptions, options.scope),
+        options.scope === 'user'
+          ? Promise.resolve(emptyDiagnostics())
+          : getUsageRecordInsightsDiagnostics({
+              ...globalParams,
+              dimension,
+            }, requestOptions, options.scope),
       ])
       if (requestId !== analyticsRequestId)
         return
@@ -151,6 +154,8 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
   }
 
   async function loadDiagnostics() {
+    if (options.scope === 'user')
+      return
     const requestId = ++diagnosticRequestId
     diagnosticController?.abort()
     diagnosticController = new AbortController()
@@ -160,7 +165,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
       const diagnostics = await getUsageRecordInsightsDiagnostics({
         ...params,
         dimension,
-      }, { signal: diagnosticController.signal })
+      }, { signal: diagnosticController.signal }, options.scope)
       if (requestId !== diagnosticRequestId || dimension !== diagnosticDimension.value)
         return
       insights.value = {

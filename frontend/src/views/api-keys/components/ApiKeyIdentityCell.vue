@@ -13,6 +13,7 @@ defineProps<{
     <span class="text-cp font-bold text-cp-text">
       {{ apiKey.name }}
     </span>
+    <span class="truncate text-cp-sm text-cp-text-secondary" :title="apiKey.userId">{{ apiKey.userId }}</span>
     <span v-if="apiKey.label" class="text-cp-sm font-emphasis text-cp-text-tertiary">
       {{ apiKey.label }}
     </span>

@@ -7,6 +7,7 @@ import BaseInput from '@/components/base/BaseInput.vue'
 defineProps<{
   refreshing: boolean
   loading: boolean
+  personal?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -19,7 +20,7 @@ const search = defineModel<string>('search', { required: true })
 <template>
   <div class="flex w-full items-center gap-3" role="group" aria-label="使用记录筛选与操作">
     <div class="min-w-0 flex-1 sm:w-96 sm:flex-none">
-      <BaseInput v-model="search" placeholder="请求、Key ID / 可见前缀、账号或模型" aria-label="搜索使用记录：请求、Key ID / 可见前缀、账号或模型" class="w-full">
+      <BaseInput v-model="search" :placeholder="personal ? '请求、Key ID / 可见前缀或模型' : '请求、Key ID / 可见前缀、账号或模型'" aria-label="搜索使用记录" class="w-full">
         <template #prefix>
           <Search class="size-4.5 text-cp-text-tertiary" />
         </template>

@@ -14,6 +14,7 @@ import {
   PanelLeftOpen,
   Settings,
   Sun,
+  UserRound,
   Users,
 } from '@lucide/vue'
 import { usePreferredReducedMotion, useTimeoutFn } from '@vueuse/core'
@@ -57,16 +58,23 @@ const { effectiveTheme } = storeToRefs(themeStore)
 const { toggleTheme } = themeStore
 const preferredMotion = usePreferredReducedMotion()
 
-const navItems = [
+const adminNavItems = [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
   { label: '代理管理', icon: Network, path: '/proxies' },
   { label: '分组管理', icon: FolderTree, path: '/account-groups' },
   { label: 'API 密钥', icon: KeyRound, path: '/api-keys' },
+  { label: '用户管理', icon: Users, path: '/users' },
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
 ]
+const personalNavItems = [
+  { label: '个人资料', icon: UserRound, path: '/me/profile' },
+  { label: 'API 密钥', icon: KeyRound, path: '/me/keys' },
+  { label: '使用统计', icon: ChartNoAxesColumn, path: '/me/usage' },
+]
+const navItems = computed(() => [...(authStore.isAdmin ? adminNavItems : []), ...personalNavItems])
 
 function isActive(path: string) {
   if (path === '/')
@@ -75,7 +83,7 @@ function isActive(path: string) {
 }
 
 const activeNavIndex = computed(() => {
-  const index = navItems.findIndex(item => isActive(item.path))
+  const index = navItems.value.findIndex(item => isActive(item.path))
   return Math.max(0, index)
 })
 const activeNavIndicatorStyle = computed(() => ({
@@ -340,7 +348,7 @@ onBeforeUnmount(() => {
         <span class="mt-1.5 flex h-4.5 min-w-0 items-center gap-2">
           <span class="shrink-0 text-xs leading-none font-emphasis text-cp-text-secondary"> Rust build </span>
           <button
-            v-if="hasVersionLabel"
+            v-if="authStore.isAdmin && hasVersionLabel"
             type="button"
             class="inline-flex h-4.5 min-w-0 cursor-pointer items-center gap-1 rounded-cp-sm border-0 px-1.5 font-mono text-[10px] leading-none font-bold transition-colors outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline focus-visible:ring-offset-2 focus-visible:ring-offset-cp-bg-container"
             :class="[
@@ -376,6 +384,7 @@ onBeforeUnmount(() => {
             type="button"
             class="relative z-10 inline-flex h-11.5 cursor-pointer items-center rounded-cp border-0 text-sm leading-[1.15] outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline focus-visible:ring-offset-2 focus-visible:ring-offset-cp-bg-container"
             :class="[
+              authStore.isAdmin && item.path === '/me/profile' ? 'before:absolute before:inset-x-0 before:-top-1.5 before:h-px before:bg-cp-fill-secondary' : '',
               isCollapsed ? 'w-11.5 justify-center' : 'w-full gap-3 px-4',
               isActive(item.path)
                 ? navFeedbackMuted
@@ -414,7 +423,7 @@ onBeforeUnmount(() => {
 
         <div class="flex items-center" :class="isCollapsed ? 'grid gap-1' : 'gap-1'">
           <BaseIconButton
-            v-if="isCollapsed && hasUpdate"
+            v-if="authStore.isAdmin && isCollapsed && hasUpdate"
             variant="success"
             size="md"
             :label="updateButtonLabel"

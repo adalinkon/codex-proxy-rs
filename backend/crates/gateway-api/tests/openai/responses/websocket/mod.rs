@@ -926,6 +926,7 @@ impl ClientAdmissionPort for SettlementPorts {
 
     fn release<'a>(
         &'a self,
+        _: &'a str,
         _: &'a ClientApiKeyId,
         request_id: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
@@ -952,7 +953,7 @@ impl ClientAdmissionPort for SettlementPorts {
 }
 
 impl ClientBudgetPort for SettlementPorts {
-    fn admit(&self, _: ClientApiKeyId) -> BoxFuture<'_, Result<(), GatewayError>> {
+    fn admit(&self, _: String, _: ClientApiKeyId) -> BoxFuture<'_, Result<(), GatewayError>> {
         Box::pin(async { Ok(()) })
     }
 

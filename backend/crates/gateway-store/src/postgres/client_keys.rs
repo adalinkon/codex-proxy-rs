@@ -53,6 +53,7 @@ const CLIENT_API_KEY_LAST_USED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientApiKeySnapshot {
+    pub user: gateway_core::policy::UserPolicy,
     pub id: ClientApiKeyId,
     pub plaintext_key: PlaintextClientApiKey,
     pub group_ids: Vec<AccountGroupId>,
@@ -66,8 +67,10 @@ impl ClientApiKeySnapshot {
         group_ids: Vec<String>,
         max_concurrency: i64,
         requests_per_minute: i64,
+        user: gateway_core::policy::UserPolicy,
     ) -> StoreResult<Self> {
         Ok(Self {
+            user,
             id: ClientApiKeyId::new(id).map_err(|_| invalid("persisted key ID is invalid"))?,
             plaintext_key: PlaintextClientApiKey::new(key)
                 .map_err(|_| invalid("persisted plaintext key is invalid"))?,
@@ -107,6 +110,7 @@ impl fmt::Debug for ClientApiKeySecret {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientApiKeyRecord {
+    pub user_id: String,
     pub id: String,
     pub name: String,
     pub label: Option<String>,
@@ -230,6 +234,7 @@ impl ClientApiKeyCursor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientApiKeyListQuery {
+    pub user_id: Option<String>,
     pub cursor: Option<ClientApiKeyCursor>,
     pub page_size: u16,
     pub search: Option<String>,
@@ -267,6 +272,7 @@ pub struct ClientApiKeyPage {
 
 #[derive(Clone)]
 pub struct NewClientApiKey {
+    pub user_id: Option<String>,
     pub id: String,
     pub name: String,
     pub label: Option<String>,
@@ -353,15 +359,23 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         query: ClientApiKeyListQuery,
     ) -> StoreResult<ClientApiKeyPage> {
         query.validate()?;
-        let total = count_client_api_keys(&self.pool, query.search.as_deref()).await?;
+        let total = count_client_api_keys(
+            &self.pool,
+            query.search.as_deref(),
+            query.user_id.as_deref(),
+        )
+        .await?;
         let mut statement = QueryBuilder::<Postgres>::new(
-            "select k.id, k.name, k.label, left(k.key, 10) as prefix, k.enabled,
+            "select k.id, k.user_id, k.name, k.label, left(k.key, 10) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
                     k.updated_at, '[]'::jsonb as groups, '{}'::text[] as provider_kinds
              from client_api_keys k
              where true",
         );
         push_client_key_search(&mut statement, query.search.as_deref());
+        if let Some(user_id) = &query.user_id {
+            statement.push(" and user_id = ").push_bind(user_id);
+        }
         if let Some(cursor) = &query.cursor {
             push_client_key_cursor(&mut statement, cursor);
         }
@@ -414,7 +428,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
     async fn get_client_api_key(&self, id: &str) -> StoreResult<Option<ClientApiKeyRecord>> {
         require_nonempty(ENTITY, "id", id)?;
         let record = sqlx::query(
-            "select k.id, k.name, k.label, left(k.key, 10) as prefix, k.enabled,
+            "select k.id, k.user_id, k.name, k.label, left(k.key, 10) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
                     k.updated_at, coalesce(groups.groups, '[]'::jsonb) as groups,
                     case
@@ -678,6 +692,99 @@ impl PgAdminClientKeyStore {
 
 #[async_trait]
 impl ClientKeyStore for PgAdminClientKeyStore {
+    async fn mutate_owned_key(
+        &self,
+        user_id: &str,
+        mutation: gateway_admin::model::client_keys::OwnedKeyMutation,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        use gateway_admin::model::client_keys::OwnedKeyMutation;
+        let mut tx = self.keys.pool.begin().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("begin owned key mutation"))
+        })?;
+        let result = async {
+            let revision = super::bump_config_revision_in_transaction(&mut tx).await?;
+            let enabled = sqlx::query_scalar::<_, bool>(
+                "select enabled from admin_users where id=$1 for share",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| postgres_unavailable("read key owner"))?;
+            if enabled != Some(true) {
+                return Err(invalid("user is disabled or missing"));
+            }
+            match mutation {
+                OwnedKeyMutation::Create(key) => {
+                    insert_client_api_key_in_transaction(
+                        &mut tx,
+                        &NewClientApiKey {
+                            id: key.id.as_str().to_owned(),
+                            user_id: Some(user_id.to_owned()),
+                            name: key.name,
+                            label: None,
+                            group_ids: Vec::new(),
+                            key: key.plaintext,
+                            max_concurrency: 0,
+                            requests_per_minute: 0,
+                            budget: Default::default(),
+                        },
+                    )
+                    .await?;
+                }
+                mutation => {
+                    let id = match &mutation {
+                        OwnedKeyMutation::UpdateIdentity { id, .. } => id,
+                        OwnedKeyMutation::SetEnabled(command) => &command.id,
+                        OwnedKeyMutation::Delete(command) => &command.id,
+                        OwnedKeyMutation::Create(_) => unreachable!(),
+                    };
+                    let owned = sqlx::query_scalar::<_, String>(
+                        "select id from client_api_keys where id=$1 and user_id=$2 for update",
+                    )
+                    .bind(id.as_str())
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|_| postgres_unavailable("read owned key"))?;
+                    if owned.is_none() {
+                        return Err(StoreError::NotFound {
+                            entity: ENTITY,
+                            id: id.as_str().to_owned(),
+                        });
+                    }
+                    match mutation {
+                        OwnedKeyMutation::UpdateIdentity { id, name, label } => {
+                            // 只更新身份展示字段，避免覆盖管理员并发修改的授权与限额。
+                            sqlx::query("update client_api_keys set name=$2,label=$3,updated_at=now() where id=$1")
+                                .bind(id.as_str()).bind(name).bind(label)
+                                .execute(&mut *tx).await.map_err(|_| postgres_unavailable("update owned key identity"))?;
+                        }
+                        OwnedKeyMutation::SetEnabled(command) => {
+                            set_client_api_key_enabled_in_transaction(
+                                &mut tx,
+                                command.id.as_str(),
+                                command.enabled,
+                            )
+                            .await?
+                        }
+                        OwnedKeyMutation::Delete(command) => {
+                            delete_client_api_key_in_transaction(&mut tx, command.id.as_str())
+                                .await?
+                        }
+                        OwnedKeyMutation::Create(_) => unreachable!(),
+                    }
+                }
+            }
+            Ok(revision)
+        }
+        .await
+        .map_err(|e| admin_store_error(ENTITY, e))?;
+        tx.commit().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("commit owned key mutation"))
+        })?;
+        admin_revision(result)
+    }
+
     async fn list_client_keys(
         &self,
         query: AdminClientKeyListQuery,
@@ -726,6 +833,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .control_plane
             .create_client_api_key(
                 NewClientApiKey {
+                    user_id: command.user_id,
                     id: id.as_str().to_owned(),
                     name: command.name,
                     label: command.label,
@@ -863,6 +971,7 @@ fn store_client_key_query(
 ) -> AdminStoreResult<ClientApiKeyListQuery> {
     let sort = store_client_key_sort(query.sort);
     Ok(ClientApiKeyListQuery {
+        user_id: query.user_id,
         cursor: query
             .cursor
             .map(|cursor| store_client_key_cursor(cursor, sort))
@@ -931,6 +1040,7 @@ fn admin_client_key_cursor(cursor: ClientApiKeyCursor) -> AdminStoreResult<Admin
 
 fn admin_client_key_record(record: ClientApiKeyRecord) -> AdminStoreResult<AdminClientKeyRecord> {
     Ok(AdminClientKeyRecord {
+        user_id: record.user_id,
         id: ClientApiKeyId::new(record.id)
             .map_err(|_| admin_store_error(ENTITY, invalid("invalid client key id")))?,
         name: record.name,
@@ -980,8 +1090,9 @@ pub(crate) async fn insert_client_api_key_in_transaction(
     sqlx::query(
         "insert into client_api_keys (
            id, name, label, key, enabled, max_concurrency, requests_per_minute,
-           last_used_at, created_at, updated_at, daily_limit_usd, weekly_limit_usd
-         ) values ($1, $2, $3, $4, true, $5, $6, null, now(), now(), $7::text::numeric, $8::text::numeric)",
+           last_used_at, created_at, updated_at, daily_limit_usd, weekly_limit_usd, user_id
+         ) values ($1, $2, $3, $4, true, $5, $6, null, now(), now(), $7::text::numeric, $8::text::numeric,
+             coalesce($9,(select id from admin_users where role='admin' and deleted_at is null order by created_at,id limit 1)))",
     )
     .bind(&key.id)
     .bind(&key.name)
@@ -991,6 +1102,7 @@ pub(crate) async fn insert_client_api_key_in_transaction(
     .bind(to_i64(key.requests_per_minute)?)
     .bind(key.budget.daily_usd.canonical())
     .bind(key.budget.weekly_usd.canonical())
+    .bind(&key.user_id)
     .execute(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("insert client API key in transaction"))?;
@@ -1070,6 +1182,11 @@ async fn replace_client_api_key_groups_in_transaction(
     key_id: &str,
     group_ids: &[String],
 ) -> StoreResult<()> {
+    let allowed=sqlx::query_scalar::<_,bool>("select u.deleted_at is null and (u.all_groups or not exists(select 1 from unnest($2::text[]) g(id) where not exists(select 1 from user_account_groups ug where ug.user_id=u.id and ug.account_group_id=g.id))) from client_api_keys k join admin_users u on u.id=k.user_id where k.id=$1")
+        .bind(key_id).bind(group_ids).fetch_one(&mut **transaction).await.map_err(|_| postgres_unavailable("validate key owner groups"))?;
+    if !allowed {
+        return Err(invalid("key groups exceed user authorization"));
+    }
     validate_group_ids(group_ids)?;
     if !group_ids.is_empty() {
         let count = sqlx::query_scalar::<_, i64>(
@@ -1151,6 +1268,9 @@ fn client_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ClientApiK
         .try_get("groups")
         .map_err(|_| invalid("invalid groups"))?;
     Ok(ClientApiKeyRecord {
+        user_id: row
+            .try_get("user_id")
+            .map_err(|_| invalid("missing key owner"))?,
         id: row.try_get("id").map_err(|_| invalid("invalid id"))?,
         name: row.try_get("name").map_err(|_| invalid("invalid name"))?,
         label: row.try_get("label").map_err(|_| invalid("invalid label"))?,
@@ -1185,10 +1305,17 @@ fn client_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ClientApiK
     })
 }
 
-async fn count_client_api_keys(pool: &PgPool, search: Option<&str>) -> StoreResult<u64> {
+async fn count_client_api_keys(
+    pool: &PgPool,
+    search: Option<&str>,
+    user_id: Option<&str>,
+) -> StoreResult<u64> {
     let mut statement =
         QueryBuilder::<Postgres>::new("select count(*)::bigint from client_api_keys where true");
     push_client_key_search(&mut statement, search);
+    if let Some(user_id) = user_id {
+        statement.push(" and user_id = ").push_bind(user_id);
+    }
     let count = statement
         .build_query_scalar::<i64>()
         .fetch_one(pool)

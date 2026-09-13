@@ -34,4 +34,6 @@ router.beforeEach(async (to) => {
   if (!authStore.isAuthenticated) {
     return '/login'
   }
+  if (!authStore.isAdmin && !to.path.startsWith('/me/'))
+    return '/me/profile'
 })

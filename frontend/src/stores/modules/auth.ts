@@ -1,11 +1,14 @@
+import type { AuthStatusResponse } from '@/api/modules/auth'
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
 import { login as apiLogin, logout as apiLogout, getAuthStatus } from '@/api'
 import { resetUnauthorizedHandling } from '@/api/request'
 
 export const useAuthStore = defineStore('auth', () => {
   const isAuthenticated = ref(false)
+  const user = ref<AuthStatusResponse['user']>(null)
+  const isAdmin = computed(() => user.value?.role === 'admin')
   const sessionChecked = ref(false)
   const loading = ref(false)
 
@@ -13,6 +16,7 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const status = await getAuthStatus({ silent: true })
       isAuthenticated.value = status.authenticated
+      user.value = status.user
       if (status.authenticated)
         resetUnauthorizedHandling()
       return status.authenticated
@@ -31,8 +35,8 @@ export const useAuthStore = defineStore('auth', () => {
       loading.value = true
       await apiLogin(payload)
 
-      isAuthenticated.value = true
-      sessionChecked.value = true
+      if (!await checkAuth())
+        return false
       resetUnauthorizedHandling()
 
       return true
@@ -55,17 +59,21 @@ export const useAuthStore = defineStore('auth', () => {
     }
     finally {
       isAuthenticated.value = false
+      user.value = null
       sessionChecked.value = true
     }
   }
 
   function invalidateSession() {
+    user.value = null
     isAuthenticated.value = false
     sessionChecked.value = true
     loading.value = false
   }
 
   return {
+    user,
+    isAdmin,
     isAuthenticated,
     sessionChecked,
     loading,

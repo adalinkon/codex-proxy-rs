@@ -23,6 +23,7 @@ fn client_admission_startup_recovery_should_preserve_order_and_exact_facts() {
         let now = SystemTime::now();
         let request = ModelRequestId::new("req_recovery").expect("request id");
         let recovery = ClientAdmissionRecovery {
+            user_id: Some("test-owner".to_owned()),
             client_api_key_id: ClientApiKeyId::new("key_recovery").expect("key id"),
             recent_requests: vec![RecentAdmissionFact {
                 model_request_id: request.clone(),
@@ -96,6 +97,7 @@ fn client_admission_startup_recovery_should_fail_closed_at_each_boundary() {
 
 fn empty_recovery() -> ClientAdmissionRecovery {
     ClientAdmissionRecovery {
+        user_id: Some("test-owner".to_owned()),
         client_api_key_id: ClientApiKeyId::new("key_empty").expect("key id"),
         recent_requests: Vec::new(),
         running_requests: Vec::new(),
@@ -191,6 +193,7 @@ impl ClientAdmissionPort for RecordingAdmissions {
     }
     fn release<'a>(
         &'a self,
+        _: &'a str,
         _: &'a ClientApiKeyId,
         _: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
