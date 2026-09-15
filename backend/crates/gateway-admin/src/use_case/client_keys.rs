@@ -41,7 +41,7 @@ pub trait ClientKeyService: Send + Sync {
     async fn create_owned(
         &self,
         user_id: &str,
-        name: String,
+        command: CreateClientKey,
     ) -> Result<CreatedClientKey, AdminError>;
     async fn mutate_owned(
         &self,
@@ -139,16 +139,11 @@ impl ClientKeyService for DefaultClientKeyService {
     async fn create_owned(
         &self,
         user_id: &str,
-        name: String,
+        command: CreateClientKey,
     ) -> Result<CreatedClientKey, AdminError> {
-        if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
-            return Err(AdminError::invalid("Key 名称不合法"));
-        }
         let id = ClientApiKeyId::new(format!("key_{}", Uuid::now_v7().simple()))
             .map_err(|_| AdminError::internal("Key ID 创建失败"))?;
-        let mut bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut bytes);
-        let plaintext = format!("sk_{}", URL_SAFE_NO_PAD.encode(bytes));
+        let plaintext = create_plaintext(command.custom_key);
         let revision = self
             .store
             .mutate_owned_key(
@@ -156,16 +151,16 @@ impl ClientKeyService for DefaultClientKeyService {
                 crate::model::client_keys::OwnedKeyMutation::Create(NewClientKey {
                     id: id.clone(),
                     user_id: Some(user_id.to_owned()),
-                    name,
-                    label: None,
-                    group_ids: Vec::new(),
-                    limits: gateway_core::policy::RateLimits::unlimited(),
-                    budget: Default::default(),
+                    name: command.name,
+                    label: command.label,
+                    group_ids: command.group_ids,
+                    limits: command.limits,
+                    budget: command.budget,
                     plaintext,
                 }),
             )
             .await
-            .map_err(|e| map_store_error(e, "client key"))?;
+            .map_err(map_client_key_write_error)?;
         publish_committed(self.snapshot.as_ref(), revision).await?;
         Ok(CreatedClientKey {
             config_revision: revision,
@@ -226,13 +221,7 @@ impl ClientKeyService for DefaultClientKeyService {
     ) -> Result<CreatedClientKey, AdminError> {
         let id = ClientApiKeyId::new(format!("key_{}", Uuid::now_v7().simple()))
             .map_err(|_| AdminError::internal("创建 Client API Key ID 失败"))?;
-        let plaintext = if let Some(key) = command.custom_key {
-            key.expose_for_auth().to_owned()
-        } else {
-            let mut bytes = [0_u8; 32];
-            OsRng.fill_bytes(&mut bytes);
-            format!("sk_{}", URL_SAFE_NO_PAD.encode(bytes))
-        };
+        let plaintext = create_plaintext(command.custom_key);
         let (config_revision, record) = self
             .store
             .create_client_key(
@@ -318,6 +307,15 @@ impl ClientKeyService for DefaultClientKeyService {
             id,
         })
     }
+}
+
+fn create_plaintext(custom_key: Option<gateway_core::policy::PlaintextClientApiKey>) -> String {
+    if let Some(key) = custom_key {
+        return key.expose_for_auth().to_owned();
+    }
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("sk_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn map_client_key_write_error(error: AdminStoreError) -> AdminError {

@@ -25,7 +25,6 @@ fn policy(id: &str, daily: &str, weekly: &str) -> UserPolicyUpdate {
         id: id.to_owned(),
         role: UserRole::User,
         enabled: true,
-        all_groups: false,
         group_ids: Vec::new(),
         limits: Default::default(),
         budget: gateway_core::engine::budget::ClientBudgetLimits {
@@ -207,6 +206,51 @@ async fn create_key(db: &TestDatabase, user: &str, id: &str) {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn owned_creation_preserves_parameters_and_rejects_unassigned_groups() {
+    let Some(db) = TestDatabase::create("owned_creation_policy").await else {
+        return;
+    };
+    let users = PgUserRepository::new(db.pool.clone());
+    users.save(policy("alice", "10", "20"), Some("test-hash")).await.unwrap();
+    sqlx::raw_sql("insert into account_groups(id,name,color,created_at,updated_at)
+        values('grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','A','#2563EBFF',now(),now()),
+              ('grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','B','#2563EBFF',now(),now());
+        insert into user_account_groups(user_id,account_group_id)
+        values('alice','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');")
+        .execute(&db.pool).await.unwrap();
+    let group = |id: &str| gateway_core::routing::AccountGroupId::new(id.to_owned()).unwrap();
+    let keys = PgAdminClientKeyStore::new(db.pool.clone());
+    let command = NewClientKey {
+        id: ClientApiKeyId::new("custom-key").unwrap(),
+        user_id: Some("alice".to_owned()),
+        name: "Custom".to_owned(),
+        label: Some("Personal".to_owned()),
+        group_ids: vec![group("grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+        limits: gateway_core::policy::RateLimits { max_concurrency: 2, requests_per_minute: 7 },
+        budget: gateway_core::engine::budget::ClientBudgetLimits {
+            daily_usd: "1.25".parse().unwrap(),
+            weekly_usd: "5".parse().unwrap(),
+        },
+        plaintext: format!("sk_{}", "a".repeat(43)),
+    };
+    keys.mutate_owned_key("alice", OwnedKeyMutation::Create(command.clone())).await.unwrap();
+    let secret = keys.reveal_client_key(&command.id).await.unwrap().unwrap();
+    assert_eq!(secret.record.user_id, "alice");
+    assert_eq!(secret.record.label, command.label);
+    assert_eq!(secret.record.groups[0].id, command.group_ids[0]);
+    assert_eq!(secret.record.limits, command.limits);
+    assert_eq!(secret.record.budget.limits, command.budget);
+    let mut rejected = command;
+    rejected.id = ClientApiKeyId::new("rejected-key").unwrap();
+    rejected.name = "Rejected".to_owned();
+    rejected.plaintext = format!("sk_{}", "b".repeat(43));
+    rejected.group_ids = vec![group("grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")];
+    assert!(keys.mutate_owned_key("alice", OwnedKeyMutation::Create(rejected.clone())).await.is_err());
+    assert!(keys.reveal_client_key(&rejected.id).await.unwrap().is_none());
+    db.close().await;
 }
 fn charge(user: &str, key: &str, id: &str, amount: &str) -> ClientBudgetCharge {
     ClientBudgetCharge {
@@ -508,7 +552,6 @@ async fn password_reset_revokes_generations_and_last_administrator_cannot_be_dis
     let mut disabled = policy("test-owner", "0", "0");
     disabled.role = UserRole::Admin;
     disabled.enabled = false;
-    disabled.all_groups = true;
     assert!(users.save(disabled, None).await.is_err());
     assert!(
         users
@@ -519,6 +562,56 @@ async fn password_reset_revokes_generations_and_last_administrator_cannot_be_dis
             .identity
             .enabled
     );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn migration_materializes_existing_groups_without_granting_future_groups() {
+    let Some(db) = TestDatabase::create_at("explicit_user_groups", 202609130003).await else {
+        return;
+    };
+    sqlx::raw_sql("insert into account_groups(id,name,color,enabled,created_at,updated_at)
+        values('grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','A','#2563EBFF',true,now(),now()),
+              ('grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','B','#2563EBFF',false,now(),now());
+        insert into admin_users(id,password_hash,role,all_groups,created_at,updated_at)
+        values('limited','test-hash','user',false,now(),now());
+        insert into user_account_groups(user_id,account_group_id)
+        values('limited','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+              ('test-owner','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');")
+        .execute(&db.pool).await.unwrap();
+    super::TEST_MIGRATOR.run(&db.pool).await.unwrap();
+    sqlx::query("insert into account_groups(id,name,color,created_at,updated_at)
+        values('grp_cccccccccccccccccccccccccccccccc','C','#2563EBFF',now(),now())")
+        .execute(&db.pool).await.unwrap();
+    let groups: Vec<(String, String)> = sqlx::query_as(
+        "select user_id,account_group_id from user_account_groups order by user_id,account_group_id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        groups,
+        vec![
+            (
+                "limited".to_owned(),
+                "grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            (
+                "test-owner".to_owned(),
+                "grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            (
+                "test-owner".to_owned(),
+                "grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+        ]
+    );
+    let user = PgUserRepository::new(db.pool.clone())
+        .load("test-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.groups.len(), 2);
     db.close().await;
 }
 
@@ -540,7 +633,7 @@ async fn migration_assigns_legacy_keys_and_preserves_password_limits_and_recorde
         .unwrap()
         .unwrap();
     assert_eq!(user.identity.role, UserRole::Admin);
-    assert!(user.all_groups);
+    assert!(user.groups.is_empty());
     assert!(!user.budget.limits.is_limited());
     assert_eq!(user.budget.daily_used_usd.canonical(), "1.1234567891");
     let old:(String,String,String,i64,i64,String)=sqlx::query_as("select k.user_id,k.daily_limit_usd::text,w.daily_used_usd::text,k.max_concurrency,k.requests_per_minute,u.password_hash from client_api_keys k join client_key_budget_windows w on w.client_api_key_id=k.id join admin_users u on u.id=k.user_id where k.id='old-key'").fetch_one(&db.pool).await.unwrap();

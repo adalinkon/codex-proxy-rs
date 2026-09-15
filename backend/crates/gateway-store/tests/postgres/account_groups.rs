@@ -77,6 +77,12 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
     )
     .await;
 
+    sqlx::query("insert into user_account_groups(user_id,account_group_id) values('test-owner',$1),('test-owner',$2)")
+        .bind(MIXED_GROUP)
+        .bind(EMPTY_GROUP)
+        .execute(&database.pool)
+        .await
+        .expect("authorize key owner's groups");
     for (id, group_ids) in [
         ("key_group_one", vec![mixed_group.clone()]),
         ("key_group_two", vec![mixed_group.clone()]),
@@ -179,7 +185,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
             &context("widen-group-key"),
         )
         .await
-        .expect("widen restricted key to all accounts");
+        .expect("let restricted key inherit user groups");
     assert!(widened.groups.is_empty());
     let scope_audit: Vec<String> = sqlx::query_scalar(
         "select changed_fields from admin_audit_events
@@ -188,7 +194,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
     .fetch_one(&database.pool)
     .await
     .expect("load scope widening audit");
-    assert!(scope_audit.contains(&"routing_scope:groups->all".to_owned()));
+    assert!(scope_audit.contains(&"routing_scope:groups->inherit".to_owned()));
     assert_eq!(current_revision(&database.pool).await, scope_revision.get());
     let (restricted_revision, restricted) = keys
         .update_client_key(
@@ -204,7 +210,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
             &context("restrict-all-key"),
         )
         .await
-        .expect("restrict all-accounts key to groups");
+        .expect("restrict inherited key to groups");
     assert_eq!(restricted.groups.len(), 1);
     let restricted_audit: Vec<String> = sqlx::query_scalar(
         "select changed_fields from admin_audit_events
@@ -213,7 +219,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
     .fetch_one(&database.pool)
     .await
     .expect("load scope restriction audit");
-    assert!(restricted_audit.contains(&"routing_scope:all->groups".to_owned()));
+    assert!(restricted_audit.contains(&"routing_scope:inherit->groups".to_owned()));
     assert_eq!(
         current_revision(&database.pool).await,
         restricted_revision.get()

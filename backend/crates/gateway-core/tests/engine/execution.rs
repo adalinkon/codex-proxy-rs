@@ -1876,7 +1876,7 @@ fn client_snapshot() -> RuntimeSnapshot {
             gateway_core::policy::UserPolicy {
                 id: "test-owner".to_owned(),
                 enabled: true,
-                group_ids: None,
+                group_ids: Vec::new(),
                 limits: Default::default(),
             },
         )],
@@ -1914,7 +1914,7 @@ fn start_snapshot_with_policy(revision: u64, enabled: bool, limits: RateLimits) 
             gateway_core::policy::UserPolicy {
                 id: "test-owner".to_owned(),
                 enabled: true,
-                group_ids: None,
+                group_ids: Vec::new(),
                 limits: Default::default(),
             },
         )],

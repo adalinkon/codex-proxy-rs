@@ -341,7 +341,7 @@ fn client_key_responses_should_keep_shape_and_redact_creation_debug() {
         list["items"][0]["providerKinds"],
         serde_json::json!(["openai"])
     );
-    assert_eq!(list["items"][0]["routingScope"], "all");
+    assert_eq!(list["items"][0]["routingScope"], "inherit");
     assert_eq!(list["items"][0]["maxConcurrency"], 2);
     assert_eq!(list["items"][0]["requestsPerMinute"], 60);
     assert!(list["items"][0].get("tokensPerMinute").is_none());

@@ -17,6 +17,7 @@ import { useIdSet } from '@/composables/useIdSet'
 type ApiKeyRow = Awaited<ReturnType<typeof getApiKeys>>['items'][number]
 
 export interface ApiKeyFormValue {
+  userId: string
   customKey: string
   name: string
   label: string
@@ -31,13 +32,13 @@ export function useApiKeyMutations(options: {
   scope?: 'admin' | 'user'
   selectedIds: Ref<Set<string>>
   reload: () => Promise<unknown>
+  canCreate?: (userId: string) => boolean
 }) {
   const copyText = useCopyText()
   const showFormModal = shallowRef(false)
   const showDeleteModal = shallowRef(false)
   const showSingleDeleteModal = shallowRef(false)
   const showKeyModal = shallowRef(false)
-  const showAllAccountsConfirm = shallowRef(false)
   const createdKey = shallowRef('')
   const createdKeyName = shallowRef('')
   const editingKey = shallowRef<ApiKeyRow | null>(null)
@@ -63,6 +64,7 @@ export function useApiKeyMutations(options: {
   function openEdit(key: ApiKeyRow) {
     editingKey.value = key
     form.value = {
+      userId: key.userId,
       customKey: '',
       name: key.name,
       label: key.label ?? '',
@@ -78,20 +80,13 @@ export function useApiKeyMutations(options: {
   function requestSave() {
     if (!validateForm() || savingKey.value)
       return
-    if (options.scope !== 'user' && form.value.groupIds.length === 0) {
-      showAllAccountsConfirm.value = true
-      return
-    }
     void save()
-  }
-
-  async function confirmAllAccountsScope() {
-    showAllAccountsConfirm.value = false
-    await save()
   }
 
   async function save() {
     if (!validateForm() || savingKey.value)
+      return
+    if (!editingKey.value && options.canCreate && !options.canCreate(form.value.userId))
       return
 
     await savingKeyAction.run(
@@ -112,6 +107,7 @@ export function useApiKeyMutations(options: {
         else {
           const result = await createApiKey({
             ...payload,
+            ...(options.scope === 'user' ? {} : { userId: form.value.userId }),
             customKey: form.value.customKey || undefined,
           }, options.scope)
           createdKey.value = result.plaintextKey
@@ -268,7 +264,6 @@ export function useApiKeyMutations(options: {
     showDeleteModal,
     showSingleDeleteModal,
     showKeyModal,
-    showAllAccountsConfirm,
     createdKey,
     createdKeyName,
     editingKey,
@@ -282,7 +277,6 @@ export function useApiKeyMutations(options: {
     openCreate,
     openEdit,
     requestSave,
-    confirmAllAccountsScope,
     requestDeleteKey,
     handleDelete,
     handleBatchDelete,
@@ -295,6 +289,7 @@ export function useApiKeyMutations(options: {
 
 function emptyForm(): ApiKeyFormValue {
   return {
+    userId: '',
     customKey: '',
     name: '',
     label: '',

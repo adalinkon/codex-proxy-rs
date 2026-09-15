@@ -63,6 +63,7 @@ async fn records<S: AdminSessionState + Send + Sync>(
         row.account_id = None;
         row.account_name = None;
         row.account_email = None;
+        row.username = None;
         row.authentication_kind = None;
         row.latency_details.capacity_used_slots = None;
         row.latency_details.capacity_total_slots = None;

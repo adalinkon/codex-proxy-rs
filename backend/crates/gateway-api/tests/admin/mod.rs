@@ -227,7 +227,6 @@ fn test_user(id: &str) -> gateway_admin::model::users::UserRecord {
             enabled: true,
             auth_revision: 0,
         },
-        all_groups: true,
         groups: Vec::new(),
         limits: Default::default(),
         budget: Default::default(),
@@ -350,7 +349,6 @@ impl AuthStore for MemoryAuthStore {
         }
         user.identity.enabled = policy.enabled;
         user.identity.role = policy.role;
-        user.all_groups = policy.all_groups;
         user.limits = policy.limits;
         user.budget.limits = policy.budget;
         if let Some(hash) = hash {

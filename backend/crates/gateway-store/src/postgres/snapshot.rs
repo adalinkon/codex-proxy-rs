@@ -276,7 +276,7 @@ async fn load_client_keys(
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("load snapshot client policies"))?;
-    let users = sqlx::query("select k.id as key_id,u.id,u.enabled,u.all_groups,u.max_concurrency,u.requests_per_minute,
+    let users = sqlx::query("select k.id as key_id,u.id,u.enabled,u.max_concurrency,u.requests_per_minute,
         array(select account_group_id from user_account_groups where user_id=u.id order by account_group_id) as group_ids
         from client_api_keys k join admin_users u on u.id=k.user_id where k.enabled")
         .fetch_all(&mut **transaction).await.map_err(|_| postgres_unavailable("load key owners"))?;
@@ -287,18 +287,11 @@ async fn load_client_keys(
             gateway_core::policy::UserPolicy {
                 id: row.get("id"),
                 enabled: row.get("enabled"),
-                group_ids: if row.get("all_groups") {
-                    None
-                } else {
-                    Some(
-                        row.get::<Vec<String>, _>("group_ids")
-                            .into_iter()
-                            .map(|id| {
-                                AccountGroupId::new(id).map_err(|_| invalid("invalid user group"))
-                            })
-                            .collect::<StoreResult<_>>()?,
-                    )
-                },
+                group_ids: row
+                    .get::<Vec<String>, _>("group_ids")
+                    .into_iter()
+                    .map(|id| AccountGroupId::new(id).map_err(|_| invalid("invalid user group")))
+                    .collect::<StoreResult<_>>()?,
                 limits: gateway_core::policy::RateLimits {
                     max_concurrency: to_u64(row.get("max_concurrency"))?,
                     requests_per_minute: to_u64(row.get("requests_per_minute"))?,

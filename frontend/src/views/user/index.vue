@@ -206,8 +206,7 @@ useBudgetRollover(() => profile.value ? [profile.value] : [], async () => {
               可用分组
             </span>
           </template>
-          <span v-if="profile.allGroups" class="self-start rounded-lg bg-cp-warning-container px-2 py-1 text-cp-sm font-bold text-cp-warning-on-container">全部账号</span>
-          <BaseEmpty v-else-if="!profile.groups.length" title="无可用分组" :icon="FolderTree" size="sm" surface="none" />
+          <BaseEmpty v-if="!profile.groups.length" title="无可用分组" :icon="FolderTree" size="sm" surface="none" />
           <ul v-else class="m-0 grid list-none gap-3 p-0">
             <li v-for="group in profile.groups" :key="group.id" class="flex min-w-0 items-center gap-3 text-cp-sm">
               <AccountGroupMarks :groups="[group]" class="shrink-0" />

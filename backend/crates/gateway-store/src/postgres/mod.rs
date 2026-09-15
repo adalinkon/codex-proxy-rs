@@ -308,7 +308,7 @@ impl PgControlPlaneRepository {
             match mutation {
                 ControlPlaneMutation::CreateClientApiKey(key) => {
                     audit.changed_fields.push(if key.group_ids.is_empty() {
-                        "routing_scope:all".to_owned()
+                        "routing_scope:inherit".to_owned()
                     } else {
                         "routing_scope:groups".to_owned()
                     });
@@ -329,11 +329,11 @@ impl PgControlPlaneRepository {
                     if previously_restricted && key.group_ids.is_empty() {
                         audit
                             .changed_fields
-                            .push("routing_scope:groups->all".to_owned());
+                            .push("routing_scope:groups->inherit".to_owned());
                     } else if !previously_restricted && !key.group_ids.is_empty() {
                         audit
                             .changed_fields
-                            .push("routing_scope:all->groups".to_owned());
+                            .push("routing_scope:inherit->groups".to_owned());
                     }
                     update_client_api_key_in_transaction(&mut transaction, &key).await?;
                 }

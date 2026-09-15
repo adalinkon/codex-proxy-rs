@@ -35,7 +35,6 @@ pub struct UserIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRecord {
     pub identity: UserIdentity,
-    pub all_groups: bool,
     pub groups: Vec<AccountGroupRef>,
     pub limits: RateLimits,
     pub budget: ClientBudgetStatus,
@@ -47,7 +46,6 @@ pub struct UserPolicyUpdate {
     pub id: String,
     pub role: UserRole,
     pub enabled: bool,
-    pub all_groups: bool,
     pub group_ids: Vec<AccountGroupId>,
     pub limits: RateLimits,
     pub budget: ClientBudgetLimits,

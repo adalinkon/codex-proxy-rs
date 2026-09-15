@@ -11,7 +11,7 @@ fn snapshot_client_policy_contains_only_common_limits() {
         user: gateway_core::policy::UserPolicy {
             id: "test-owner".to_owned(),
             enabled: true,
-            group_ids: None,
+            group_ids: Vec::new(),
             limits: RateLimits::unlimited(),
         },
         id: ClientApiKeyId::new("key-1").expect("client key ID"),

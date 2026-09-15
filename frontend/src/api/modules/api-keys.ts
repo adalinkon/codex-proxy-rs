@@ -2,7 +2,7 @@ import type { RequestOptions } from '../request'
 import type { AccountGroupRef } from './account-groups'
 import request from '../request'
 
-export type ApiKeyRoutingScope = 'all' | 'groups' | 'inherit'
+export type ApiKeyRoutingScope = 'groups' | 'inherit'
 
 export interface ApiKey {
   id: string
@@ -72,6 +72,7 @@ interface ApiKeyUpdateParam extends ApiKeyWriteParam {
 }
 
 interface ApiKeyCreateParam extends ApiKeyWriteParam {
+  userId?: string
   customKey?: string
 }
 
@@ -92,7 +93,7 @@ export function createApiKey(data: ApiKeyCreateParam, scope: 'admin' | 'user' = 
   return request<ApiKeyCreateResponse>({
     url: `/api/${scope}/client-keys/create`,
     method: 'POST',
-    data: scope === 'user' ? { name: data.name } : data,
+    data,
   })
 }
 

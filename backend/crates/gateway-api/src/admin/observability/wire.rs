@@ -74,6 +74,8 @@ pub struct BillingView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageListRecordView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     pub id: String,
     pub provider: Option<String>,
     pub authentication_kind: Option<String>,

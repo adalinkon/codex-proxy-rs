@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import type { UserRecord } from '@/api/modules/users'
+import { computed, ref, watch } from 'vue'
+import { getMyProfile, getUsers } from '@/api/modules/users'
 
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -9,9 +11,9 @@ import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import RequestLimitsCell from '@/components/RequestLimitsCell.vue'
-import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { usePageSelection } from '@/composables/usePageSelection'
 import { useRequestUsage } from '@/composables/useRequestUsage'
+import { useAuthStore } from '@/stores/modules/auth'
 import ApiKeyActions from './components/ApiKeyActions.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
 import ApiKeyCreateModal from './components/ApiKeyCreateModal.vue'
@@ -41,18 +43,19 @@ const {
 } = useApiKeysQuery(props.scope)
 const requestUsage = useRequestUsage(props.scope === 'user' ? 'my-keys' : 'keys', () => apiKeys.value.map(key => key.id))
 
-const {
-  groups,
-  loading: loadingGroups,
-  loadGroups,
-} = useAccountGroupCatalog({ immediate: false })
+const auth = useAuthStore()
+const owners = ref<UserRecord[]>([])
+const loadingGroups = ref(false)
+const ownerOptions = computed(() => owners.value.filter(user => user.enabled).map(user => ({ label: user.username, value: user.id })))
+function canCreate(userId: string) {
+  return !loadingGroups.value && owners.value.some(user => user.id === userId && user.enabled)
+}
 
 const {
   showFormModal,
   showDeleteModal,
   showSingleDeleteModal,
   showKeyModal,
-  showAllAccountsConfirm,
   createdKey,
   createdKeyName,
   editingKey,
@@ -66,7 +69,6 @@ const {
   openCreate,
   openEdit,
   requestSave,
-  confirmAllAccountsScope,
   requestDeleteKey,
   handleDelete,
   handleBatchDelete,
@@ -74,7 +76,9 @@ const {
   copyToClipboard,
   revealPlaintextKey,
   copyApiKey,
-} = useApiKeyMutations({ selectedIds, reload: loadApiKeys, scope: props.scope })
+} = useApiKeyMutations({ selectedIds, reload: loadApiKeys, scope: props.scope, canCreate })
+const groups = computed(() => owners.value.find(user => user.id === form.value.userId)?.groups ?? [])
+const createUnavailable = computed(() => !canCreate(form.value.userId))
 
 const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll } = usePageSelection(
   apiKeys,
@@ -94,10 +98,34 @@ const {
   revealPlaintextKey,
 })
 
-watch(
-  showFormModal,
-  open => open && props.scope === 'admin' && void loadGroups(),
-)
+watch(showFormModal, async (open, _, onCleanup) => {
+  if (!open)
+    return
+  const controller = new AbortController()
+  onCleanup(() => controller.abort())
+  owners.value = []
+  loadingGroups.value = true
+  if (!editingKey.value)
+    form.value.userId = auth.user?.id ?? ''
+  try {
+    const result = props.scope === 'admin'
+      ? await getUsers({ signal: controller.signal })
+      : [await getMyProfile({ signal: controller.signal })]
+    if (!controller.signal.aborted)
+      owners.value = result
+  }
+  catch {
+    // 请求层统一提示失败，创建保持禁用，避免使用过期的归属或分组。
+  }
+  finally {
+    if (!controller.signal.aborted)
+      loadingGroups.value = false
+  }
+})
+watch(() => form.value.userId, () => {
+  if (!editingKey.value)
+    form.value.groupIds = []
+})
 </script>
 
 <template>
@@ -204,7 +232,10 @@ watch(
       :groups="groups"
       :group-loading="loadingGroups"
       :editing="Boolean(editingKey)"
-      :policy-readonly="scope === 'user'"
+      :policy-readonly="scope === 'user' && Boolean(editingKey)"
+      :selecting-owner="scope === 'admin'"
+      :users="ownerOptions"
+      :create-unavailable="createUnavailable"
       :created-key="createdKey"
       :saving="savingKey"
       @copy="copyToClipboard"
@@ -218,19 +249,6 @@ watch(
       :api-base-url="openAiBaseUrl"
       @copy="copyToClipboard"
     />
-
-    <BaseConfirmModal
-      v-model="showAllAccountsConfirm"
-      title="授予全部账号权限"
-      description="保存后，该密钥可以使用所有账号。"
-      confirm-text="确认授予全部账号"
-      :loading="savingKey"
-      @confirm="confirmAllAccountsScope"
-    >
-      <p class="m-0">
-        该密钥可以使用所有账号，包括以后新增和未分组的账号。
-      </p>
-    </BaseConfirmModal>
 
     <BaseConfirmModal
       v-model="showDeleteModal"

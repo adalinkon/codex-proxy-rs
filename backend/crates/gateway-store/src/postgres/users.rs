@@ -100,7 +100,7 @@ impl PgUserRepository {
             .execute(&mut *tx)
             .await
             .map_err(unavailable)?;
-        let rows = sqlx::query("select u.id,u.role,u.enabled,u.auth_revision,u.all_groups,u.max_concurrency,u.requests_per_minute,
+        let rows = sqlx::query("select u.id,u.role,u.enabled,u.auth_revision,u.max_concurrency,u.requests_per_minute,
             (select count(*) from client_api_keys k where k.user_id=u.id) as key_count,
             w.daily_used_usd::text as daily_used,
             w.weekly_used_usd::text as weekly_used,
@@ -125,7 +125,6 @@ impl PgUserRepository {
             };
             records.push(UserRecord {
                 identity: user_identity(&row)?,
-                all_groups: row.get("all_groups"),
                 groups: groups
                     .iter()
                     .filter(|g| g.get::<&str, _>("user_id") == id)
@@ -174,8 +173,8 @@ impl PgUserRepository {
         // 与其它配置写入使用同一锁，保证最后一个管理员检查及快照版本原子提交。
         let revision: i64 = sqlx::query_scalar("update runtime_settings set config_revision=config_revision+1, updated_at=now() where id=1 returning config_revision").fetch_one(&mut *tx).await.map_err(unavailable)?;
         if let Some(hash) = initial_hash {
-            sqlx::query("insert into admin_users(id,password_hash,role,enabled,all_groups,created_at,updated_at) values($1,$2,$3,$4,$5,now(),now())")
-                .bind(&policy.id).bind(hash).bind(policy.role.as_str()).bind(policy.enabled).bind(policy.all_groups).execute(&mut *tx).await.map_err(write_error)?;
+            sqlx::query("insert into admin_users(id,password_hash,role,enabled,created_at,updated_at) values($1,$2,$3,$4,now(),now())")
+                .bind(&policy.id).bind(hash).bind(policy.role.as_str()).bind(policy.enabled).execute(&mut *tx).await.map_err(write_error)?;
         } else {
             let exists: bool = sqlx::query_scalar(
                 "select exists(select 1 from admin_users where id=$1 and deleted_at is null)",
@@ -202,8 +201,8 @@ impl PgUserRepository {
                 }
             }
         }
-        sqlx::query("update admin_users set auth_revision=auth_revision+case when enabled<>$2 or role<>$3 then 1 else 0 end, enabled=$2, role=$3, all_groups=$4, daily_limit_usd=$5::text::numeric, weekly_limit_usd=$6::text::numeric, max_concurrency=$7, requests_per_minute=$8, updated_at=now() where id=$1")
-            .bind(&policy.id).bind(policy.enabled).bind(policy.role.as_str()).bind(policy.all_groups).bind(policy.budget.daily_usd.canonical()).bind(policy.budget.weekly_usd.canonical())
+        sqlx::query("update admin_users set auth_revision=auth_revision+case when enabled<>$2 or role<>$3 then 1 else 0 end, enabled=$2, role=$3, daily_limit_usd=$4::text::numeric, weekly_limit_usd=$5::text::numeric, max_concurrency=$6, requests_per_minute=$7, updated_at=now() where id=$1")
+            .bind(&policy.id).bind(policy.enabled).bind(policy.role.as_str()).bind(policy.budget.daily_usd.canonical()).bind(policy.budget.weekly_usd.canonical())
             .bind(i64::try_from(policy.limits.max_concurrency).map_err(|_| invalid("limit overflow"))?).bind(i64::try_from(policy.limits.requests_per_minute).map_err(|_| invalid("limit overflow"))?).execute(&mut *tx).await.map_err(write_error)?;
         sqlx::query("delete from user_account_groups where user_id=$1")
             .bind(&policy.id)

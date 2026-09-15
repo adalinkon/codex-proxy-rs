@@ -7,6 +7,26 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 pub(super) struct TestRequestUsageStore;
+
+#[tokio::test]
+async fn personal_key_creation_rejects_explicit_owner() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("administrator");
+    let response = call(
+        &fixture,
+        "POST",
+        "/api/user/client-keys/create",
+        "administrator",
+        json!({
+            "name": "Personal", "label": "Test", "userId": "another-user",
+            "groupIds": [], "maxConcurrency": 2, "requestsPerMinute": 10,
+            "dailyLimitUsd": "1", "weeklyLimitUsd": "5"
+        }),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+}
+
 #[async_trait::async_trait]
 impl gateway_admin::ports::store::RequestUsageStore for TestRequestUsageStore {
     async fn request_usage(
@@ -164,7 +184,7 @@ async fn call(
 }
 
 fn user_payload() -> Value {
-    json!({"username":"alice","role":"user","enabled":true,"allGroups":false,"groupIds":[],"dailyLimitUsd":"1.1234567891","weeklyLimitUsd":"7","maxConcurrency":2,"requestsPerMinute":10,"password":"alice-initial-password"})
+    json!({"username":"alice","role":"user","enabled":true,"groupIds":[],"dailyLimitUsd":"1.1234567891","weeklyLimitUsd":"7","maxConcurrency":2,"requestsPerMinute":10,"password":"alice-initial-password"})
 }
 
 #[tokio::test]

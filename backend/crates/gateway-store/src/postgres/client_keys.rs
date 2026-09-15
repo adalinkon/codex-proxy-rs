@@ -722,12 +722,16 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                             id: key.id.as_str().to_owned(),
                             user_id: Some(user_id.to_owned()),
                             name: key.name,
-                            label: None,
-                            group_ids: Vec::new(),
+                            label: key.label,
+                            group_ids: key
+                                .group_ids
+                                .iter()
+                                .map(|id| id.as_str().to_owned())
+                                .collect(),
                             key: key.plaintext,
-                            max_concurrency: 0,
-                            requests_per_minute: 0,
-                            budget: Default::default(),
+                            max_concurrency: key.limits.max_concurrency,
+                            requests_per_minute: key.limits.requests_per_minute,
+                            budget: key.budget,
                         },
                     )
                     .await?;
@@ -1226,7 +1230,7 @@ async fn replace_client_api_key_groups_in_transaction(
     key_id: &str,
     group_ids: &[String],
 ) -> StoreResult<()> {
-    let allowed=sqlx::query_scalar::<_,bool>("select u.deleted_at is null and (u.all_groups or not exists(select 1 from unnest($2::text[]) g(id) where not exists(select 1 from user_account_groups ug where ug.user_id=u.id and ug.account_group_id=g.id))) from client_api_keys k join admin_users u on u.id=k.user_id where k.id=$1")
+    let allowed=sqlx::query_scalar::<_,bool>("select u.deleted_at is null and not exists(select 1 from unnest($2::text[]) g(id) where not exists(select 1 from user_account_groups ug where ug.user_id=u.id and ug.account_group_id=g.id)) from client_api_keys k join admin_users u on u.id=k.user_id where k.id=$1")
         .bind(key_id).bind(group_ids).fetch_one(&mut **transaction).await.map_err(|_| postgres_unavailable("validate key owner groups"))?;
     if !allowed {
         return Err(invalid("key groups exceed user authorization"));

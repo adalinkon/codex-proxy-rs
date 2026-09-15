@@ -17,7 +17,6 @@ import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseNumberInput from '@/components/base/BaseNumberInput.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import { defineTableColumns } from '@/components/base/BaseTable/columns'
 import BaseTable from '@/components/base/BaseTable/index.vue'
@@ -61,10 +60,10 @@ const pageSize = ref(50)
 const sort = ref<BaseTableSort>({ key: 'username', direction: 'asc' })
 const busy = computed(() => saving.value || deleting.value || resettingBudget.value)
 function emptyForm(): UserPolicy {
-  return { username: '', role: 'user', enabled: true, allGroups: false, groupIds: [], dailyLimitUsd: '0', weeklyLimitUsd: '0', maxConcurrency: 0, requestsPerMinute: 0, password: '' }
+  return { username: '', role: 'user', enabled: true, groupIds: [], dailyLimitUsd: '0', weeklyLimitUsd: '0', maxConcurrency: 0, requestsPerMinute: 0, password: '' }
 }
 function policy(user: UserRecord): UserPolicy {
-  return { username: user.username, role: user.role, enabled: user.enabled, allGroups: user.allGroups, groupIds: user.groups.map(g => g.id), dailyLimitUsd: user.dailyLimitUsd, weeklyLimitUsd: user.weeklyLimitUsd, maxConcurrency: user.maxConcurrency, requestsPerMinute: user.requestsPerMinute }
+  return { username: user.username, role: user.role, enabled: user.enabled, groupIds: user.groups.map(g => g.id), dailyLimitUsd: user.dailyLimitUsd, weeklyLimitUsd: user.weeklyLimitUsd, maxConcurrency: user.maxConcurrency, requestsPerMinute: user.requestsPerMinute }
 }
 const filteredUsers = computed(() => users.value
   .filter(user => user.username.toLowerCase().includes(search.value.toLowerCase()))
@@ -108,7 +107,7 @@ function edit(user?: UserRecord) {
 }
 async function save() {
   await saveAction.run(async () => {
-    await saveUser({ ...form.value, allGroups: form.value.role === 'admin' && form.value.allGroups }, !editing.value)
+    await saveUser({ ...form.value }, !editing.value)
     open.value = false
     toast.success('用户已保存')
     await load()
@@ -273,8 +272,7 @@ onMounted(load)
             </template>
             <template #groups="{ row }">
               <div class="grid w-full justify-items-center gap-1.5">
-                <span v-if="row.allGroups" class="inline-flex h-6 items-center rounded-lg bg-cp-warning-container px-2 text-cp-xs font-bold text-cp-warning-on-container">全部账号</span>
-                <AccountGroupMarks v-else :groups="row.groups" />
+                <AccountGroupMarks :groups="row.groups" />
               </div>
             </template>
             <template #actions="{ row }">
@@ -333,9 +331,11 @@ onMounted(load)
           <BaseNumberInput v-model="form.maxConcurrency" label="共享并发" :min="0" />
           <BaseNumberInput v-model="form.requestsPerMinute" label="共享 RPM" :min="0" />
         </div>
-        <BaseSwitch v-if="form.role === 'admin'" v-model="form.allGroups" label="全部分组" />
         <BaseFormItem label="可用账号分组">
-          <AccountGroupCheckboxGrid v-if="form.role !== 'admin' || !form.allGroups" v-model="form.groupIds" :groups="groups" :loading="groupsLoading" :disabled="saving" />
+          <AccountGroupCheckboxGrid v-model="form.groupIds" :groups="groups" :loading="groupsLoading" :disabled="saving" />
+          <p class="m-0 mt-2 text-cp-sm text-cp-text-secondary">
+            未选择分组时无法使用账号；新增分组需另行授权。
+          </p>
         </BaseFormItem>
       </form>
       <template #footer>

@@ -275,7 +275,7 @@ fn facts_with_min_versions(
             gateway_core::policy::UserPolicy {
                 id: "test-owner".to_owned(),
                 enabled: true,
-                group_ids: None,
+                group_ids: Vec::new(),
                 limits: Default::default(),
             },
         )],
@@ -306,10 +306,10 @@ fn user_and_key_groups_intersect_without_widening_empty_permissions() {
     let group = |id| AccountGroupId::new(format!("grp_{id:0>32}")).unwrap();
     let account = |id| ProviderAccountId::new(format!("acct_{id}")).unwrap();
     for (allowed, key_groups, expected) in [
-        (Some(vec![group("a")]), vec![], [true, false]),
-        (Some(vec![group("a")]), vec![group("b")], [false, false]),
-        (Some(vec![]), vec![], [false, false]),
-        (None, vec![], [true, true]),
+        (vec![group("a")], vec![], [true, false]),
+        (vec![group("a")], vec![group("b")], [false, false]),
+        (vec![], vec![], [false, false]),
+        (vec![group("a"), group("b")], vec![], [true, true]),
     ] {
         let facts = SnapshotFacts::new(
             revision(1),
@@ -334,6 +334,7 @@ fn user_and_key_groups_intersect_without_widening_empty_permissions() {
             vec![
                 SnapshotProviderAccountFacts::new(account("one"), "alpha"),
                 SnapshotProviderAccountFacts::new(account("two"), "alpha"),
+                SnapshotProviderAccountFacts::new(account("ungrouped"), "alpha"),
             ],
             vec![
                 SnapshotAccountGroupMemberFacts::new(group("a"), account("one")),
@@ -354,5 +355,6 @@ fn user_and_key_groups_intersect_without_widening_empty_permissions() {
             expected
         );
         assert_eq!(policy.user().id, "alice");
+        assert!(!policy.account_scope().allows(&account("ungrouped")));
     }
 }

@@ -4,8 +4,8 @@ use super::{
     AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse, AdminSessionState,
     auth::admin_session_cookie,
     client_keys::{
-        ClientKeyView, CreatedClientKeyData, ListClientKeysQuery, RevealedClientKeyData,
-        encode_page_cursor,
+        ClientKeyView, CreateClientKeyRequest, CreatedClientKeyData, ListClientKeysQuery,
+        RevealedClientKeyData, encode_page_cursor,
     },
     wire::map_admin_service_error,
 };
@@ -126,7 +126,6 @@ struct UserView {
     #[serde(flatten)]
     identity: SessionUserView,
     enabled: bool,
-    all_groups: bool,
     groups: Vec<GroupView>,
     max_concurrency: u64,
     requests_per_minute: u64,
@@ -139,7 +138,6 @@ impl From<UserRecord> for UserView {
         Self {
             enabled: u.identity.enabled,
             identity: u.identity.into(),
-            all_groups: u.all_groups,
             groups: u
                 .groups
                 .into_iter()
@@ -164,7 +162,6 @@ struct SaveUser {
     username: String,
     role: String,
     enabled: bool,
-    all_groups: bool,
     group_ids: Vec<String>,
     daily_limit_usd: String,
     weekly_limit_usd: String,
@@ -183,7 +180,6 @@ impl SaveUser {
                 _ => return Err(invalid()),
             },
             enabled: self.enabled,
-            all_groups: self.all_groups,
             group_ids: self
                 .group_ids
                 .iter()
@@ -250,11 +246,6 @@ impl From<RequestUsage> for RequestUsageView {
 struct ChangePassword {
     current_password: String,
     new_password: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NewKey {
-    name: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,12 +503,18 @@ async fn keys<S: AdminSessionState + Send + Sync>(
 async fn create_key<S: AdminSessionState + Send + Sync>(
     auth: UserAuth,
     State(s): State<S>,
-    AdminJson(p): AdminJson<NewKey>,
+    AdminJson(p): AdminJson<CreateClientKeyRequest>,
 ) -> Result<impl IntoResponse, AdminError> {
+    let command = p
+        .into_command()
+        .map_err(super::client_keys::map_wire_error)?;
+    if command.user_id.is_some() {
+        return Err(AdminError::bad_request("个人 Key 不接受指定所属用户"));
+    }
     let key = s
         .admin_services()
         .client_keys()
-        .create_owned(&auth.0.id, p.name)
+        .create_owned(&auth.0.id, command)
         .await
         .map_err(map_admin_service_error)?;
     Ok(AdminResponse::new(

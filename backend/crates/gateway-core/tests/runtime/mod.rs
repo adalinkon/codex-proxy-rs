@@ -604,7 +604,7 @@ fn scoped_facts(value: u64, allow_removed: bool) -> SnapshotFacts {
             gateway_core::policy::UserPolicy {
                 id: "test-owner".to_owned(),
                 enabled: true,
-                group_ids: None,
+                group_ids: Vec::new(),
                 limits: Default::default(),
             },
         )],
@@ -650,7 +650,7 @@ fn facts(config_revision: u64, observed_current_revision: u64) -> SnapshotFacts 
             gateway_core::policy::UserPolicy {
                 id: "test-owner".to_owned(),
                 enabled: true,
-                group_ids: None,
+                group_ids: Vec::new(),
                 limits: Default::default(),
             },
         )],

@@ -430,6 +430,7 @@ pub(crate) fn admin_usage_list_record(
     };
     Ok(admin_observability::UsageListRecord {
         id: record.id,
+        username: record.username,
         endpoint: record.endpoint,
         client_transport: record.client_transport,
         requested_model_id: record.requested_model_id,
@@ -755,6 +756,7 @@ pub(crate) fn usage_list_record_from_row(
 ) -> StoreResult<UsageListRecord> {
     Ok(UsageListRecord {
         id: get(row, "id")?,
+        username: get(row, "username")?,
         endpoint: get(row, "endpoint")?,
         client_transport: get(row, "client_transport")?,
         requested_model_id: get(row, "requested_model_id")?,

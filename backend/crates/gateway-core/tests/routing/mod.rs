@@ -98,7 +98,7 @@ fn client_policy(id: &str, plaintext: &str, enabled: bool) -> ClientPolicy {
         gateway_core::policy::UserPolicy {
             id: "test-owner".to_owned(),
             enabled: true,
-            group_ids: None,
+            group_ids: Vec::new(),
             limits: Default::default(),
         },
     )

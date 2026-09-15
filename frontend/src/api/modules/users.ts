@@ -14,7 +14,6 @@ export interface UserRecord extends BudgetAmounts {
   username: string
   role: 'admin' | 'user'
   enabled: boolean
-  allGroups: boolean
   groups: { id: string, name: string, color: string, enabled: boolean }[]
   maxConcurrency: number
   requestsPerMinute: number
@@ -26,7 +25,6 @@ export interface UserPolicy {
   username: string
   role: 'admin' | 'user'
   enabled: boolean
-  allGroups: boolean
   groupIds: string[]
   maxConcurrency: number
   requestsPerMinute: number

@@ -183,7 +183,7 @@ fn snapshot(plaintext: &str, provider_name: &str) -> RuntimeSnapshot {
             gateway_core::policy::UserPolicy {
                 id: "test-owner".to_owned(),
                 enabled: true,
-                group_ids: None,
+                group_ids: Vec::new(),
                 limits: Default::default(),
             },
         )],

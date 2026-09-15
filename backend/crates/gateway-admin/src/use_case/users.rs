@@ -7,7 +7,7 @@ use super::{
 use crate::{
     model::{
         AdminError,
-        users::{RequestUsage, RequestUsageScope, UserPolicyUpdate, UserRecord, UserRole},
+        users::{RequestUsage, RequestUsageScope, UserPolicyUpdate, UserRecord},
     },
     ports::store::{AuthStore, RequestUsageStore},
 };
@@ -130,9 +130,6 @@ impl UserService for DefaultUserService {
             || policy.id.chars().any(char::is_control)
         {
             return Err(AdminError::invalid("用户名不合法"));
-        }
-        if policy.role == UserRole::User && policy.all_groups {
-            return Err(AdminError::invalid("普通用户必须显式分配账号分组"));
         }
         if policy.limits.max_concurrency >= (1_u64 << 53)
             || policy.limits.requests_per_minute >= (1_u64 << 53)

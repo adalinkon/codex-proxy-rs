@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { ApiKeyFormValue } from '../composables/useApiKeyMutations'
-import type { AccountGroup } from '@/api'
+import type { AccountGroupRef } from '@/api'
 import { Copy, DollarSign, KeyRound, Upload } from '@lucide/vue'
 import { computed } from 'vue'
 
@@ -11,9 +11,13 @@ import BaseForm from '@/components/base/BaseForm/index.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
+import BaseSelect from '@/components/base/BaseSelect.vue'
 
 const props = defineProps<{
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
+  users?: { label: string, value: string }[]
+  selectingOwner?: boolean
+  createUnavailable?: boolean
   groupLoading: boolean
   editing: boolean
   createdKey: string
@@ -44,6 +48,9 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
     </template>
 
     <BaseForm class="grid gap-6">
+      <BaseFormItem v-if="selectingOwner && !editing" label="用户名" required>
+        <BaseSelect v-model="form.userId" :options="users ?? []" :disabled="saving || groupLoading" placeholder="选择所属用户" />
+      </BaseFormItem>
       <BaseFormItem label="名称" required>
         <BaseInput
           v-model="form.name"
@@ -53,7 +60,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         />
       </BaseFormItem>
 
-      <BaseFormItem v-if="!policyReadonly || editing" label="标签（可选）">
+      <BaseFormItem label="标签（可选）">
         <BaseInput
           v-model="form.label"
           aria-label="标签（可选）"
@@ -63,7 +70,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
       </BaseFormItem>
 
       <BaseFormItem
-        v-if="!editing && !policyReadonly"
+        v-if="!editing"
         label="自定义 Key（可选）"
       >
         <BaseInput
@@ -84,6 +91,9 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
           :loading="groupLoading"
           :disabled="saving"
         />
+        <p class="m-0 mt-2 text-cp-sm text-cp-text-secondary">
+          不选择时继承所属用户的分组授权；选择后仅可使用与用户授权重合的分组。
+        </p>
       </BaseFormItem>
 
       <div v-if="!policyReadonly" class="grid gap-6 sm:grid-cols-2">
@@ -152,7 +162,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
       <BaseButton
         variant="primary"
         :loading="saving"
-        :disabled="!form.name.trim()"
+        :disabled="!form.name.trim() || (!editing && createUnavailable)"
         @click="emit('save')"
       >
         {{ editing ? '保存更改' : '创建' }}

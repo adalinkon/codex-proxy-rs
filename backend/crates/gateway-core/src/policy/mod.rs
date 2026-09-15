@@ -182,11 +182,11 @@ impl ClientPolicy {
     }
 }
 
-/// 请求冻结的用户归属与授权；None 表示管理员明确拥有全部分组，空集合表示无权限。
+/// 请求冻结的用户归属与显式分组授权；所有角色的空集合均表示无权限。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPolicy {
     pub id: String,
     pub enabled: bool,
-    pub group_ids: Option<Vec<crate::account::scope::AccountGroupId>>,
+    pub group_ids: Vec<crate::account::scope::AccountGroupId>,
     pub limits: RateLimits,
 }

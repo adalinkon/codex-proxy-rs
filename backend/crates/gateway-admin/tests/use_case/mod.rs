@@ -18,7 +18,6 @@ fn test_user(id: &str) -> gateway_admin::model::users::UserRecord {
             enabled: true,
             auth_revision: 0,
         },
-        all_groups: true,
         groups: Vec::new(),
         limits: Default::default(),
         budget: Default::default(),

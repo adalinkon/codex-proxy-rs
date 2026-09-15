@@ -69,6 +69,7 @@ export interface UsageRecordMetadata {
 
 export interface UsageListRecord {
   id: string
+  username?: string | null
   provider: string | null
   authenticationKind: string | null
   accountId: string | null

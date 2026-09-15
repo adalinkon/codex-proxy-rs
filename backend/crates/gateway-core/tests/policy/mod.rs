@@ -30,7 +30,7 @@ fn enabled_key_requires_an_enabled_nonempty_owner() {
                 gateway_core::policy::UserPolicy {
                     id: id.to_owned(),
                     enabled,
-                    group_ids: None,
+                    group_ids: Vec::new(),
                     limits: Default::default()
                 },
             )
@@ -51,7 +51,7 @@ fn disabled_client_key_should_be_denied() {
         gateway_core::policy::UserPolicy {
             id: "test-owner".to_owned(),
             enabled: true,
-            group_ids: None,
+            group_ids: Vec::new(),
             limits: Default::default(),
         },
     );
@@ -70,7 +70,7 @@ fn enabled_client_key_should_be_authorized() {
         gateway_core::policy::UserPolicy {
             id: "test-owner".to_owned(),
             enabled: true,
-            group_ids: None,
+            group_ids: Vec::new(),
             limits: Default::default(),
         },
     );

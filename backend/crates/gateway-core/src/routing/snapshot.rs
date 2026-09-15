@@ -370,21 +370,16 @@ async fn compile_runtime_snapshot(
         if user.id.is_empty() {
             return Err(RuntimeSnapshotCompileError::InvalidData);
         }
-        let group_ids = match &user.group_ids {
-            None => policy.group_ids,
-            Some(allowed) if policy.group_ids.is_empty() => allowed.clone(),
-            Some(allowed) => policy
+        let group_ids = if policy.group_ids.is_empty() {
+            user.group_ids.clone()
+        } else {
+            policy
                 .group_ids
                 .into_iter()
-                .filter(|group| allowed.contains(group))
-                .collect(),
+                .filter(|group| user.group_ids.contains(group))
+                .collect()
         };
-        let account_scope = if group_ids.is_empty() && user.group_ids.is_none() {
-            FrozenAccountScope::new(
-                Arc::clone(&account_directory),
-                ClientRoutingScope::all_accounts(),
-            )
-        } else {
+        let account_scope = {
             let mut seen = BTreeSet::new();
             let mut bound_groups = Vec::with_capacity(group_ids.len());
             let mut enabled_group_ids = BTreeSet::new();

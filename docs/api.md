@@ -269,7 +269,7 @@ OpenAI 明确返回 `server_is_overloaded`、`slow_down` 或模型容量不足�
 | `GET` | `/api/user/profile` | 只返回当前会话用户；与管理员用户列表复用相同的额度投影 |
 | `POST` | `/api/user/password` | `{ currentPassword, newPassword }`，验证当前密码后修改 |
 | `GET` | `/api/user/client-keys` | 沿用 Key 列表的游标、排序和搜索参数，服务端固定当前用户过滤条件 |
-| `POST` | `/api/user/client-keys/create` | `{ name }`，创建归属当前用户、继承用户权限且 Key 附加限额为零的 Key |
+| `POST` | `/api/user/client-keys/create` | 接受与管理员创建相同的 Key 参数，但不接受 `userId`；归属固定为当前登录用户 |
 | `POST` | `/api/user/client-keys/update` | `{ id, name, label }`，只修改自己的 Key 名称与标签，不接受授权或限额字段 |
 | `GET` | `/api/user/client-keys/reveal` | `id`，显式读取自己的明文 Key |
 | `POST` | `/api/user/client-keys/enable` | `{ id }`，启用自己的 Key |
@@ -281,16 +281,16 @@ OpenAI 明确返回 `server_is_overloaded`、`slow_down` 或模型容量不足�
 | `GET` | `/api/user/usage/insights/overview` | 同范围的个人健康、性能、费用趋势；账号容量数据置空 |
 | `GET` | `/api/user/usage/insights/diagnostics` | 同范围的个人聚合，另接受 `dimension`；不允许 `account` 维度 |
 
-用户策略字段为 `username`、`role`、`enabled`、`allGroups`、`groupIds`、`dailyLimitUsd`、
+用户策略字段为 `username`、`role`、`enabled`、`groupIds`、`dailyLimitUsd`、
 `weeklyLimitUsd`、`maxConcurrency` 和 `requestsPerMinute`。用户名不可修改，新密码长度为 12 至 1024
-字节。至少保留一个启用的管理员。普通用户必须 `allGroups: false`，空 `groupIds` 表示无权限；
-管理员可显式设置 `allGroups: true`。金额为非负十进制字符串，精度与 Key 相同，零表示不限。
+字节。至少保留一个启用的管理员。所有角色均须显式分配账号分组，空 `groupIds` 表示无权限；
+新增分组不会自动授权，未分组账号不在授权范围内。金额为非负十进制字符串，精度与 Key 相同，零表示不限。
 
 删除用户后不再出现在用户列表中，也不能登录、编辑配置或重置密码。所属 Key 与用户分组关联一并删除，
 用户账本和历史请求归属保留，已开始的请求仍可向原用户幂等结算。同名用户不能重新创建，以免接管历史
 记录或重置额度；最后一个启用的管理员不能删除。此删除操作不新增操作审计。
 
-用户投影包含 `id`、`username`、`role`、`enabled`、`allGroups`、`groups`、`keyCount`、
+用户投影包含 `id`、`username`、`role`、`enabled`、`groups`、`keyCount`、
 `maxConcurrency`、`requestsPerMinute`，以及 `dailyLimitUsd`、`weeklyLimitUsd`、`dailyUsedUsd`、
 `weeklyUsedUsd`、`dailyRemainingUsd`、`weeklyRemainingUsd`、`dailyResetsAt`、`weeklyResetsAt`。
 不限额时剩余金额为 `null`，超额后剩余金额为零。日／周重置时间从创建当天北京时间零点连续计算，
@@ -310,6 +310,8 @@ OpenAI 明确返回 `server_is_overloaded`、`slow_down` 或模型容量不足�
 不加回清零后的用户用量。相同 `operationId` 重试返回首次清零时间，不再次清零；用于不同用户返回 `409`。
 前端在当前浏览器会话保留尚未确认结果的操作 ID，刷新或重新打开弹窗后继续复用。操作不写入审计事件。
 
+个人创建接受 `name`、可选 `label`、可选 `customKey`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、
+可选 `dailyLimitUsd` 和 `weeklyLimitUsd`，沿用管理员创建的校验规则。分组必须在本人授权内，Key 限额与用户总限额同时生效。
 个人 Key 列表复用管理员 Key 列表展示字段，包括名称、标签、前缀、启停、时间、附加金额限额、并发／RPM
 及分组标识、名称、颜色。空分组使用 `routingScope: "inherit"`，表示继承用户授权；不返回上游账号或凭据。
 读取、修改、启停和删除他人 Key 返回 `404`。客户端不能通过请求体或查询参数指定他人的用户 ID。
@@ -721,14 +723,16 @@ PostgreSQL 或 Redis。
 
 创建字段为 `name`、可选 `label`、可选 `userId`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、可选
 `dailyLimitUsd`、`weeklyLimitUsd` 和 `customKey`。更新请求携带 `id`，不接受 `customKey`。
-`groupIds` 必须显式提交：空数组派生 `routingScope: "all"`，非空数组派生
+`groupIds` 必须显式提交：空数组派生 `routingScope: "inherit"`，非空数组派生
 `routingScope: "groups"`。响应同时返回分组引用 `groups`，以及从当前有效账号池派生、仅供展示的
 `providerKinds`。创建和 reveal 响应会返回完整明文 Key，调用方
 必须立即安全保存。
 
 每个 Key 必须有用户归属，创建时省略 `userId` 使用当前管理员；管理 API Key 调用省略时使用最早创建的
 管理员。Key 归属不可修改。空 `groupIds` 表示继承用户授权；非空分组必须在用户授权内，执行时继续与
-用户最新分组取交集。管理员 `allGroups: true` 且 Key 未绑定分组时仍可使用全部账号。
+用户最新分组取交集。管理员与普通用户遵循同一分组授权规则，均不允许访问未授权分组或未分组账号。
+
+管理员创建弹窗可选择所属用户名，分组列表随所选用户切换，只展示该用户获授权的分组。
 
 密钥列表的 `search` 仅匹配名称和标签，不匹配密钥值或可见前缀；搜索不区分大小写，使用字面量前缀匹配。
 创建和更新时去除名称首尾空白，并按忽略大小写、首尾空格的名称查重，重复返回 `409`。
@@ -936,6 +940,8 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 审计动作：`backup.s3_config_updated`、`backup.s3_connection_tested`、`backup.schedule_updated`、`backup.created`、`backup.download_url_created`、`backup.delete_requested`。审计详情与记录表均不保存 Secret、数据库连接串或预签名 URL query。
 
 ## 10. Dashboard、用量与错误
+
+管理员使用统计明细的 `username` 来自请求开始时保存的用户归属；个人使用统计不返回该字段。
 
 | 方法 | 路由 | 说明 |
 | --- | --- | --- |

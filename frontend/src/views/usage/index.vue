@@ -22,7 +22,7 @@ import { usageRecordColumns, usageTimeRangeOptions } from './constants'
 
 const props = withDefaults(defineProps<{ scope?: 'admin' | 'user' }>(), { scope: 'admin' })
 const columns = computed(() => props.scope === 'user'
-  ? usageRecordColumns.filter(column => !['accountEmail', 'actions'].includes(column.key))
+  ? usageRecordColumns.filter(column => !['username', 'accountEmail', 'actions'].includes(column.key))
   : usageRecordColumns)
 const recordView = shallowRef('success')
 const recordViewOptions = [

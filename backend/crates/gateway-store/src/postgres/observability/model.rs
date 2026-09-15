@@ -481,6 +481,7 @@ pub struct DashboardObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
     pub id: String,
+    pub username: Option<String>,
     pub endpoint: String,
     pub client_transport: String,
     pub requested_model_id: Option<String>,

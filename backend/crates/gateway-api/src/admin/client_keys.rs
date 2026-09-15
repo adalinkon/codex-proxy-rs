@@ -311,7 +311,7 @@ pub struct ClientKeyGroupView {
 impl From<ClientKeyRecord> for ClientKeyView {
     fn from(record: ClientKeyRecord) -> Self {
         let routing_scope = if record.groups.is_empty() {
-            "all"
+            "inherit"
         } else {
             "groups"
         };
@@ -355,12 +355,7 @@ impl From<ClientKeyRecord> for ClientKeyView {
 
 impl ClientKeyView {
     pub(crate) fn owned(record: ClientKeyRecord) -> Self {
-        let inherited = record.groups.is_empty();
-        let mut view = Self::from(record);
-        if inherited {
-            view.routing_scope = "inherit";
-        }
-        view
+        Self::from(record)
     }
 }
 
@@ -880,7 +875,7 @@ fn mutation_response(
     ))
 }
 
-fn map_wire_error(error: WireValidationError) -> AdminError {
+pub(super) fn map_wire_error(error: WireValidationError) -> AdminError {
     match error.field() {
         "cursor" => AdminError::bad_request("Client API Key 游标不合法"),
         "clientKeyRevealNotFound" | "clientKeyMutationNotFound" => {

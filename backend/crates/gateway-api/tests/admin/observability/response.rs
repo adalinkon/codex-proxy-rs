@@ -953,6 +953,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .expect("usage records")
         .push(UsageListRecord {
             id: "request_endpoint".to_owned(),
+            username: Some("test-owner".to_owned()),
             endpoint: "/v1/responses".to_owned(),
             client_transport: "websocket".to_owned(),
             requested_model_id: Some("grok-4.5".to_owned()),
@@ -1046,6 +1047,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .expect("usage response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage response JSON");
 
+    assert_eq!(value["data"]["items"][0]["username"], "test-owner");
     assert_eq!(
         value["data"]["items"][0]["billing"]["inputPriceDisplay"],
         "$10 / 1M Token"
