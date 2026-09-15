@@ -19,6 +19,7 @@ Example:
 Before publishing, replace release/notes.md with the new version's notes,
 starting with "# v<version>". Leave the notes uncommitted; this command commits
 them together with release/version.yaml. Commit other tracked changes first.
+Pushing the version tag automatically triggers the Release workflow.
 USAGE
 }
 
@@ -72,10 +73,7 @@ fi
 }
 
 require_command git
-require_command gh
 require_command ruby
-
-gh auth status >/dev/null 2>&1 || die "gh authentication is required; run gh auth login first"
 
 version="${1#v}"
 [[ "$version" =~ $SEMVER ]] || die "version must be semver, for example 0.1.4"
@@ -91,9 +89,6 @@ merge_ref="$(git config --get "branch.$branch.merge" || true)"
 [[ -n "$remote" && -n "$merge_ref" ]] || die "current branch has no upstream"
 remote_branch="${merge_ref#refs/heads/}"
 [[ "$remote_branch" != "$merge_ref" && -n "$remote_branch" ]] || die "unsupported upstream ref: $merge_ref"
-remote_url="$(git remote get-url "$remote")" || die "failed to resolve remote URL for $remote"
-repository="$(gh repo view "$remote_url" --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)" ||
-  die "failed to resolve GitHub repository for $remote_url"
 
 if ! git diff --quiet --ignore-submodules -- . ":(exclude)$NOTES_FILE"; then
   die "tracked files other than $NOTES_FILE have unstaged changes; commit or stash them first"
@@ -153,20 +148,10 @@ git commit \
 git tag -a "$tag" -m "$tag"
 git push --atomic "$remote" "HEAD:$remote_branch" "refs/tags/$tag"
 
-# Dispatch from the long-lived release branch instead of the tag so GitHub
-# Actions caches remain reusable across releases.
-if ! gh workflow run release.yml \
-  --repo "$repository" \
-  --ref "$remote_branch" \
-  --raw-field "tag=$tag"; then
-  echo "error: commit and tag were pushed, but the Release workflow was not dispatched" >&2
-  echo "retry: gh workflow run release.yml --repo $repository --ref $remote_branch --raw-field tag=$tag" >&2
-  exit 1
-fi
-
 cat <<DONE
-Published $APP_NAME $version
+Pushed $APP_NAME $version for release
 Commit: $(git rev-parse --short HEAD)
 Tag:    $tag
-Release workflow dispatched from: $remote_branch
+The tag push triggers the Release workflow; check GitHub Actions for its status.
+If no run appears, use the Release workflow's Run workflow action with tag=$tag.
 DONE
