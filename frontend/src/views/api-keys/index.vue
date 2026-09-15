@@ -77,7 +77,15 @@ const {
   revealPlaintextKey,
   copyApiKey,
 } = useApiKeyMutations({ selectedIds, reload: loadApiKeys, scope: props.scope, canCreate })
-const groups = computed(() => owners.value.find(user => user.id === form.value.userId)?.groups ?? [])
+const owner = computed(() => owners.value.find(user => user.id === form.value.userId))
+const unavailableGroups = computed(() => {
+  if (!owner.value)
+    return []
+  const allowedIds = new Set(owner.value.groups.map(group => group.id))
+  return editingKey.value?.groups.filter(group => !allowedIds.has(group.id)) ?? []
+})
+const unavailableGroupIds = computed(() => unavailableGroups.value.map(group => group.id))
+const groups = computed(() => [...(owner.value?.groups ?? []), ...unavailableGroups.value])
 const createUnavailable = computed(() => !canCreate(form.value.userId))
 
 const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll } = usePageSelection(
@@ -230,6 +238,7 @@ watch(() => form.value.userId, () => {
       v-model:created-open="showKeyModal"
       v-model:form="form"
       :groups="groups"
+      :unavailable-group-ids="unavailableGroupIds"
       :group-loading="loadingGroups"
       :editing="Boolean(editingKey)"
       :policy-readonly="scope === 'user' && Boolean(editingKey)"

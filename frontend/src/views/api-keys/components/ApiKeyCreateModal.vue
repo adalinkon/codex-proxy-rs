@@ -15,6 +15,7 @@ import BaseSelect from '@/components/base/BaseSelect.vue'
 
 const props = defineProps<{
   groups: AccountGroupRef[]
+  unavailableGroupIds?: string[]
   users?: { label: string, value: string }[]
   selectingOwner?: boolean
   createUnavailable?: boolean
@@ -88,6 +89,7 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         <AccountGroupCheckboxGrid
           v-model="form.groupIds"
           :groups="groups"
+          :unavailable-group-ids="unavailableGroupIds"
           :loading="groupLoading"
           :disabled="saving"
         />

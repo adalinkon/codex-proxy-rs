@@ -8,10 +8,12 @@ withDefaults(
     groups: AccountGroupRef[]
     loading?: boolean
     disabled?: boolean
+    unavailableGroupIds?: string[]
   }>(),
   {
     loading: false,
     disabled: false,
+    unavailableGroupIds: () => [],
   },
 )
 
@@ -39,11 +41,12 @@ function updateGroup(groupId: string, selected: boolean) {
           :model-value="selectedGroupIds.includes(group.id)"
           :label="group.name"
           show-label
-          :disabled="disabled || loading"
+          :disabled="disabled || loading || (unavailableGroupIds.includes(group.id) && !selectedGroupIds.includes(group.id))"
           @update:model-value="updateGroup(group.id, $event)"
         />
       </span>
-      <span v-if="!group.enabled" class="shrink-0 text-cp-xs font-emphasis text-cp-text-quaternary"> 已禁用 </span>
+      <span v-if="unavailableGroupIds.includes(group.id)" class="shrink-0 text-cp-xs font-emphasis text-cp-warning-text">已失去授权，仅可移除</span>
+      <span v-else-if="!group.enabled" class="shrink-0 text-cp-xs font-emphasis text-cp-text-quaternary"> 已禁用 </span>
     </div>
   </div>
   <p v-else class="m-0 rounded-cp bg-cp-fill-quaternary px-3.5 py-3 text-cp-sm font-emphasis text-cp-text-secondary">
