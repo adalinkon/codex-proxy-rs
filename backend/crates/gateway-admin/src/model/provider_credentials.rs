@@ -757,6 +757,24 @@ pub(crate) fn explicit_plan_type(value: Option<&str>) -> Option<&str> {
     })
 }
 
+/// 按需查询的订阅周期，不参与额度或账号可用性判断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSubscription {
+    pub starts_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+    pub will_renew: Option<bool>,
+    pub billing_period: Option<String>,
+    pub billing_currency: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// 按需汇聚的个人信息；资料查询失败不丢弃可用的订阅结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountPersonalInfo {
+    pub profile: Result<ProviderProfileStatistics, AdminError>,
+    pub subscription: Option<ProviderSubscription>,
+}
+
 /// Provider 官方个人资料中的累计摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfileStatisticsSummary {

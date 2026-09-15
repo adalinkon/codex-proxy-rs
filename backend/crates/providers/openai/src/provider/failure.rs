@@ -1,14 +1,13 @@
 //! OpenAI 上游失败分类、恢复决策与稳定错误投影。
 
 use super::*;
+use crate::transport::diagnostics::is_capacity_error;
 
 /// OpenAI 失败对 Smart 账号分数的结构化 reason 闭集。
 ///
 /// 已归一的上游 code 优先；code 缺失时才读取结构化客户端错误的 code/type。
 /// 新增错误、裸 HTTP 状态和内部错误 kind 默认都不会进入该闭集。
 const OPENAI_ACCOUNT_SCORE_FAILURE_REASONS: &[&str] = &[
-    "server_is_overloaded",
-    "slow_down",
     "rate_limit_exceeded",
     "rate_limit_error",
     "server_error",
@@ -33,6 +32,17 @@ fn openai_account_score_failure_reason(error: &ProviderError) -> Option<&str> {
 /// 返回该 OpenAI 失败是否属于 Smart 账号计分闭集。
 #[doc(hidden)]
 pub fn openai_failure_affects_account_score(error: &ProviderError) -> bool {
+    let client_error = error.client_visible_upstream_error();
+    if is_capacity_error(
+        error
+            .upstream_code()
+            .map(OpaqueUpstreamValue::as_str)
+            .or_else(|| client_error.and_then(ClientVisibleUpstreamError::code)),
+        client_error.and_then(ClientVisibleUpstreamError::error_type),
+        client_error.map(ClientVisibleUpstreamError::message),
+    ) {
+        return false;
+    }
     openai_account_score_failure_reason(error).is_some_and(is_openai_account_score_failure_reason)
 }
 
@@ -506,6 +516,30 @@ pub(super) fn apply_websocket_recovery_policy(
     failure: &mut MappedProviderFailure,
     context: WebSocketRecoveryContext<'_>,
 ) {
+    // 明确账号拒绝走已有换号路径，容量拒绝走请求内退避；两者都不消耗 WS 传输预算。
+    if failure.error.replay_is_safe()
+        && (failure.account_failure.is_some()
+            || matches!(
+                failure.error.pre_delivery_retry(),
+                Some(gateway_core::error::PreDeliveryRetry::SameAccountTransientRetry { .. })
+            ))
+    {
+        tracing::warn!(
+            request_id = context.request_id,
+            attempt_index = context.attempt_index,
+            account_id = context.account_id,
+            websocket_failure_kind = failure.error.kind().as_str(),
+            websocket_failure_code = failure
+                .error
+                .upstream_code()
+                .map_or("", OpaqueUpstreamValue::as_str),
+            upstream_status_code = failure.error.upstream_status().unwrap_or_default(),
+            upstream_status_code_present = failure.error.upstream_status().is_some(),
+            transport_requirement = context.requirement.as_str(),
+            "OpenAI upstream WebSocket returned a business rejection; deferring to request retry"
+        );
+        return;
+    }
     let session_budget_exhausted = context.session_affinity_key.is_some_and(|key| {
         context
             .session_transport_recovery
@@ -1134,6 +1168,7 @@ pub(super) fn map_upstream_failure(
     replay_boundary: ReplayBoundary,
 ) -> MappedProviderFailure {
     let category = failure.category();
+    let capacity_unavailable = category == CodexFailureCategory::CapacityUnavailable;
     let cyber_policy_failure = failure
         .status
         .is_some_and(|status| status.is_client_error())
@@ -1192,6 +1227,17 @@ pub(super) fn map_upstream_failure(
     }
     if let Some(retry_after) = failure.retry_after_seconds.map(Duration::from_secs) {
         error = error.with_retry_after(retry_after);
+    }
+    if capacity_unavailable && error.replay_is_safe() {
+        let max_delay = Duration::from_secs(8);
+        error = error.with_transient_retry(
+            NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN),
+            failure
+                .retry_after_seconds
+                .map_or(Duration::from_millis(500), Duration::from_secs)
+                .min(max_delay),
+            max_delay,
+        );
     }
     if let Some(code) = failure.persistable_code() {
         error = error.with_upstream_code(OpaqueUpstreamValue::new(code.to_owned()));
@@ -1260,6 +1306,7 @@ pub(super) const fn provider_error_kind(category: CodexFailureCategory) -> Provi
         CodexFailureCategory::CloudflareChallenge
         | CodexFailureCategory::CloudflarePathBlocked
         | CodexFailureCategory::Unavailable => ProviderErrorKind::Unavailable,
+        CodexFailureCategory::CapacityUnavailable => ProviderErrorKind::UpstreamCapacityUnavailable,
         CodexFailureCategory::InvalidRequest => ProviderErrorKind::InvalidRequest,
         CodexFailureCategory::PermissionDenied => ProviderErrorKind::PermissionDenied,
         CodexFailureCategory::Timeout => ProviderErrorKind::Timeout,
@@ -1311,6 +1358,7 @@ pub(super) fn account_failure(
         | CodexFailureCategory::InvalidRequest
         | CodexFailureCategory::PermissionDenied
         | CodexFailureCategory::Timeout
+        | CodexFailureCategory::CapacityUnavailable
         | CodexFailureCategory::Unavailable
         | CodexFailureCategory::Transport => None,
     }

@@ -88,56 +88,50 @@ export function getApiKeys(data: ApiKeyListParams, options: RequestOptions = {},
   })
 }
 
-export function createApiKey(data: ApiKeyCreateParam, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
+export function createApiKey(data: ApiKeyCreateParam, scope: 'admin' | 'user' = 'admin') {
   return request<ApiKeyCreateResponse>({
     url: `/api/${scope}/client-keys/create`,
     method: 'POST',
     data: scope === 'user' ? { name: data.name } : data,
-    ...options,
   })
 }
 
-export function updateApiKey(data: ApiKeyUpdateParam, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
+export function updateApiKey(data: ApiKeyUpdateParam, scope: 'admin' | 'user' = 'admin') {
   return request<ApiKeyMutationResponse>({
     url: `/api/${scope}/client-keys/update`,
     method: 'POST',
     data: scope === 'user' ? { id: data.id, name: data.name, label: data.label } : data,
-    ...options,
   })
 }
 
-export function revealApiKey(data: ApiKeyIdParam, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
+export function revealApiKey(data: ApiKeyIdParam, scope: 'admin' | 'user' = 'admin') {
   return request<ApiKeyRevealResponse>({
     url: `/api/${scope}/client-keys/reveal`,
     method: 'GET',
     params: data,
-    ...options,
   })
 }
 
-export function deleteApiKey(data: ApiKeyIdParam, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
+export function deleteApiKey(data: ApiKeyIdParam, scope: 'admin' | 'user' = 'admin') {
   return request<ApiKeyMutationResponse>({
     url: `/api/${scope}/client-keys/delete`,
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function disableApiKey(data: ApiKeyIdParam, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
+export function disableApiKey(data: ApiKeyIdParam, scope: 'admin' | 'user' = 'admin') {
   return request<ApiKeyMutationResponse>({
     url: `/api/${scope}/client-keys/disable`,
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function enableApiKey(data: ApiKeyIdParam, options: RequestOptions = {}, scope: 'admin' | 'user' = 'admin') {
+export function enableApiKey(data: ApiKeyIdParam, scope: 'admin' | 'user' = 'admin') {
   return request<ApiKeyMutationResponse>({
     url: `/api/${scope}/client-keys/enable`,
     method: 'POST',
     data,
-    ...options,
   })
 }

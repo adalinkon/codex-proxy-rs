@@ -60,44 +60,39 @@ export function getSettings(options: RequestOptions = {}) {
 
 type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt'>
 
-export function updateSettings(data: UpdateSettingsParam, options: RequestOptions = {}) {
+export function updateSettings(data: UpdateSettingsParam) {
   return request<RuntimeSettings>({
     url: '/api/admin/settings/update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function getAdminApiKeyStatus(options: RequestOptions = {}) {
+export function getAdminApiKeyStatus() {
   return request<AdminApiKeyStatus>({
     url: '/api/admin/settings/admin-api-key',
     method: 'GET',
-    ...options,
   })
 }
 
-export function regenerateAdminApiKey(options: RequestOptions = {}) {
+export function regenerateAdminApiKey() {
   return request<RegeneratedAdminApiKey>({
     url: '/api/admin/settings/admin-api-key/regenerate',
     method: 'POST',
-    ...options,
   })
 }
 
-export function deleteAdminApiKey(options: RequestOptions = {}) {
+export function deleteAdminApiKey() {
   return request<DeletedAdminApiKey>({
     url: '/api/admin/settings/admin-api-key/delete',
     method: 'POST',
-    ...options,
   })
 }
 
-export function getCodexDesktopWindowsDownloads(refresh = false, options: RequestOptions = {}) {
+export function getCodexDesktopWindowsDownloads(data: { refresh?: boolean } = {}) {
   return request<CodexDesktopWindowsDownloads>({
     url: '/api/admin/settings/client-downloads/codex-desktop/windows',
     method: 'GET',
-    params: refresh ? { refresh: true } : undefined,
-    ...options,
+    params: data,
   })
 }

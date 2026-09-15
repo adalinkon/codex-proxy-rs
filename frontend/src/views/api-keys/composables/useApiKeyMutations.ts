@@ -107,13 +107,13 @@ export function useApiKeyMutations(options: {
         }
         const current = editingKey.value
         if (current) {
-          await updateApiKey({ id: current.id, ...payload }, {}, options.scope)
+          await updateApiKey({ id: current.id, ...payload }, options.scope)
         }
         else {
           const result = await createApiKey({
             ...payload,
             customKey: form.value.customKey || undefined,
-          }, {}, options.scope)
+          }, options.scope)
           createdKey.value = result.plaintextKey
           createdKeyName.value = payload.name
         }
@@ -176,7 +176,7 @@ export function useApiKeyMutations(options: {
 
     await deletingKeyAction.run(
       async () => {
-        await deleteApiKey({ id: keyId }, {}, options.scope)
+        await deleteApiKey({ id: keyId }, options.scope)
         const remaining = new Set(options.selectedIds.value)
         remaining.delete(keyId)
         options.selectedIds.value = remaining
@@ -197,7 +197,7 @@ export function useApiKeyMutations(options: {
       async () => {
         const deleteCount = options.selectedIds.value.size
         for (const keyId of [...options.selectedIds.value]) {
-          await deleteApiKey({ id: keyId }, {}, options.scope)
+          await deleteApiKey({ id: keyId }, options.scope)
           const remaining = new Set(options.selectedIds.value)
           remaining.delete(keyId)
           options.selectedIds.value = remaining
@@ -214,7 +214,7 @@ export function useApiKeyMutations(options: {
     await updatingStatusKeys.run(key.id, async () => {
       try {
         const mutation = key.enabled ? disableApiKey : enableApiKey
-        await mutation({ id: key.id }, {}, options.scope)
+        await mutation({ id: key.id }, options.scope)
         await options.reload()
         toast.success(key.enabled ? '已禁用' : '已启用')
       }
@@ -230,7 +230,7 @@ export function useApiKeyMutations(options: {
 
   async function revealPlaintextKey(apiKey: ApiKeyRow) {
     try {
-      const result = await revealingKeys.run(apiKey.id, () => revealApiKey({ id: apiKey.id }, {}, options.scope))
+      const result = await revealingKeys.run(apiKey.id, () => revealApiKey({ id: apiKey.id }, options.scope))
       if (!result)
         return undefined
       if (!result.plaintextKey) {

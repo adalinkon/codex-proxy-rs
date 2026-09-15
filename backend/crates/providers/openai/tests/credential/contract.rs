@@ -161,6 +161,7 @@ fn selector_with_runtime(
         arch: "x86_64".to_owned(),
         terminal: "selector-contract".to_owned(),
         residency: None,
+        location: Default::default(),
         verified_at: chrono::Utc::now(),
     });
     let http = reqwest::Client::builder().build().expect("HTTP client");

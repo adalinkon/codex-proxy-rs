@@ -19,12 +19,11 @@ interface LoginParam {
   password: string
 }
 
-export function login(data: LoginParam, options: RequestOptions = {}) {
+export function login(data: LoginParam) {
   return request<LoginResponse>({
     url: '/api/admin/auth/login',
     method: 'POST',
     data,
-    ...options,
   })
 }
 

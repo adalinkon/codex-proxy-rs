@@ -96,71 +96,64 @@ export interface DownloadUrlResult {
   expiresInSeconds: number
 }
 
-export function getBackupSettings(options: RequestOptions = {}) {
+export function getBackupSettings() {
   return request<BackupSettingsView>({
     url: '/api/admin/settings/backups',
     method: 'GET',
-    ...options,
   })
 }
 
-export function updateBackupStorage(data: UpdateBackupStoragePayload, options: RequestOptions = {}) {
+export function updateBackupStorage(data: UpdateBackupStoragePayload) {
   return request<BackupSettingsView>({
     url: '/api/admin/settings/backups/storage/update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function testBackupStorage(options: RequestOptions = {}) {
+export function testBackupStorage() {
   return request<ConnectionTestResult>({
     url: '/api/admin/settings/backups/storage/test',
     method: 'POST',
-    ...options,
   })
 }
 
-export function updateBackupSchedule(data: UpdateBackupSchedulePayload, options: RequestOptions = {}) {
+export function updateBackupSchedule(data: UpdateBackupSchedulePayload) {
   return request<BackupSettingsView>({
     url: '/api/admin/settings/backups/schedule/update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function getBackupRecords(params: BackupRecordsParams, options: RequestOptions = {}) {
+export function getBackupRecords(data: BackupRecordsParams, options: RequestOptions = {}) {
   return request<BackupRecordPage>({
     url: '/api/admin/settings/backups/records',
     method: 'GET',
-    params,
+    params: data,
     ...options,
   })
 }
 
-export function createBackup(options: RequestOptions = {}) {
+export function createBackup() {
   return request<BackupRecord>({
     url: '/api/admin/settings/backups/create',
     method: 'POST',
-    ...options,
   })
 }
 
-export function getBackupDownloadUrl(backupId: string, options: RequestOptions = {}) {
+export function getBackupDownloadUrl(data: { backupId: string }) {
   return request<DownloadUrlResult>({
     url: '/api/admin/settings/backups/download-url',
     method: 'POST',
-    data: { backupId },
-    ...options,
+    data,
   })
 }
 
-export function deleteBackup(backupId: string, options: RequestOptions = {}) {
+export function deleteBackup(data: { backupId: string }) {
   return request<BackupRecord>({
     url: '/api/admin/settings/backups/delete',
     method: 'POST',
-    data: { backupId },
-    ...options,
+    data,
   })
 }

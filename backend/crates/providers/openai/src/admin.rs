@@ -24,7 +24,7 @@ use gateway_admin::model::provider_credentials::{
     ProviderProfileAvatar, ProviderProfileAvatarStreamError, ProviderProfileDailyUsage,
     ProviderProfileInvocation, ProviderProfileStatistics, ProviderProfileStatisticsSummary,
     ProviderQuota, ProviderQuotaRequest, ProviderQuotaWindow, ProviderQuotaWindowRole,
-    ProviderResetCredit, ProviderResetCreditResult, ProviderResetCredits,
+    ProviderResetCredit, ProviderResetCreditResult, ProviderResetCredits, ProviderSubscription,
     QuotaLocalUsageAttribution,
 };
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
@@ -511,6 +511,27 @@ impl ProviderAdmin for OpenAiAdminProvider {
             reset_at: DateTime::<Utc>::from_timestamp(observed.reset_at?, 0)?,
             plan_type: parsed.plan_type,
         })
+    }
+
+    async fn subscription(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderSubscription>, ProviderAdminError> {
+        self.account(account_id).await?;
+        self.profile_statistics
+            .subscription(account_id)
+            .await
+            .map(|subscription| {
+                subscription.map(|subscription| ProviderSubscription {
+                    starts_at: subscription.starts_at,
+                    expires_at: subscription.expires_at,
+                    will_renew: subscription.will_renew,
+                    billing_period: subscription.billing_period,
+                    billing_currency: subscription.billing_currency,
+                    observed_at: subscription.observed_at,
+                })
+            })
+            .map_err(map_profile_statistics_error)
     }
 
     async fn profile_statistics(

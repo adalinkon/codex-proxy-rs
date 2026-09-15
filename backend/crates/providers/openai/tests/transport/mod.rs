@@ -60,6 +60,7 @@ mod profile_contract;
 mod protocol;
 mod request;
 mod reset_credits;
+mod subscription;
 mod tls;
 mod usage;
 mod websocket;
@@ -130,6 +131,7 @@ fn test_wire_profile() -> CodexWireProfileState {
         arch: "x86_64".to_owned(),
         terminal: "transport-test".to_owned(),
         residency: None,
+        location: Default::default(),
         verified_at: Utc::now(),
     })
 }

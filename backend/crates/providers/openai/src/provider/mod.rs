@@ -72,7 +72,7 @@ use crate::transport::diagnostics::{
     CodexFailureCategory, CodexUpstreamFailure, CodexUpstreamSendPhase,
 };
 use crate::transport::profile::{
-    APPCAST_POLL_INTERVAL, CodexDesktopReleaseService, CodexWireProfileState,
+    APPCAST_POLL_INTERVAL, CodexDesktopReleaseService, CodexRequestLocation, CodexWireProfileState,
 };
 use crate::transport::protocol::responses::{
     CodexResponsesRequest, PREVIOUS_RESPONSE_NOT_FOUND_CODE, PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
@@ -141,6 +141,7 @@ pub struct CodexProvider {
     quota: Arc<CodexCredentialQuotaService>,
     account_feedback: Arc<AccountFeedbackStats>,
     client: CodexBackendClient,
+    location: Option<CodexRequestLocation>,
     responses_url: Url,
     image_generations_url: Url,
     image_edits_url: Url,
@@ -173,6 +174,7 @@ impl CodexProvider {
             .map_err(|_| CodexProviderConfigError::InvalidBaseUrl)?;
         let search_url = Url::parse(&endpoint_url(&base_url, CODEX_ALPHA_SEARCH_PATH))
             .map_err(|_| CodexProviderConfigError::InvalidBaseUrl)?;
+        let location = profile.snapshot().location;
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
@@ -181,6 +183,7 @@ impl CodexProvider {
             quota,
             account_feedback,
             client,
+            location,
             responses_url,
             image_generations_url,
             image_edits_url,
@@ -253,7 +256,8 @@ impl Provider for CodexProvider {
                 ..Default::default()
             };
         };
-        let Ok(encoded) = encode_generate_request(request, "observability") else {
+        let Ok(encoded) = encode_generate_request(request, "observability", self.location.as_ref())
+        else {
             return ProviderRequestObservation::default();
         };
         let semantics = encoded.semantics();
@@ -354,8 +358,9 @@ impl Provider for CodexProvider {
         };
         let previous_session = decode_openai_session_state(generate);
         let continuation_requested = generate.native_continuation_requested();
-        let mut upstream_request = encode_generate_request(generate, upstream_model.as_str())
-            .map_err(map_request_error)?;
+        let mut upstream_request =
+            encode_generate_request(generate, upstream_model.as_str(), self.location.as_ref())
+                .map_err(map_request_error)?;
         if let Some(conversation_id) = previous_session
             .as_ref()
             .and_then(|state| state.conversation_id.as_ref())

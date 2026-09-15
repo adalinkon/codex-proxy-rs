@@ -228,6 +228,14 @@ Responses wire 之间的协议转换层，转换只在 xAI Provider 内完成。
 上游结构化错误的 message/code/type 会透传给客户端，其中内嵌的账号指纹 UUID 已脱敏。模型映射是
 全局精确映射，未命中时模型名原样交给候选 Provider；分组只限定账号集合，不参与模型改名。
 
+OpenAI 明确返回 `server_is_overloaded`、`slow_down` 或模型容量不足错误时，代理在允许安全重放且
+尚未交付输出的前提下，先做最多 3 次同账号指数退避，再通过现有调度换号。默认间隔从 500ms 开始，
+上游 `Retry-After` 参与退避计算，单次等待不超过 8 秒；重试同时受请求总尝试次数和截止时间约束。
+容量不足不扣 Smart 账号健康分，不触发 Provider 全局熔断，也不作为账号额度耗尽写入冷却状态。
+最终交付的上游错误仍按上述透明边界保留原始状态码、错误码和正文。
+明确额度耗尽继续走现有账号隔离与安全换号流程，
+包括 WebSocket 握手返回的 429；不会因其长 `Retry-After` 而转入同账号传输恢复等待。
+
 ## 4. 管理员认证
 
 | 方法 | 路由 | 请求 | 说明 |
@@ -335,7 +343,7 @@ Responses wire 之间的协议转换层，转换只在 xAI Provider 内完成。
 | `GET` | `/api/admin/accounts/quota` | `accountId` | 读取当前额度，不强制访问上游 |
 | `GET` | `/api/admin/accounts/quota-forecast` | `accountId` | 按需读取周/月容量预测、源窗口剩余估算与采样依据，不刷新上游额度 |
 | `POST` | `/api/admin/accounts/quota/refresh` | `{ accountId }` | 访问 Provider 并刷新额度，同时同步额度所属状态 |
-| `GET` | `/api/admin/accounts/profile-statistics` | `accountId` | 实时查询 OpenAI/Codex 官方个人资料中的累计活动与使用洞察 |
+| `GET` | `/api/admin/accounts/personal-info` | `accountId` | 按需汇聚 OpenAI/Codex 官方个人资料、累计活动与订阅信息，不更新额度或 credential |
 | `GET` | `/api/admin/accounts/reset-credits` | `accountId` | 查询 OpenAI 上游主动额度重置卡，不读取本地库存 |
 | `POST` | `/api/admin/accounts/reset-credits` | `{ accountId, creditId?, redeemRequestId }` | 使用 UUIDv4 幂等键消费一张 OpenAI 上游重置卡 |
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
@@ -593,10 +601,26 @@ OpenAI 复用已有限流协议解析器匹配额度桶、槽位、时长和明�
 上游消耗和模型组合变化仍可能造成误差；等价 USD 费用不是官方订阅价格或固定额度承诺，
 30 天折算也不是自然月额度。记录覆盖率不等于预测准确率，不输出未经校准的置信区间。
 
-### OpenAI 官方个人资料统计
+### OpenAI 个人信息
 
-`GET /api/admin/accounts/profile-statistics?accountId=...` 仅支持 OpenAI/Codex OAuth 账号。每次查询直接
-访问官方个人资料端点，不读取本地 usage/billing 记录，也不缓存或估算统计结果。响应 `data` 包含：
+`GET /api/admin/accounts/personal-info?accountId=...` 需要管理员会话，当前由 OpenAI/Codex OAuth
+账号提供。后端并发读取资料统计与订阅，一次返回；每次请求均重新查询，不自动重试或
+刷新 credential，不读取本地 usage/billing 记录，也不缓存或估算统计结果。
+
+响应 `data` 包含：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `profile` | object 或 null | 官方个人资料、累计统计与活动洞察；查询失败为 null |
+| `profileError` | string 或 null | 资料查询失败时的安全错误提示；成功为 null |
+| `subscription` | object 或 null | 当前绑定账号的订阅周期；无可用周期或查询失败为 null |
+
+两部分的查询结果独立：资料失败时仍返回可用订阅，订阅失败时仍返回资料。账号不存在、查询参数不合法或
+无管理员会话时，仍返回标准错误；请求期间账号身份或 credential revision 改变时拒绝整份结果。
+
+#### 官方资料与累计统计
+
+`profile` 包含：
 
 - `displayName`、`username`、`imageUrl`：官方账号资料；
 - `summary`：累计文本 Token、单日峰值 Token、最长任务时长、当前连续天数和最长连续天数；
@@ -605,7 +629,27 @@ OpenAI 复用已有限流协议解析器匹配额度桶、槽位、时长和明�
   以及插件与 Skill 调用排行。
 
 官方未返回的字段保持 `null`，不使用本地数据补齐；`hasStatsError: true` 表示账号资料可用，但官方统计
-部分不可用。access token 已过期或官方返回 401 时，接口要求先刷新 credential 或重新授权。
+部分不可用。access token 已过期或官方返回 401 时，通过 `profileError` 提示先刷新 credential 或重新授权。
+
+#### 订阅信息
+
+后端使用当前凭据、绑定的上游账号 ID 和账号出站代理访问 `/backend-api/subscriptions?account_id=...`，
+不枚举其他账号，不返回上游订阅 ID 或原始响应。
+
+`subscription` 为 `null`（未获得可用订阅周期），或包含以下字段：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `startsAt` | RFC 3339 字符串或 null | 上游本期开始时间 |
+| `expiresAt` | RFC 3339 字符串 | 上游本期结束时间，不代表自动续费账号最终失效 |
+| `willRenew` | boolean 或 null | 自动续费状态；未知不推断为 false |
+| `billingPeriod` | string 或 null | 上游计费周期标识 |
+| `billingCurrency` | string 或 null | 上游计费币种 |
+| `observedAt` | RFC 3339 字符串 | 本次查询时间 |
+
+订阅不写入额度快照或数据库，不参与账号状态或调度；单次上游查询最多 5 秒、响应最多 64 KiB，不重试。
+上游失败或未提供有效周期时返回未知，不据此标记免费、过期或禁用；请求期间账号身份或 credential
+revision 变化时丢弃结果。
 
 ### OpenAI 主动额度重置卡
 
@@ -951,13 +995,16 @@ Dashboard 的 `accountUsage[]` 由后端提供 `usageWindow`、`metricLabel`、`
 和本地用量由 Provider/Admin 投影。前端不得从套餐缺失推断免费套餐，也不得从显示时舍入的百分比推断
 触顶。滚动窗口使用相应时间范围的本地用量，独立于 Dashboard 的今日统计范围。
 
-OpenAI 的 `serviceTier` 只接受上游响应生命周期事件确认的实际 `response.service_tier`；请求里的
-期望档位只保留在 request summary，不能冒充响应事实。计费展示把 `priority`/`fast` 映射为 `Fast`，
-`flex` 映射为 `Flex`，缺失或 `default` 映射为 `Default`；未知非空值原样展示。各模型、档位及长上下文
-区间使用明确登记的价格；缺少对应价格时不估算，不以固定倍数兜底。展示的倍率由所选档位与标准档位
-费用之比计算，托管工具调用费不随 Token 档位倍增。
-响应未报告实际档位时，本地费用估算回退到请求档位；该推测不写入响应 `serviceTier`，也不能确认
-上游最终采用了该档位，因此本地费用不能代替官方账单。
+OpenAI Responses 用量记录的 `serviceTier` 与本地费用估算统一采用 Provider 最终发给上游的请求
+`service_tier`，不使用响应档位覆盖或回退。例如发送 `priority`、响应回显 `default` 时，仍显示
+`Fast` 并按 Priority 价格估算。未发送档位时，`serviceTier` 保持缺失，展示与估算按标准档处理。
+计费展示把 `priority`/`fast` 映射为 `Fast`，`flex` 映射为 `Flex`，缺失或 `default`/`standard`
+映射为 `Standard`；其他非空值以首字母大写展示。各模型、档位及长上下文区间使用明确登记的价格；缺少对应
+价格时不估算（包括 `auto` 和未知档位），不以固定倍数兜底。展示的倍率由所选档位与标准档位费用之比
+计算，托管工具调用费不随 Token 档位倍增。
+Provider metadata 分别保留 `requestedServiceTier` 与 `upstreamServiceTier` 供诊断；发送给客户端的
+原始 `response.service_tier` 不变。用量中的 Fast 仅表示发送档位，不能证明上游实际加速，本地费用
+估算也不能代替官方账单。该口径仅作用于新记录，不回填历史档位或重算已存储费用。
 
 本地计价规则只保留尚在服务的型号；已过官方关闭日期的型号不再新增本地估价。清理计价规则不删除或
 重新计算已存储的历史费用；缺少当前计价规则时，历史总额仍保留，但无法再据此补充费用拆分。

@@ -171,6 +171,8 @@ Client Key 鉴权完成后，API adapter 从有界请求头识别 Codex Desktop/
 - Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、重试和 fallback 由 Core 决定。
 - `not_sent`、`sent`、`ambiguous` 是单调的上游发送边界；结果不明确时不能假定上游未收到请求。
 - downstream commit 是不可撤回的交付承诺。commit 后禁止换号、重试和 fallback。
+- Provider 可将明确容量拒绝标记为有界同账号退避，Core 在既有安全重放边界内执行，按账号维护请求内
+  预算，耗尽后复用普通换号路径。该退避消耗总路由预算，与 WS 传输恢复、OAuth 刷新及账号额度冷却分开。
 - 跨 Provider 只在账号范围和能力都允许，且请求尚未到达上游或已被证明可安全重放时发生。
 - 可恢复观测写入失败不能替换已经确定的客户端协议结果。
 
@@ -269,7 +271,8 @@ Vue 普通管理请求的错误提示由 `api/request.ts` 响应拦截器统一�
 规范化异常保留 `status`、`code`、`requestId` 与 `kind`。页面和 `useAsyncAction` 不重复弹出接口错误；
 查询可以保留失败状态与重试入口，本地校验、文件操作、SSE 诊断和成功响应中的业务结果仍归各自 owner。
 
-API 模块通过统一的 `RequestOptions` 传递 `signal`、`timeout` 和 `silent`。取消或已被新查询取代的请求
+API 模块按 `url`、`method`、`data`（POST）或 `params: data`（GET）排列请求配置；
+仅在实际调用方需要时提供 `RequestOptions`（`signal`、`timeout`、`silent`），并放在请求配置末尾。取消或已被新查询取代的请求
 不弹提示；后台轮询、重启探测等显式使用 `silent`，它只关闭提示，不吞异常，也不跳过会话失效处理。
 批量操作的部分成功汇总、不可逆操作的结果未知等必要业务处理先将对应请求静默，再由业务 owner 提供
 一次有上下文的反馈；不得为普通失败重新维护一套消息或业务码映射。
@@ -425,6 +428,12 @@ credential 与 quota 是两组独立事实：credential refresh 不等于 quota 
 - quota refresh、正常推理返回的 rate-limit headers 和后台健康任务汇入同一额度事实；套餐只用于展示与
   目录 cache 隔离，不创建套餐专属状态机。
 
+OpenAI 订阅周期属于按需个人信息，不是额度事实。Admin 账号用例通过现有 Provider 管理端口并发读取
+个人资料统计与订阅，汇聚为一次只读响应；Provider 继续拥有各自的认证、出站代理与上游协议处理。
+订阅不由 quota、导入或后台任务触发，不持久化。汇聚结果返回前核对账号身份与 credential revision，
+避免重新授权期间展示混合身份信息；单项失败不丢弃另一项可用结果。前端只在打开「个人信息」或手动
+刷新信息时请求，关闭后取消等待，不维护两套请求状态。
+
 主动额度重置是 OpenAI Provider 的不可逆上游操作：列表查询和消费都直接使用当前 Desktop 请求画像；
 卡片不写 PostgreSQL/Redis。消费请求携带调用方生成的 UUIDv4 幂等键，同一账号的消费在进程内串行；
 发送结果不明确时必须复用原键。确认成功后管理端再显式刷新卡片与 quota，不能直接改本地重置时间。
@@ -463,7 +472,9 @@ observation、调用 metadata；最终失败的关联头不与 opening 身份混
 `generate: false` 将连接与上下文准备归类为 `prewarm`，不信任客户端单独声明的同名 metadata。
 Store 的共享用量口径排除这些预热记录，账号用量与额度预测复用同一规则；原始请求审计、响应额度
 观测和费用事实仍保留，不将未知费用改写为零，也不影响 Client Key 结算账本。
-实际 `service_tier` 只接受上游响应事件确认，不能用请求期望值替代。
+OpenAI Responses 的统计档位与本地费用估算统一使用 Provider 最终发给上游的请求 `service_tier`，
+不由响应回显覆盖；未发送档位时保留缺失值，展示与估算按标准档处理。上游响应档位独立保留在
+Provider metadata 的 `upstreamServiceTier`，不改写客户端收到的响应，也不据此断言实际加速效果。
 
 Worker 由各 Bundle 贡献、由 Host 统一监督：
 

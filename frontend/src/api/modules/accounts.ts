@@ -242,6 +242,15 @@ export interface AccountProfileActivityInsights {
   invocations: AccountProfileInvocation[] | null
 }
 
+export interface AccountSubscription {
+  startsAt: string | null
+  expiresAt: string
+  willRenew: boolean | null
+  billingPeriod: string | null
+  billingCurrency: string | null
+  observedAt: string
+}
+
 export interface AccountProfileStatisticsResponse {
   displayName: string | null
   username: string | null
@@ -250,6 +259,12 @@ export interface AccountProfileStatisticsResponse {
   summary: AccountProfileStatisticsSummary
   dailyUsage: AccountProfileDailyUsage[] | null
   activityInsights: AccountProfileActivityInsights
+}
+
+export interface AccountPersonalInfoResponse {
+  profile: AccountProfileStatisticsResponse | null
+  profileError: string | null
+  subscription: AccountSubscription | null
 }
 
 export interface AccountResetCredit {
@@ -393,36 +408,33 @@ export function getAccounts(data: AccountListParams, options: RequestOptions = {
   })
 }
 
-export function exportAccounts(data: AccountExportParam, options: RequestOptions = {}) {
+export function exportAccounts(data: AccountExportParam) {
   return request<unknown>({
     url: '/api/admin/accounts/export',
     method: 'GET',
     params: data,
-    ...options,
   })
 }
 
-export function refreshAccount(data: AccountIdParam, options: RequestOptions = {}) {
+export function refreshAccount(data: AccountIdParam) {
   return request<AccountRefreshResponse>({
     url: '/api/admin/accounts/refresh',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function recoverAccount(data: AccountIdParam, options: RequestOptions = {}) {
+export function recoverAccount(data: AccountIdParam) {
   return request<AccountRefreshResponse>({
     url: '/api/admin/accounts/recover',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function getAccountProfileStatistics(data: AccountIdParam, options: RequestOptions = {}) {
-  return request<AccountProfileStatisticsResponse>({
-    url: '/api/admin/accounts/profile-statistics',
+export function getAccountPersonalInfo(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<AccountPersonalInfoResponse>({
+    url: '/api/admin/accounts/personal-info',
     method: 'GET',
     params: data,
     ...options,
@@ -507,21 +519,19 @@ export function importAccounts(data: AccountImportParam, options: RequestOptions
   })
 }
 
-export function updateAccount(data: AccountUpdateParam, options: RequestOptions = {}) {
+export function updateAccount(data: AccountUpdateParam) {
   return request<AccountUpdateResponse>({
     url: '/api/admin/accounts/update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function batchUpdateAccounts(data: AccountBatchUpdateParam, options: RequestOptions = {}) {
+export function batchUpdateAccounts(data: AccountBatchUpdateParam) {
   return request<AccountBatchUpdateResponse>({
     url: '/api/admin/accounts/batch-update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
@@ -534,20 +544,18 @@ export function deleteAccounts(data: AccountDeleteParams, options: RequestOption
   })
 }
 
-export function startAccountOAuth(data: AccountOAuthStartParam, options: RequestOptions = {}) {
+export function startAccountOAuth(data: AccountOAuthStartParam) {
   return request<AccountOAuthStartResponse>({
     url: '/api/admin/accounts/oauth/start',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function completeAccountOAuth(data: AccountOAuthCompleteParam, options: RequestOptions = {}) {
+export function completeAccountOAuth(data: AccountOAuthCompleteParam) {
   return request<AccountOAuthCompleteResponse>({
     url: '/api/admin/accounts/oauth/complete',
     method: 'POST',
     data,
-    ...options,
   })
 }

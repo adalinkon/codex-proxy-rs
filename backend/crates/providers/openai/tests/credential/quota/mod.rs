@@ -5,6 +5,7 @@ mod refresh_timing;
 mod scheduling;
 mod slots;
 mod snapshot;
+mod subscription;
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -37,6 +38,7 @@ fn wire_profile() -> CodexWireProfileState {
         arch: "x86_64".to_owned(),
         terminal: "quota-contract".to_owned(),
         residency: None,
+        location: Default::default(),
         verified_at: Utc
             .with_ymd_and_hms(2026, 7, 18, 0, 0, 0)
             .single()

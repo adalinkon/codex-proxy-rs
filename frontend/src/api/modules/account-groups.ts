@@ -88,39 +88,35 @@ export function getAccountGroups(data: AccountGroupListParams, options: RequestO
   })
 }
 
-export function createAccountGroup(data: AccountGroupCreateParam, options: RequestOptions = {}) {
+export function createAccountGroup(data: AccountGroupCreateParam) {
   return request<AccountGroupMutationResponse>({
     url: '/api/admin/account-groups/create',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function updateAccountGroup(data: AccountGroupUpdateParam, options: RequestOptions = {}) {
+export function updateAccountGroup(data: AccountGroupUpdateParam) {
   return request<AccountGroupMutationResponse>({
     url: '/api/admin/account-groups/update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function enableAccountGroup(data: AccountGroupIdParam, options: RequestOptions = {}) {
+export function enableAccountGroup(data: AccountGroupIdParam) {
   return request<AccountGroupMutationResponse>({
     url: '/api/admin/account-groups/enable',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
-export function disableAccountGroup(data: AccountGroupIdParam, options: RequestOptions = {}) {
+export function disableAccountGroup(data: AccountGroupIdParam) {
   return request<AccountGroupMutationResponse>({
     url: '/api/admin/account-groups/disable',
     method: 'POST',
     data,
-    ...options,
   })
 }
 

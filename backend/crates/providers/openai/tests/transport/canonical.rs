@@ -219,7 +219,7 @@ fn decoder_should_emit_calculated_cost_for_complete_known_model_usage() {
 }
 
 #[test]
-fn decoder_should_prefer_response_service_tier_over_requested_tier_for_billing() {
+fn decoder_should_bill_requested_service_tier_despite_default_response() {
     let body = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fast_cost\",\"model\":\"gpt-5.4\",\"service_tier\":\"default\"}}\n\n",
@@ -236,12 +236,12 @@ fn decoder_should_prefer_response_service_tier_over_requested_tier_for_billing()
     assert!(canonical_facts(&events).into_iter().any(|event| matches!(
         event,
         GatewayEvent::CalculatedCost(cost)
-            if cost.total().amount().scaled() == 3_437_500
+            if cost.total().amount().scaled() == 6_875_000
     )));
 }
 
 #[test]
-fn decoder_should_use_response_service_tier_when_request_omits_it() {
+fn decoder_should_bill_standard_when_request_omits_service_tier() {
     let body = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_response_tier_cost\",\"model\":\"gpt-5.4\",\"service_tier\":\"priority\"}}\n\n",
@@ -257,7 +257,7 @@ fn decoder_should_use_response_service_tier_when_request_omits_it() {
     assert!(canonical_facts(&events).into_iter().any(|event| matches!(
         event,
         GatewayEvent::CalculatedCost(cost)
-            if cost.total().amount().scaled() == 6_875_000
+            if cost.total().amount().scaled() == 3_437_500
     )));
 }
 
@@ -346,7 +346,7 @@ fn decoder_should_fail_closed_for_fixed_block_web_search_content() {
 }
 
 #[test]
-fn websocket_decoder_should_prefer_response_service_tier_over_requested_tier_for_billing() {
+fn websocket_decoder_should_bill_requested_service_tier_despite_default_response() {
     let created = websocket_event_to_sse_frame(
         r#"{"type":"response.created","response":{"id":"resp_ws_fast_cost","model":"gpt-5.4","service_tier":"default"}}"#,
     )
@@ -366,7 +366,7 @@ fn websocket_decoder_should_prefer_response_service_tier_over_requested_tier_for
     assert!(canonical_facts(&events).into_iter().any(|event| matches!(
         event,
         GatewayEvent::CalculatedCost(cost)
-            if cost.total().amount().scaled() == 3_437_500
+            if cost.total().amount().scaled() == 6_875_000
     )));
 }
 
@@ -720,6 +720,36 @@ fn decoder_should_classify_official_server_overloaded_failure() {
 }
 
 #[test]
+fn capacity_failure_preserves_original_wire_and_diagnostics() {
+    for path in ["error", "response.failed"] {
+        let data = if path == "error" {
+            r#"{"type":"error","error":{"code":"slow_down","message":"busy","extra":123456789012345678901234567890},"extension":true}"#
+        } else {
+            r#"{"type":"response.failed","response":{"id":"resp_capacity","error":{"code":"server_is_overloaded","message":"busy","extra":123456789012345678901234567890}},"extension":true}"#
+        };
+        let raw = format!("event: {path}\r\nid: upstream-id\r\nretry: 123\r\ndata: {data}\r\n\r\n");
+        let failure = CodexCanonicalDecoder::new("fallback")
+            .with_raw_sse_passthrough()
+            .push(raw.as_bytes())
+            .expect_err("capacity failure");
+        let wire = failure.events()[0].wire_event().expect("client wire");
+        let expected: serde_json::Value = serde_json::from_str(data).expect("original JSON");
+        assert_eq!(wire.data(), &expected);
+        assert_eq!(wire.sse_id(), Some("upstream-id"));
+        assert_eq!(wire.sse_retry(), Some(123));
+        assert_eq!(
+            wire.raw_sse_frame().map(AsRef::as_ref),
+            Some(raw.as_bytes())
+        );
+        let CodexCanonicalError::Upstream(upstream) = failure.error() else {
+            panic!("typed failure")
+        };
+        assert_eq!(upstream.raw_body(), data);
+        assert_ne!(upstream.upstream_code.as_deref(), Some("server_error"));
+    }
+}
+
+#[test]
 fn decoder_should_classify_official_cyber_policy_as_an_invalid_request() {
     assert_failed_event("cyber_policy", "policy-secret-marker");
 }
@@ -975,14 +1005,19 @@ fn pricing_response_cost(
 }
 
 #[test]
-fn billing_should_follow_actual_tier_and_only_fall_back_when_it_is_absent() {
+fn billing_should_follow_requested_tier_independently_of_response_tier() {
     for (requested, actual, expected) in [
-        (Some("fast"), Some("default"), Some(1_000_000_000)),
-        (Some("auto"), Some("fast"), Some(2_000_000_000)),
-        (Some("default"), Some("flex"), Some(500_000_000)),
+        (Some("priority"), Some("default"), Some(2_000_000_000)),
+        (Some("fast"), Some("default"), Some(2_000_000_000)),
+        (Some("auto"), Some("fast"), None),
+        (Some("default"), Some("flex"), Some(1_000_000_000)),
+        (Some("flex"), Some("priority"), Some(500_000_000)),
         (Some("fast"), None, Some(2_000_000_000)),
         (Some("auto"), None, None),
-        (Some("default"), Some("future"), None),
+        (Some("default"), Some("future"), Some(1_000_000_000)),
+        (Some("future"), Some("default"), None),
+        (None, Some("priority"), Some(1_000_000_000)),
+        (None, None, Some(1_000_000_000)),
     ] {
         assert_eq!(
             pricing_response_cost(requested, actual, json!([]), &[]),
@@ -1002,8 +1037,8 @@ fn billing_should_add_file_and_web_search_fees_without_tier_markup() {
     for (tier, expected) in [("default", 1_150_000_000), ("fast", 2_150_000_000)] {
         assert_eq!(
             pricing_response_cost(
-                None,
                 Some(tier),
+                Some("default"),
                 output.clone(),
                 &[json!({"type": "web_search"})]
             ),

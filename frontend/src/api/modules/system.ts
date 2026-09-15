@@ -59,21 +59,19 @@ interface SystemUpdateTarget {
   targetVersion?: string
 }
 
-export function getSystemUpdateDetail(data: SystemUpdateDetailQuery, options: RequestOptions = {}) {
+export function getSystemUpdateDetail(data: SystemUpdateDetailQuery) {
   return request<SystemUpdateDetail>({
     url: '/api/admin/system/update/detail',
     method: 'GET',
     params: data,
-    ...options,
   })
 }
 
-export function performSystemUpdate(data: SystemUpdateTarget, options: RequestOptions = {}) {
+export function performSystemUpdate(data: SystemUpdateTarget) {
   return request<SystemUpdateAccepted>({
     url: '/api/admin/system/update',
     method: 'POST',
     data,
-    ...options,
   })
 }
 
