@@ -214,13 +214,20 @@ async fn owned_creation_preserves_parameters_and_rejects_unassigned_groups() {
         return;
     };
     let users = PgUserRepository::new(db.pool.clone());
-    users.save(policy("alice", "10", "20"), Some("test-hash")).await.unwrap();
-    sqlx::raw_sql("insert into account_groups(id,name,color,created_at,updated_at)
+    users
+        .save(policy("alice", "10", "20"), Some("test-hash"))
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "insert into account_groups(id,name,color,created_at,updated_at)
         values('grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','A','#2563EBFF',now(),now()),
               ('grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','B','#2563EBFF',now(),now());
         insert into user_account_groups(user_id,account_group_id)
-        values('alice','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');")
-        .execute(&db.pool).await.unwrap();
+        values('alice','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let group = |id: &str| gateway_core::routing::AccountGroupId::new(id.to_owned()).unwrap();
     let keys = PgAdminClientKeyStore::new(db.pool.clone());
     let command = NewClientKey {
@@ -229,14 +236,19 @@ async fn owned_creation_preserves_parameters_and_rejects_unassigned_groups() {
         name: "Custom".to_owned(),
         label: Some("Personal".to_owned()),
         group_ids: vec![group("grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
-        limits: gateway_core::policy::RateLimits { max_concurrency: 2, requests_per_minute: 7 },
+        limits: gateway_core::policy::RateLimits {
+            max_concurrency: 2,
+            requests_per_minute: 7,
+        },
         budget: gateway_core::engine::budget::ClientBudgetLimits {
             daily_usd: "1.25".parse().unwrap(),
             weekly_usd: "5".parse().unwrap(),
         },
         plaintext: format!("sk_{}", "a".repeat(43)),
     };
-    keys.mutate_owned_key("alice", OwnedKeyMutation::Create(command.clone())).await.unwrap();
+    keys.mutate_owned_key("alice", OwnedKeyMutation::Create(command.clone()))
+        .await
+        .unwrap();
     let secret = keys.reveal_client_key(&command.id).await.unwrap().unwrap();
     assert_eq!(secret.record.user_id, "alice");
     assert_eq!(secret.record.label, command.label);
@@ -248,8 +260,17 @@ async fn owned_creation_preserves_parameters_and_rejects_unassigned_groups() {
     rejected.name = "Rejected".to_owned();
     rejected.plaintext = format!("sk_{}", "b".repeat(43));
     rejected.group_ids = vec![group("grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")];
-    assert!(keys.mutate_owned_key("alice", OwnedKeyMutation::Create(rejected.clone())).await.is_err());
-    assert!(keys.reveal_client_key(&rejected.id).await.unwrap().is_none());
+    assert!(
+        keys.mutate_owned_key("alice", OwnedKeyMutation::Create(rejected.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
+        keys.reveal_client_key(&rejected.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     db.close().await;
 }
 fn charge(user: &str, key: &str, id: &str, amount: &str) -> ClientBudgetCharge {
@@ -570,19 +591,27 @@ async fn migration_materializes_existing_groups_without_granting_future_groups()
     let Some(db) = TestDatabase::create_at("explicit_user_groups", 202609130003).await else {
         return;
     };
-    sqlx::raw_sql("insert into account_groups(id,name,color,enabled,created_at,updated_at)
+    sqlx::raw_sql(
+        "insert into account_groups(id,name,color,enabled,created_at,updated_at)
         values('grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','A','#2563EBFF',true,now(),now()),
               ('grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','B','#2563EBFF',false,now(),now());
         insert into admin_users(id,password_hash,role,all_groups,created_at,updated_at)
         values('limited','test-hash','user',false,now(),now());
         insert into user_account_groups(user_id,account_group_id)
         values('limited','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
-              ('test-owner','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');")
-        .execute(&db.pool).await.unwrap();
+              ('test-owner','grp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
     super::TEST_MIGRATOR.run(&db.pool).await.unwrap();
-    sqlx::query("insert into account_groups(id,name,color,created_at,updated_at)
-        values('grp_cccccccccccccccccccccccccccccccc','C','#2563EBFF',now(),now())")
-        .execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "insert into account_groups(id,name,color,created_at,updated_at)
+        values('grp_cccccccccccccccccccccccccccccccc','C','#2563EBFF',now(),now())",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let groups: Vec<(String, String)> = sqlx::query_as(
         "select user_id,account_group_id from user_account_groups order by user_id,account_group_id",
     )
