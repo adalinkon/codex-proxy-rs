@@ -1,15 +1,9 @@
 <script setup lang="ts">
 import type { OutboundProxyAccount, OutboundProxyRecord } from '@/api'
+import { BaseConfirmModal, BaseIconButton, BaseInput, BaseModal, BaseTable, BaseTablePagination, defineTableColumns } from '@codex-proxy/ui'
 import { Search, Unlink } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import AccountPlanBadge from '@/views/accounts/components/AccountPlanBadge.vue'
 import { stablePresetVisualToneClass } from '@/views/accounts/utils/visualTone'
@@ -125,7 +119,7 @@ watch([open, () => props.proxy?.id], () => {
   </BaseModal>
   <BaseConfirmModal v-model="showRemove" title="移除关联账号" confirm-text="移除" :loading="removing" @confirm="confirmRemove">
     <p class="m-0 break-words">
-      将“{{ pendingRemove?.name }}”从“{{ proxy?.name }}”移除后，该账号将改为直连。
+      将“{{ pendingRemove?.name }}”从“{{ proxy?.name }}”移除后，该账号将改为直连
     </p>
   </BaseConfirmModal>
 </template>

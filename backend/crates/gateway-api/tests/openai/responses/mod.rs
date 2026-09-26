@@ -19,7 +19,7 @@ use gateway_protocol::openai::sse::parse_sse_events;
 use serde_json::{Value, json};
 
 fn decode_request(body: &[u8]) -> Result<DecodedResponsesRequest, RequestDecodeError> {
-    decode_request_with_headers(body, &HeaderMap::new())
+    decode_request_with_headers(body, &HeaderMap::new(), 64 * 1024 * 1024)
 }
 
 fn decode_response_create(
@@ -205,8 +205,9 @@ fn decoder_should_preserve_connection_metadata_outside_the_openai_wire_body() {
         }
     });
 
-    let decoded = decode_request_with_headers(body.to_string().as_bytes(), &headers)
-        .expect("request should decode");
+    let decoded =
+        decode_request_with_headers(body.to_string().as_bytes(), &headers, 64 * 1024 * 1024)
+            .expect("request should decode");
 
     assert_eq!(Value::Object(openai_wire_body(&decoded).clone()), body);
     assert_eq!(
@@ -233,6 +234,14 @@ fn decoder_should_preserve_connection_metadata_outside_the_openai_wire_body() {
 #[test]
 fn decoder_should_preserve_ordinary_request_headers_as_opaque_multivalues() {
     let mut headers = HeaderMap::new();
+    for name in [
+        "chatgpt-organization-id",
+        "chatgpt-org-id",
+        "x-openai-organization",
+        "x-openai-project",
+    ] {
+        headers.insert(name, HeaderValue::from_static("unclassified-extension"));
+    }
     headers.append(
         "x-openai-future-mode",
         HeaderValue::from_static("future-ascii"),
@@ -309,9 +318,12 @@ fn decoder_should_preserve_ordinary_request_headers_as_opaque_multivalues() {
         HeaderValue::from_static("client-is-update"),
     );
 
-    let decoded =
-        decode_request_with_headers(br#"{"model":"smart-code","input":"hello"}"#, &headers)
-            .expect("opaque request headers should not affect body decoding");
+    let decoded = decode_request_with_headers(
+        br#"{"model":"smart-code","input":"hello"}"#,
+        &headers,
+        64 * 1024 * 1024,
+    )
+    .expect("opaque request headers should not affect body decoding");
     let entries = openai_protocol_context(&decoded)
         .get("opaque_request_headers")
         .and_then(Value::as_array)
@@ -338,6 +350,18 @@ fn decoder_should_preserve_ordinary_request_headers_as_opaque_multivalues() {
         values("openai-beta"),
         vec![b"future_responses=v2".to_vec(), b"future_tools=v3".to_vec()]
     );
+    for name in [
+        "chatgpt-organization-id",
+        "chatgpt-org-id",
+        "x-openai-organization",
+        "x-openai-project",
+    ] {
+        assert_eq!(values(name), vec![b"unclassified-extension".to_vec()]);
+    }
+    assert_eq!(
+        values("x-codex-installation-id"),
+        vec![b"client-installation".to_vec()]
+    );
     for preserved in [
         "accept",
         "content-type",
@@ -357,7 +381,6 @@ fn decoder_should_preserve_ordinary_request_headers_as_opaque_multivalues() {
         "cookie",
         "chatgpt-account-id",
         "chatgpt-project-id",
-        "x-codex-installation-id",
         // 上游指纹由运行时画像统一生成，客户端不得覆盖。
         "user-agent",
         "originator",
@@ -371,7 +394,7 @@ fn decoder_should_preserve_ordinary_request_headers_as_opaque_multivalues() {
 }
 
 #[test]
-fn decoder_should_exclude_downstream_transport_headers_from_opaque_context() {
+fn decoder_should_strip_http_transport_but_leave_source_headers_for_provider() {
     let mut headers = HeaderMap::new();
     for name in [
         "cf-visitor",
@@ -401,14 +424,132 @@ fn decoder_should_exclude_downstream_transport_headers_from_opaque_context() {
     headers.insert("content-encoding", HeaderValue::from_static("identity"));
     headers.insert("x-openai-future-mode", HeaderValue::from_static("keep"));
 
-    let decoded =
-        decode_request_with_headers(br#"{"model":"smart-code","input":"hello"}"#, &headers)
-            .expect("decode request behind a reverse proxy");
+    let decoded = decode_request_with_headers(
+        br#"{"model":"smart-code","input":"hello"}"#,
+        &headers,
+        64 * 1024 * 1024,
+    )
+    .expect("decode request behind a reverse proxy");
 
     assert_eq!(
         openai_protocol_context(&decoded).get("opaque_request_headers"),
-        Some(&json!([["x-openai-future-mode", STANDARD.encode(b"keep")]])),
+        Some(&Value::Array(
+            headers
+                .iter()
+                .filter(|(name, _)| !matches!(
+                    name.as_str(),
+                    "accept-encoding" | "content-encoding"
+                ))
+                .map(|(name, value)| json!([name.as_str(), STANDARD.encode(value.as_bytes())]))
+                .collect()
+        )),
     );
+}
+
+#[test]
+fn downstream_client_headers_should_remain_opaque_without_losing_session_semantics() {
+    for canonical in [None, Some("canonical-session")] {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "X-Stainless-Runtime",
+            "x-stainless-future-field",
+            "Origin",
+            "Referer",
+            "Sec-Ch-Ua",
+            "sec-ch-ua-platform",
+            "Sec-Fetch-Site",
+            "session_id",
+        ] {
+            headers.append(name, HeaderValue::from_static("alias-session"));
+            headers.append(name, HeaderValue::from_static("duplicate"));
+        }
+        if let Some(session) = canonical {
+            headers.insert("session-id", HeaderValue::from_static(session));
+        }
+        for name in [
+            "thread-id",
+            "x-client-request-id",
+            "traceparent",
+            "tracestate",
+        ] {
+            headers.insert(name, HeaderValue::from_static("keep"));
+        }
+        headers.append("x-future-business", HeaderValue::from_static("first"));
+        headers.append(
+            "x-future-business",
+            HeaderValue::from_bytes(b"\x80\xff").unwrap(),
+        );
+        let original_headers = headers.clone();
+        let body = json!({
+            "model": "smart-code", "input": "中文 pi 内容不能被请求头过滤改写",
+            "prompt_cache_key": "synthetic-cache",
+            "client_metadata": {"session_id": "body-session"}
+        });
+        let mut frame = body.clone();
+        frame["type"] = json!("response.create");
+        let opening = OpenAiRequestHeaders::from_headers(&headers);
+        for decoded in [
+            decode_request_with_headers(body.to_string().as_bytes(), &headers, 64 * 1024 * 1024)
+                .unwrap(),
+            decode_response_create_with_context(&frame.to_string(), &opening).unwrap(),
+            decode_response_create_with_context(&frame.to_string(), &opening).unwrap(),
+        ] {
+            assert_eq!(openai_wire_body(&decoded), body.as_object().unwrap());
+            let context = openai_protocol_context(&decoded);
+            assert_eq!(context["session_id"], canonical.unwrap_or("alias-session"));
+            let entries = context["opaque_request_headers"].as_array().unwrap();
+            for name in [
+                "x-stainless-runtime",
+                "x-stainless-future-field",
+                "origin",
+                "referer",
+                "sec-ch-ua",
+                "sec-ch-ua-platform",
+                "sec-fetch-site",
+                "session_id",
+            ] {
+                let values: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry[0] == name)
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    values,
+                    vec![
+                        json!([name, STANDARD.encode(b"alias-session")]),
+                        json!([name, STANDARD.encode(b"duplicate")]),
+                    ],
+                    "source header {name} belongs to the Provider"
+                );
+            }
+            for name in [
+                "thread-id",
+                "x-client-request-id",
+                "traceparent",
+                "tracestate",
+            ] {
+                assert!(
+                    entries
+                        .iter()
+                        .any(|entry| entry == &json!([name, STANDARD.encode(b"keep")]))
+                );
+            }
+            let future: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry[0] == "x-future-business")
+                .cloned()
+                .collect();
+            assert_eq!(
+                future,
+                vec![
+                    json!(["x-future-business", STANDARD.encode(b"first")]),
+                    json!(["x-future-business", STANDARD.encode(b"\x80\xff")]),
+                ]
+            );
+        }
+        // 解码不修改原始请求，CORS、鉴权和本地观测仍可读取原值。
+        assert_eq!(headers, original_headers);
+    }
 }
 
 #[test]
@@ -432,7 +573,7 @@ fn decoder_should_preserve_unknown_arbitrary_precision_numbers() {
     let number = "12345678901234567890123456789012345678901234567890";
     let body = format!(r#"{{"model":"smart-code","input":"hello","future_number":{number}}}"#);
 
-    let decoded = decode_request_with_headers(body.as_bytes(), &HeaderMap::new())
+    let decoded = decode_request_with_headers(body.as_bytes(), &HeaderMap::new(), 64 * 1024 * 1024)
         .expect("opaque numeric field should decode");
     let encoded = serde_json::to_string(openai_wire_body(&decoded)).expect("encode request body");
 
@@ -705,7 +846,7 @@ fn transparent_encoder_should_translate_error_wire_to_response_failed_for_websoc
     assert_eq!(payload["type"], "response.failed");
     assert_eq!(payload["response"]["id"], response_id);
     assert_eq!(payload["response"]["status"], "failed");
-    assert_eq!(payload["response"]["error"]["code"], "server_is_overloaded");
+    assert_eq!(payload["response"]["error"]["code"], "server_error");
 
     // 与 SSE 边界投影到同一份 data 负载，两条客户端通道行为一致。
     let mut sse_encoder = OpenAiResponsesEncoder::new();
@@ -777,6 +918,108 @@ fn transparent_encoder_should_follow_wire_when_canonical_identity_changes() {
             .expect("wire terminal remains authoritative"),
         json!({"id": "wire_resp_2"})
     );
+}
+
+#[test]
+fn capacity_failure_projection_preserves_wire_metadata_and_original_events() {
+    for code in ["server_is_overloaded", "slow_down"] {
+        for (event_type, explicit_type) in [
+            ("error", true),
+            ("error", false),
+            ("response.failed", true),
+            ("response.failed", false),
+        ] {
+            for status in [None, Some(400), Some(429), Some(503)] {
+                let error = json!({"code": code, "type": "service_unavailable_error", "message": "busy", "future": 42});
+                let mut original = if event_type == "error" {
+                    json!({"type": event_type, "error": error, "sequence_number": 3})
+                } else {
+                    json!({"type": event_type, "response": {"id": "resp_capacity", "status": "failed", "error": error}, "sequence_number": 3})
+                };
+                if let Some(status) = status {
+                    original["status_code"] = json!(status);
+                }
+                let raw = Bytes::from(format!(
+                    "id: capacity\r\nretry: 1700\r\nevent: {event_type}\r\ndata: {original}\r\n\r\n"
+                ));
+                let event = ProviderEvent::wire(
+                    ProtocolWireEvent::json_with_raw_sse_metadata(
+                        "openai",
+                        explicit_type.then(|| event_type.to_owned()),
+                        original.clone(),
+                        raw.clone(),
+                        Some("capacity".to_owned()),
+                        Some(1700),
+                    )
+                    .expect("wire"),
+                );
+                let mut sse = OpenAiResponsesEncoder::new();
+                let mut ws = OpenAiResponsesEncoder::new();
+                let created = openai_wire_event(
+                    Vec::new(),
+                    "response.created",
+                    json!({"type": "response.created", "response": {"id": "resp_capacity", "status": "in_progress"}}),
+                );
+                sse.push_sse(&created);
+                ws.push_websocket(&created);
+                let frames = sse.push_sse(&event);
+                let parsed =
+                    parse_sse_events(std::str::from_utf8(&frames[0]).expect("UTF-8")).expect("SSE");
+                let sse_data: Value = serde_json::from_str(&parsed[0].data).expect("JSON");
+                assert_eq!(parsed[0].id.as_deref(), Some("capacity"));
+                assert_eq!(parsed[0].retry, Some(1700));
+                assert_eq!(parsed[0].event.as_deref(), Some("response.failed"));
+                assert_eq!(sse_data["response"]["error"]["code"], "server_error");
+                assert_eq!(sse_data["response"]["error"]["message"], "busy");
+                assert_eq!(sse_data["response"]["error"]["future"], 42);
+                let messages = ws.push_websocket(&event);
+                let ws_data: Value = serde_json::from_str(&messages[0]).expect("JSON");
+                if event_type == "error" && status.is_some() {
+                    let mut expected = original.clone();
+                    expected["error"]["code"] = json!("server_error");
+                    expected["status_code"] = json!(503);
+                    assert_eq!(ws_data, expected);
+                } else {
+                    assert_eq!(ws_data, sse_data);
+                }
+                assert!(sse.has_wire_failure());
+                assert!(ws.has_wire_failure());
+                let wire = event.wire_event().expect("original wire");
+                assert_eq!(wire.data(), &original);
+                assert_eq!(wire.raw_sse_frame(), Some(&raw));
+            }
+        }
+    }
+}
+
+#[test]
+fn capacity_client_projection_does_not_touch_other_codes_or_non_failure_events() {
+    for (event_type, code) in [
+        ("response.failed", "rate_limit_exceeded"),
+        ("response.failed", "insufficient_quota"),
+        ("response.failed", "previous_response_not_found"),
+        ("response.future", "server_is_overloaded"),
+    ] {
+        let original =
+            json!({"type": event_type, "response": {"error": {"code": code, "message": "busy"}}});
+        let raw = Bytes::from(format!("event: {event_type}\r\ndata: {original}\r\n\r\n"));
+        let event = ProviderEvent::wire(
+            ProtocolWireEvent::json_with_raw_sse_metadata(
+                "openai",
+                Some(event_type.to_owned()),
+                original.clone(),
+                raw.clone(),
+                None,
+                None,
+            )
+            .expect("wire"),
+        );
+        assert_eq!(OpenAiResponsesEncoder::new().push_sse(&event), vec![raw]);
+        assert_eq!(
+            OpenAiResponsesEncoder::new().push_websocket(&event),
+            vec![original.to_string()]
+        );
+    }
 }
 
 #[test]

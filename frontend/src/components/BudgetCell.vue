@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { BudgetAmounts } from '@/api/modules/users'
+import { BasePopover } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BasePopover from '@/components/base/BasePopover.vue'
 import { useUiClock } from '@/composables/useUiClock'
 import { formatBudgetAmount as amount, formatBudgetResetCountdown } from '@/utils/budget'
 import { formatDateTime } from '@/utils/date'

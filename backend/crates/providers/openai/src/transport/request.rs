@@ -14,6 +14,8 @@ use serde::Serialize as _;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::transport::downstream::{is_non_codex_request_header, normalize_codex_request_body};
+use crate::transport::headers::is_managed_identity_header;
 use crate::transport::profile::CodexRequestLocation;
 use crate::transport::protocol::responses::{
     CodexResponsesRequest, X_CODEX_TURN_STATE_CLIENT_METADATA_KEY,
@@ -24,7 +26,6 @@ const TURN_ID_CLIENT_METADATA_KEY: &str = "turn_id";
 const THREAD_SPAWN_SUBAGENT_KIND: &str = "thread_spawn";
 const THREAD_SPAWN_CONVERSATION_PREFIX: &str = "thread-spawn:";
 const ENVIRONMENT_CONTEXT_CONTENT_KIND: &str = "environments.environment_context";
-const UNSUPPORTED_CODEX_RESPONSES_FIELDS: &[&str] = &["max_output_tokens", "temperature"];
 
 const CROSS_ACCOUNT_IDENTITY_KEYS: &[&str] = &[
     "authorization",
@@ -119,15 +120,13 @@ fn adapt_codex_responses_body(
     location: Option<&CodexRequestLocation>,
 ) {
     body.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
-    for field in UNSUPPORTED_CODEX_RESPONSES_FIELDS {
-        body.remove(*field);
-    }
+    normalize_codex_request_body(body);
     if let Some(location) = location {
         align_structured_location_fields(body, Utc::now(), location);
     }
 }
 
-fn align_structured_location_fields(
+pub(crate) fn align_structured_location_fields(
     body: &mut Map<String, Value>,
     now: DateTime<Utc>,
     location: &CodexRequestLocation,
@@ -454,8 +453,8 @@ fn normalize_conversation_anchor_text(text: &str) -> String {
 /// 把客户端正文收敛到当前 lease 的账号身份边界。
 ///
 /// 真实 account ID 由随后构造的 `CodexRequestContext` 注入请求头；installation ID
-/// 统一写入 Core client_metadata，并替换原有兼容字段，绝不接受客户端
-/// 提供的 token、cookie 或账号身份。`input` 是 Responses 的可回放会话正文，
+/// 统一写入 Core 的 `client_metadata["x-codex-installation-id"]`，并替换原有兼容字段。
+/// 绝不接受客户端提供的 token、cookie 或账号身份。`input` 是 Responses 的可回放会话正文，
 /// item ID、encrypted content 和 compaction 都必须原样保留。
 pub(crate) fn scope_request_to_account(
     request: &mut CodexResponsesRequest,
@@ -489,6 +488,17 @@ pub(crate) fn scope_request_to_account(
             .chain(ACCOUNT_BOUND_STATE_KEYS)
         {
             request.body_mut().remove(*key);
+        }
+    } else {
+        // 同账号的透传 turn metadata 也会覆盖重建的请求头，安装身份须同步改写。
+        for (name, value) in &mut request.passthrough_headers {
+            if name == "x-codex-turn-metadata"
+                && let Ok(raw) = value.to_str()
+                && let Some(scoped) = scope_turn_metadata(raw, installation_id, false)
+                && let Ok(scoped) = HeaderValue::from_str(&scoped)
+            {
+                *value = scoped;
+            }
         }
     }
 
@@ -527,13 +537,15 @@ pub(crate) fn scope_request_to_account(
                     metadata.remove(*key);
                 }
             }
+            // 官方 Core 在 client_metadata 使用带 x-codex 前缀的键，
+            // turn metadata 内仍使用 installation_id；两处均取当前账号的安装身份。
             metadata.insert(
-                "installation_id".to_owned(),
+                "x-codex-installation-id".to_owned(),
                 Value::String(installation_id.to_owned()),
             );
             replace_existing_metadata_field(
                 &mut metadata,
-                "x-codex-installation-id",
+                "installation_id",
                 Some(installation_id),
             );
             replace_existing_metadata_field(&mut metadata, "installationId", Some(installation_id));
@@ -738,7 +750,10 @@ fn decode_passthrough_headers(context: &Map<String, Value>) -> HeaderMap {
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
-        if provider_managed_header(name.as_str()) {
+        if is_transport_managed_request_header(name.as_str())
+            || is_managed_identity_header(name.as_str())
+            || is_non_codex_request_header(name.as_str())
+        {
             continue;
         }
         let Some(encoded) = entry.get(1).and_then(Value::as_str) else {
@@ -753,29 +768,6 @@ fn decode_passthrough_headers(context: &Map<String, Value>) -> HeaderMap {
         headers.append(name, value);
     }
     headers
-}
-
-fn provider_managed_header(name: &str) -> bool {
-    is_transport_managed_request_header(name)
-        || name.starts_with("x-grok-")
-        || name.starts_with("x-xai-")
-        || matches!(
-            name,
-            "authorization"
-                | "x-api-key"
-                | "x-openai-actor-authorization"
-                | "cookie"
-                | "cookie2"
-                | "chatgpt-account-id"
-                | "chatgpt-organization-id"
-                | "chatgpt-org-id"
-                | "chatgpt-project-id"
-                | "openai-organization"
-                | "openai-project"
-                | "x-openai-organization"
-                | "x-openai-project"
-                | "x-codex-installation-id"
-        )
 }
 
 fn context_string(context: &Map<String, Value>, field: &str) -> Option<String> {

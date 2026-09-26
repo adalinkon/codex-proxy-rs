@@ -1,7 +1,33 @@
-use gateway_protocol::openai::is_transport_managed_request_header;
+use gateway_protocol::openai::{
+    is_transport_managed_request_header, response_header_is_forwardable,
+};
 
 #[test]
-fn transport_headers_should_include_proxy_namespaces_and_compression() {
+fn transport_headers_should_include_hop_fields_and_compression() {
+    for name in [
+        "accept-encoding",
+        "content-encoding",
+        "content-length",
+        "host",
+        "x-request-id",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-extensions",
+    ] {
+        assert!(is_transport_managed_request_header(name), "missing {name}");
+    }
+}
+
+#[test]
+fn transport_headers_should_leave_business_extensions_to_the_protocol_owner() {
     for name in [
         "cf-visitor",
         "cf-connecting-ip",
@@ -24,30 +50,6 @@ fn transport_headers_should_include_proxy_namespaces_and_compression() {
         "x-forwarded-future-field",
         "x-real-ip",
         "true-client-ip",
-        "x-request-id",
-        "accept-encoding",
-        "content-encoding",
-        "content-length",
-        "host",
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-extensions",
-    ] {
-        assert!(is_transport_managed_request_header(name), "missing {name}");
-    }
-}
-
-#[test]
-fn transport_headers_should_leave_business_extensions_to_the_protocol_owner() {
-    for name in [
         "x-openai-future-mode",
         "x-custom-extension",
         "x-client-request-id",
@@ -65,4 +67,28 @@ fn transport_headers_should_leave_business_extensions_to_the_protocol_owner() {
             "unexpected {name}"
         );
     }
+}
+
+#[test]
+fn response_headers_should_reject_hop_identity_and_dynamic_connection_fields() {
+    let connection_options = vec!["x-hop".to_owned()];
+    for name in [
+        "connection",
+        "x-hop",
+        "content-length",
+        "authorization",
+        "set-cookie",
+        "chatgpt-account-id",
+        "x-openai-project",
+        "sec-websocket-accept",
+    ] {
+        assert!(
+            !response_header_is_forwardable(name, &connection_options),
+            "unexpectedly exposed {name}"
+        );
+    }
+    assert!(response_header_is_forwardable(
+        "x-ratelimit-remaining-requests",
+        &connection_options
+    ));
 }

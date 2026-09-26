@@ -9,12 +9,12 @@ use std::time::{Duration, SystemTime};
 use futures::future::BoxFuture;
 
 use crate::account::{
-    AccountFeedbackStats, AccountRuntimeSignals, CredentialRevision, CredentialState,
-    OpaqueProviderData, ProviderAccountId, ProviderAccountStore,
+    AccountConcurrency, AccountFeedbackStats, AccountRuntimeSignals, CredentialRevision,
+    CredentialState, OpaqueProviderData, ProviderAccountId, ProviderAccountStore,
 };
 use crate::identity::ProviderKind;
 use crate::policy::ClientApiKeyId;
-use crate::routing::UpstreamModelId;
+use crate::routing::{ConfigRevision, UpstreamModelId};
 use crate::validation::{IdentifierError, validate_text};
 
 const MAX_PENDING_FLOW_TTL: Duration = Duration::from_secs(30 * 60);
@@ -83,18 +83,18 @@ pub struct ProviderSchedulingLeaseRequest {
     provider_kind: ProviderKind,
     account_id: ProviderAccountId,
     credential_revision: CredentialRevision,
-    max_concurrent: NonZeroU32,
+    max_concurrent: AccountConcurrency,
     request_interval: Duration,
     deadline: SystemTime,
 }
 
 impl ProviderSchedulingLeaseRequest {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         provider_kind: ProviderKind,
         account_id: ProviderAccountId,
         credential_revision: CredentialRevision,
-        max_concurrent: NonZeroU32,
+        max_concurrent: impl Into<AccountConcurrency>,
         request_interval: Duration,
         deadline: SystemTime,
     ) -> Self {
@@ -102,7 +102,7 @@ impl ProviderSchedulingLeaseRequest {
             provider_kind,
             account_id,
             credential_revision,
-            max_concurrent,
+            max_concurrent: max_concurrent.into(),
             request_interval,
             deadline,
         }
@@ -124,7 +124,7 @@ impl ProviderSchedulingLeaseRequest {
     }
 
     #[must_use]
-    pub const fn max_concurrent(&self) -> NonZeroU32 {
+    pub const fn max_concurrent(&self) -> AccountConcurrency {
         self.max_concurrent
     }
 
@@ -181,6 +181,16 @@ pub trait ProviderLeasePort: Send + Sync {
         &self,
         request: ProviderLeaseRequest,
     ) -> BoxFuture<'_, Result<ProviderLeaseAcquisition, ProviderStoreError>>;
+
+    /// 读取指定账号当前的在途请求数；只用于容量熔断的峰值证据，
+    /// 支持租约信号的存储实现覆盖，否则视为不可观测（空映射）。
+    fn account_in_flight<'a>(
+        &'a self,
+        account_ids: &'a [ProviderAccountId],
+    ) -> BoxFuture<'a, Result<BTreeMap<ProviderAccountId, u32>, ProviderStoreError>> {
+        let _ = account_ids;
+        Box::pin(async move { Ok(BTreeMap::new()) })
+    }
 }
 
 /// Provider 从原始会话锚点派生的不可逆亲和键。
@@ -437,10 +447,11 @@ pub trait ProviderCatalogCachePort: Send + Sync {
 /// Provider 从官方制品核验出的可重建请求画像。
 ///
 /// Core 只用单调制品序号约束覆盖顺序；具体版本字段由对应 Provider 放在
-/// `profile` 中解释。每个 Provider 在 Store 中只保留一份最新画像。
+/// `profile` 中解释。每个 Provider 的各制品分别保留一份最新画像。
 #[derive(Clone, PartialEq)]
 pub struct ProviderArtifactProfile {
     provider_kind: ProviderKind,
+    artifact_key: String,
     artifact_sequence: u64,
     verified_at: SystemTime,
     profile: OpaqueProviderData,
@@ -450,12 +461,14 @@ impl ProviderArtifactProfile {
     #[must_use]
     pub const fn new(
         provider_kind: ProviderKind,
+        artifact_key: String,
         artifact_sequence: u64,
         verified_at: SystemTime,
         profile: OpaqueProviderData,
     ) -> Self {
         Self {
             provider_kind,
+            artifact_key,
             artifact_sequence,
             verified_at,
             profile,
@@ -465,6 +478,11 @@ impl ProviderArtifactProfile {
     #[must_use]
     pub const fn provider_kind(&self) -> &ProviderKind {
         &self.provider_kind
+    }
+
+    #[must_use]
+    pub fn artifact_key(&self) -> &str {
+        &self.artifact_key
     }
 
     #[must_use]
@@ -496,7 +514,7 @@ impl fmt::Debug for ProviderArtifactProfile {
 }
 
 pub trait ProviderArtifactProfileCachePort: Send + Sync {
-    /// 覆盖同一 Provider 的固定 cache key。
+    /// 覆盖同一 Provider、同一制品的固定 cache key。
     ///
     /// 返回 `false` 表示 Store 已持有更高的制品序号；相同序号但内容不同必须返回
     /// [`ProviderStoreErrorKind::Conflict`]，不能静默改写已核验画像。
@@ -509,6 +527,7 @@ pub trait ProviderArtifactProfileCachePort: Send + Sync {
     fn read<'a>(
         &'a self,
         provider_kind: &'a ProviderKind,
+        artifact_key: &'a str,
     ) -> BoxFuture<'a, Result<Option<ProviderArtifactProfile>, ProviderStoreError>>;
 }
 
@@ -596,12 +615,16 @@ pub trait ProviderCredentialStatePort: Send + Sync {
     ) -> BoxFuture<'a, Result<(), ProviderStoreError>>;
 }
 
-/// 临时 cooldown 只保存可丢失的调度截止时间，不进入账号持久状态。
+/// 账号级 cooldown 的来源类别；调度状态统一按 `rate_limited` 处理。
+pub use crate::account::AccountCooldownKind as ProviderCooldownKind;
+
+/// 可丢失的账号冷却事实，不进入持久状态；探测冻结到期后仍需确认恢复。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCooldown {
     account_id: ProviderAccountId,
     credential_revision: CredentialRevision,
     until: SystemTime,
+    kind: ProviderCooldownKind,
 }
 
 impl ProviderCooldown {
@@ -611,10 +634,26 @@ impl ProviderCooldown {
         credential_revision: CredentialRevision,
         until: SystemTime,
     ) -> Self {
+        Self::new_with_kind(
+            account_id,
+            credential_revision,
+            until,
+            ProviderCooldownKind::RateLimit,
+        )
+    }
+
+    #[must_use]
+    pub const fn new_with_kind(
+        account_id: ProviderAccountId,
+        credential_revision: CredentialRevision,
+        until: SystemTime,
+        kind: ProviderCooldownKind,
+    ) -> Self {
         Self {
             account_id,
             credential_revision,
             until,
+            kind,
         }
     }
 
@@ -631,6 +670,19 @@ impl ProviderCooldown {
     #[must_use]
     pub const fn until(&self) -> SystemTime {
         self.until
+    }
+
+    #[must_use]
+    pub const fn scheduling_state(&self) -> crate::account::AccountCooldown {
+        crate::account::AccountCooldown {
+            until: self.until,
+            kind: self.kind,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProviderCooldownKind {
+        self.kind
     }
 }
 
@@ -749,6 +801,29 @@ pub trait ProviderCooldownPort: Send + Sync {
         &'a self,
         account_id: &'a ProviderAccountId,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>>;
+
+    /// 记录一次容量类失败并返回滑动窗口内的累计次数，同时把观测到的账号
+    /// 在途并发并入窗口峰值（`in_flight` 为 0 表示本次未观测，跳过峰值更新）。
+    /// 只服务容量熔断触发器；调用频率受失败频率约束，不需要批量接口。
+    fn record_capacity_failure<'a>(
+        &'a self,
+        account_id: &'a ProviderAccountId,
+        window: Duration,
+        in_flight: u32,
+    ) -> BoxFuture<'a, Result<u32, ProviderStoreError>>;
+
+    /// 普通请求成功后原子清除临时限流及失败证据；必须保留任何容量冻结。
+    fn clear_after_success<'a>(
+        &'a self,
+        account_id: &'a ProviderAccountId,
+        through_revision: CredentialRevision,
+    ) -> BoxFuture<'a, Result<(), ProviderStoreError>>;
+
+    /// 读取窗口内观测到的在途并发峰值；无证据时返回 `None`。
+    fn capacity_peak_in_flight<'a>(
+        &'a self,
+        account_id: &'a ProviderAccountId,
+    ) -> BoxFuture<'a, Result<Option<u32>, ProviderStoreError>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,9 +936,252 @@ fn invalid_refresh_policy(operation: &'static str) -> ProviderStoreError {
 }
 
 pub trait ProviderRuntimePolicyPort: Send + Sync {
+    /// 仅首次启动写入该 Provider 的默认选择；已保存的管理配置始终优先。
+    fn initialize_request_profile<'a>(
+        &'a self,
+        _provider: &'a ProviderKind,
+        initial: OpaqueProviderData,
+    ) -> BoxFuture<'a, Result<OpaqueProviderData, ProviderStoreError>> {
+        Box::pin(async move { Ok(initial) })
+    }
+
+    /// 读取候选配置版本实际引用的全局与 Client Key 画像配置。
+    ///
+    /// 实现必须在同一数据库快照内核对 revision，且只返回画像投影，不能读取 Key
+    /// 明文。Provider 代次据此在发布前拒绝已失效的选择。
+    fn load_request_profile_configurations<'a>(
+        &'a self,
+        _revision: ConfigRevision,
+        _provider: &'a ProviderKind,
+    ) -> BoxFuture<'a, Result<Vec<OpaqueProviderData>, ProviderStoreError>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
     fn load_refresh_policy(
         &self,
     ) -> BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>>;
+
+    /// 读取账号容量熔断策略；默认关闭，只有实现运行时设置的存储需要覆盖。
+    fn load_freeze_policy(
+        &self,
+    ) -> BoxFuture<'_, Result<ProviderFreezePolicy, ProviderStoreError>> {
+        Box::pin(async move { Ok(ProviderFreezePolicy::disabled()) })
+    }
+
+    /// 读取账号模型预激活策略；默认关闭，只有实现运行时设置的存储需要覆盖。
+    fn load_warmup_policy(
+        &self,
+    ) -> BoxFuture<'_, Result<ProviderWarmupPolicy, ProviderStoreError>> {
+        Box::pin(async move { Ok(ProviderWarmupPolicy::disabled()) })
+    }
+}
+
+/// 账号容量熔断（自动冻结）策略；来源于 `runtime_settings`，
+/// 由 Provider 触发路径与恢复 worker 共享同一份配置事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFreezePolicy {
+    enabled: bool,
+    threshold: u32,
+    window: Duration,
+    freeze_duration: Duration,
+    probe_enabled: bool,
+    probe_model: Option<String>,
+    adaptive_concurrency: bool,
+}
+
+impl ProviderFreezePolicy {
+    /// 边界与迁移 `0010_account_auto_freeze.sql` 的 check 约束一致；
+    /// store 层写入前已校验，这里兜底防御越界配置。
+    pub fn try_new(
+        enabled: bool,
+        threshold: u32,
+        window_seconds: u64,
+        freeze_duration_seconds: u64,
+        probe_enabled: bool,
+        probe_model: Option<String>,
+        adaptive_concurrency: bool,
+    ) -> Result<Self, ProviderStoreError> {
+        if !(2..=1_000).contains(&threshold)
+            || !(60..=3_600).contains(&window_seconds)
+            || !(300..=604_800).contains(&freeze_duration_seconds)
+            || probe_model.as_deref().is_some_and(|model| {
+                model.is_empty()
+                    || model.len() > 128
+                    || model != model.trim()
+                    || model.bytes().any(|byte| byte.is_ascii_control())
+            })
+        {
+            return Err(ProviderStoreError::new(
+                ProviderStoreErrorKind::InvalidData,
+                "validate freeze policy",
+            ));
+        }
+        Ok(Self {
+            enabled,
+            threshold,
+            window: Duration::from_secs(window_seconds),
+            freeze_duration: Duration::from_secs(freeze_duration_seconds),
+            probe_enabled,
+            probe_model,
+            adaptive_concurrency,
+        })
+    }
+
+    /// 功能关闭时的全零策略；触发路径与 worker 都以此短路。
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            threshold: 2,
+            window: Duration::from_secs(60),
+            freeze_duration: Duration::from_secs(300),
+            probe_enabled: false,
+            probe_model: None,
+            adaptive_concurrency: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// 窗口内触发冻结的请求级失败次数阈值。
+    #[must_use]
+    pub const fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// 失败计数滑动窗口；每次失败都会顺延窗口。
+    #[must_use]
+    pub const fn window(&self) -> Duration {
+        self.window
+    }
+
+    /// 冻结时长；探测失败后的顺延也使用该值。
+    #[must_use]
+    pub const fn freeze_duration(&self) -> Duration {
+        self.freeze_duration
+    }
+
+    #[must_use]
+    pub const fn probe_enabled(&self) -> bool {
+        self.probe_enabled
+    }
+
+    /// 探测模型；`None` 表示由 worker 选择账号可用的第一个模型。
+    #[must_use]
+    pub fn probe_model(&self) -> Option<&str> {
+        self.probe_model.as_deref()
+    }
+
+    #[must_use]
+    pub const fn adaptive_concurrency(&self) -> bool {
+        self.adaptive_concurrency
+    }
+}
+
+/// 校验每日预激活时间格式，如 "08:00" 或 "08:00,13:00"。
+#[must_use]
+pub fn valid_warmup_schedule_time(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 255
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    for part in value.split(',') {
+        let bytes = part.as_bytes();
+        if bytes.len() != 5 || bytes[2] != b':' {
+            return false;
+        }
+        let Ok(hour) = part[0..2].parse::<u32>() else {
+            return false;
+        };
+        let Ok(minute) = part[3..5].parse::<u32>() else {
+            return false;
+        };
+        if hour > 23 || minute > 59 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 账号模型预激活（预热）策略；来源于 `runtime_settings`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderWarmupPolicy {
+    enabled: bool,
+    schedule_time: String,
+    model: Option<String>,
+}
+
+impl ProviderWarmupPolicy {
+    pub fn try_new(
+        enabled: bool,
+        schedule_time: String,
+        model: Option<String>,
+    ) -> Result<Self, ProviderStoreError> {
+        if !valid_warmup_schedule_time(&schedule_time)
+            || (enabled && model.is_none())
+            || model.as_deref().is_some_and(|m| {
+                m.is_empty()
+                    || m.len() > 128
+                    || m != m.trim()
+                    || m.bytes().any(|byte| byte.is_ascii_control())
+            })
+        {
+            return Err(ProviderStoreError::new(
+                ProviderStoreErrorKind::InvalidData,
+                "validate warmup policy",
+            ));
+        }
+        Ok(Self {
+            enabled,
+            schedule_time,
+            model,
+        })
+    }
+
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            schedule_time: String::new(),
+            model: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn schedule_time(&self) -> &str {
+        &self.schedule_time
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// 解析每日时间列表，返回如 `vec![(8, 0)]`。
+    #[must_use]
+    pub fn scheduled_times(&self) -> Vec<(u32, u32)> {
+        self.schedule_time
+            .split(',')
+            .filter_map(|part| {
+                let part = part.trim();
+                let mut iter = part.split(':');
+                let hour = iter.next()?.parse::<u32>().ok()?;
+                let minute = iter.next()?.parse::<u32>().ok()?;
+                Some((hour, minute))
+            })
+            .collect()
+    }
 }
 
 /// OAuth pending flow 的原始绑定只在 Provider 与 Store 边界内短暂存在。

@@ -48,9 +48,8 @@ impl CodexCredentialRepository {
             .store
             .load_credential(account.id(), account.revision())
             .await?;
-        if current.account != *account {
-            return Err(CredentialRepositoryError::RevisionConflict);
-        }
+        // load_credential 已校验凭据版本；套餐与额度可在 RT exchange 期间更新，
+        // 这些运行时事实变化不能使已成功轮换的 token 丢失。
         let mut data = CodexCredentialCodec::decode_complete(&current.credential)?;
         let oauth = data
             .oauth_mut()
@@ -75,7 +74,13 @@ impl CodexCredentialRepository {
             next_refresh_at,
         )
         .map_err(|_| CredentialRepositoryError::InvalidCredentialData)?
-        .with_account_state(CredentialState::Ready, SystemTime::now(), None, None);
+        .preserving_profile()
+        .with_account_state(
+            oauth_account_state(account, CredentialState::Ready),
+            SystemTime::now(),
+            None,
+            None,
+        );
         cas_revision(self.store.compare_and_swap_credential(update).await?)
     }
 
@@ -91,9 +96,6 @@ impl CodexCredentialRepository {
             .store
             .load_credential(account.id(), account.revision())
             .await?;
-        if current.account != *account {
-            return Err(CredentialRepositoryError::RevisionConflict);
-        }
         let data = CodexCredentialCodec::decode_complete(&current.credential)?;
         let has_refresh_token = data.has_refresh_token();
         let credential = CodexCredentialCodec::encode_complete(data)?;
@@ -106,7 +108,8 @@ impl CodexCredentialRepository {
             account.access_token_expires_at(),
             Some(next_refresh_at),
         )
-        .map_err(|_| CredentialRepositoryError::InvalidCredentialData)?;
+        .map_err(|_| CredentialRepositoryError::InvalidCredentialData)?
+        .preserving_profile();
         if let Some(error_reason) = error_reason {
             update = update.with_account_state(
                 account.credential_state(),
@@ -144,6 +147,10 @@ impl CodexCredentialRepository {
         loaded: &LoadedCredential,
     ) -> Result<CodexRuntimeCredential, CredentialRepositoryError> {
         if loaded.account.provider().as_str() != PROVIDER_NAME {
+            return Err(CredentialRepositoryError::InvalidCredentialData);
+        }
+        let data = CodexCredentialCodec::decode_complete(&loaded.credential)?;
+        if data.authentication_kind() != loaded.account.authentication_kind() {
             return Err(CredentialRepositoryError::InvalidCredentialData);
         }
         CodexCredentialCodec::decode(&loaded.credential).map_err(Into::into)
@@ -198,7 +205,8 @@ impl CodexCredentialRepository {
             account.access_token_expires_at(),
             account.next_refresh_at(),
         )
-        .map_err(|_| CredentialRepositoryError::InvalidCredentialData)?;
+        .map_err(|_| CredentialRepositoryError::InvalidCredentialData)?
+        .preserving_profile();
         cas_revision(self.store.compare_and_swap_credential(update).await?)
     }
 
@@ -230,6 +238,7 @@ impl CodexCredentialRepository {
         if !account.enabled() {
             return Ok(());
         }
+        let credential_state = oauth_account_state(account, credential_state);
         let message = message.filter(|value| !value.trim().is_empty());
         let error_reason = if credential_state == CredentialState::Ready {
             message.as_ref().and(error_reason)
@@ -293,5 +302,16 @@ impl From<gateway_core::error::StoreError> for CredentialRepositoryError {
 impl From<CodexCredentialDataError> for CredentialRepositoryError {
     fn from(_: CodexCredentialDataError) -> Self {
         Self::InvalidCredentialData
+    }
+}
+
+/// OAuth 未取得用户身份时保留未验证状态；通用账号层不解释认证类型。
+fn oauth_account_state(account: &ProviderAccount, observed: CredentialState) -> CredentialState {
+    if account.authentication_kind() == super::CODEX_AUTHENTICATION_KIND_OAUTH
+        && account.upstream_user_id().is_none()
+    {
+        CredentialState::Unknown
+    } else {
+        observed
     }
 }

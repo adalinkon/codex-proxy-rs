@@ -9,7 +9,7 @@ use super::*;
 
 use crate::postgres::{
     PgProviderAccountRepository, ProviderAccountRepository, ProviderAccountSummary,
-    account_status_projection, load_rate_limited_until,
+    account_status_projection, load_cooldown,
 };
 
 use crate::redis::{CredentialLeaseRepository as _, RedisCredentialLeaseRepository};
@@ -49,19 +49,15 @@ impl PgObservabilityRepository {
             )
             .await?;
         let now = observed_at.into();
-        let rate_limited_until =
-            load_rate_limited_until(self.cooldowns.as_deref(), &accounts, now).await;
+        let cooldown = load_cooldown(self.cooldowns.as_deref(), &accounts, now).await;
         let mut metrics = ProviderAccountMetrics {
             total: u64::try_from(accounts.len()).unwrap_or(u64::MAX),
             ..ProviderAccountMetrics::default()
         };
         let mut normal_accounts = Vec::new();
         for account in &accounts {
-            let projection = account_status_projection(
-                account,
-                now,
-                rate_limited_until.get(&account.id).copied(),
-            );
+            let projection =
+                account_status_projection(account, now, cooldown.get(&account.id).copied());
             match projection.status {
                 gateway_core::account::AccountStatus::Normal => {
                     metrics.normal = metrics.normal.saturating_add(1);

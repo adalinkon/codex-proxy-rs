@@ -1,18 +1,23 @@
 <script setup lang="ts">
+import type { AccountAuthorizationView } from '../../composables/useAccountAuthorization'
 import type { AccountRow } from '../../constants'
 import type { AccountCreateForm, AccountImportMode } from './model'
 import type { AccountGroup } from '@/api'
 import { Openai, Xai } from '@boxicons/vue'
-import { LayoutGrid, Settings2 } from '@lucide/vue'
+import { BaseButton, BaseIconButton, BaseModal, BaseSegmented } from '@codex-proxy/ui'
+import { Copy, LayoutGrid, Settings2 } from '@lucide/vue'
 import { computed } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
+import { useCopyText } from '@/composables/useCopyText'
+import { accountModelAccessError } from '../../utils/modelAccess'
 import { parseAccountSchedulingForm } from '../../utils/schedulingForm'
+import AccountApiKeyFields from '../AccountApiKeyFields.vue'
+import AccountIdentityCell from '../AccountIdentityCell.vue'
+import AccountPlanBadge from '../AccountPlanBadge.vue'
 import AccountImportFields from './AccountImportFields.vue'
 import AccountOAuthFields from './AccountOAuthFields.vue'
 import AccountSetupFields from './AccountSetupFields.vue'
-import { accountProxyError } from './model'
+import { accountCreateProvider, accountProxyError } from './model'
 import { resolveAccountCreatePresentation } from './presenter'
 
 const props = withDefaults(defineProps<{
@@ -22,19 +27,31 @@ const props = withDefaults(defineProps<{
   oauthLoading?: boolean
   reauthorizing?: boolean
   account?: AccountRow | null
+  authorization: AccountAuthorizationView
 }>(), { saving: false, oauthLoading: false, reauthorizing: false, account: null })
 
 const emit = defineEmits<{ create: [], generateOauth: [] }>()
 const open = defineModel<boolean>({ default: false })
 const form = defineModel<AccountCreateForm>('form', { required: true })
+const callback = defineModel<string>('callback', { required: true })
+const copyWithToast = useCopyText()
+const accountCopyValue = computed(() =>
+  props.account?.email?.trim()
+  || props.account?.accountId?.trim()
+  || props.account?.id
+  || '',
+)
 const busy = computed(() => props.saving || props.oauthLoading)
+const canSelect = computed(() => form.value.source?.kind === 'bundle' || Boolean(accountCreateProvider(form.value)))
 const proxyError = computed(() => accountProxyError(form.value))
+const modelError = computed(() => accountModelAccessError(form.value.modelAccess))
 const scheduling = computed(() => parseAccountSchedulingForm(form.value.concurrencyLimit, form.value.weight))
 const view = computed(() => resolveAccountCreatePresentation({
   form: form.value,
-  account: props.account,
-  saving: props.saving,
-  oauthLoading: props.oauthLoading,
+  provider: accountCreateProvider(form.value),
+  authorization: props.authorization,
+  callback: callback.value,
+  busy: busy.value,
   reauthorizing: props.reauthorizing,
 }))
 const mode = computed({
@@ -45,15 +62,15 @@ const mode = computed({
   },
 })
 const importText = computed({
-  get: () => form.value.mode === 'oauth' ? '' : form.value.importTexts[form.value.mode],
+  get: () => form.value.mode === 'oauth' || form.value.mode === 'api_key' ? '' : form.value.importTexts[form.value.mode],
   set: (value: string) => {
-    if (form.value.mode !== 'oauth')
+    if (form.value.mode !== 'oauth' && form.value.mode !== 'api_key')
       form.value.importTexts[form.value.mode] = value
   },
 })
 
 function continueToImport() {
-  if (form.value.provider && scheduling.value.valid && !props.groupsLoading && !proxyError.value && !busy.value)
+  if (canSelect.value && !modelError.value && scheduling.value.valid && !props.groupsLoading && !proxyError.value && !busy.value)
     form.value.step = 'import'
 }
 </script>
@@ -70,11 +87,42 @@ function continueToImport() {
     <template #icon>
       <Settings2 v-if="view.configuring" class="text-cp-text" :size="20" aria-hidden="true" />
       <LayoutGrid v-else-if="view.isBatch" class="text-cp-text" :size="20" aria-hidden="true" />
-      <Xai v-else-if="view.isXai" class="text-cp-text" :width="20" :height="20" aria-hidden="true" />
-      <Openai v-else class="text-cp-text" :width="20" :height="20" aria-hidden="true" />
+      <Xai v-else-if="view.provider === 'xai'" class="text-cp-text" :width="20" :height="20" aria-hidden="true" />
+      <Openai v-else-if="view.provider === 'openai'" class="text-cp-text" :width="20" :height="20" aria-hidden="true" />
     </template>
 
     <div class="grid gap-4">
+      <div
+        v-if="reauthorizing && account"
+        class="flex flex-wrap items-center justify-between gap-4 rounded-cp bg-cp-fill-quaternary px-4 py-3.5"
+      >
+        <AccountIdentityCell
+          class="min-w-0 flex-1"
+          :account="account"
+          size="lg"
+        />
+        <div class="flex shrink-0 items-center gap-3">
+          <AccountPlanBadge
+            :plan-type="account.planType"
+            :plan-type-display="account.planTypeDisplay"
+            size="sm"
+          />
+          <ProviderIconGroup
+            :provider="account.provider"
+            :authentication-kind="account.authenticationKind"
+          />
+          <BaseIconButton
+            variant="secondary"
+            size="sm"
+            label="复制账号"
+            :disabled="busy || !accountCopyValue"
+            @click="copyWithToast(accountCopyValue, { successText: '账号已复制' })"
+          >
+            <Copy class="size-3.5" />
+          </BaseIconButton>
+        </div>
+      </div>
+
       <AccountSetupFields
         v-if="view.configuring"
         v-model="form"
@@ -97,16 +145,19 @@ function continueToImport() {
         />
         <AccountOAuthFields
           v-if="mode === 'oauth'"
-          v-model="form.oauthCallback"
-          :auth-url="view.oauth.authUrl"
-          :panel-title="`${view.isXai ? 'xAI' : 'OpenAI'} OAuth ${reauthorizing ? '重新授权' : '授权'}`"
-          :panel-description="view.isXai ? '生成并打开授权链接、完成浏览器授权、粘贴回调地址或授权码' : '生成并打开授权链接、完成浏览器授权、粘贴回调地址'"
+          v-model="callback"
+          :auth-url="authorization.flow?.authorizationUrl ?? ''"
+          :authorization="authorization"
+          :can-start="true"
+          :panel-title="`${view.label} ${reauthorizing ? '重新授权' : '授权'}`"
+          :panel-description="view.oauth.description"
           :loading="oauthLoading"
           :callback-label="view.oauth.callbackLabel"
           :callback-placeholder="view.oauth.callbackPlaceholder"
           :disabled="busy"
           @regenerate="emit('generateOauth')"
         />
+        <AccountApiKeyFields v-else-if="mode === 'api_key'" v-model="form.apiKey" :disabled="busy" />
         <AccountImportFields
           v-else
           :key="mode"
@@ -126,7 +177,7 @@ function continueToImport() {
       <BaseButton v-else class="mr-auto" variant="secondary" :disabled="busy" @click="form.step = 'settings'">
         上一步
       </BaseButton>
-      <BaseButton v-if="view.configuring" variant="primary" :disabled="!form.provider || !scheduling.valid || groupsLoading || Boolean(proxyError) || busy" @click="continueToImport">
+      <BaseButton v-if="view.configuring" variant="primary" :disabled="!canSelect || !scheduling.valid || Boolean(modelError) || groupsLoading || Boolean(proxyError) || busy" @click="continueToImport">
         继续导入
       </BaseButton>
       <BaseButton v-else variant="primary" :loading="saving || oauthLoading" :disabled="!view.canSubmit" @click="emit('create')">

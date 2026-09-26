@@ -7,7 +7,7 @@ use serde_json::json;
 use super::decode_response_create;
 
 #[test]
-fn response_create_should_exclude_cloudflare_headers_on_every_frame() {
+fn response_create_should_carry_source_headers_to_provider_on_every_frame() {
     let mut headers = HeaderMap::new();
     for (name, value) in [
         ("CF-Visitor", r#"{"scheme":"https"}"#),
@@ -24,7 +24,7 @@ fn response_create_should_exclude_cloudflare_headers_on_every_frame() {
     headers.append("x-openai-future-mode", HeaderValue::from_static("second"));
     let request_headers = OpenAiRequestHeaders::from_headers(&headers);
 
-    // 连接级头会用于同一 WebSocket 的每一帧，后续帧也不能恢复下游链路元数据。
+    // 连接级头随每一帧传给 Provider，由相同的出站边界处理来源适配。
     for input in ["hello", "continue"] {
         let decoded = decode_response_create_with_context(
             &json!({"type": "response.create", "model": "smart-code", "input": input}).to_string(),
@@ -39,10 +39,12 @@ fn response_create_should_exclude_cloudflare_headers_on_every_frame() {
                 .protocol_payload()
                 .context()
                 .get("opaque_request_headers"),
-            Some(&json!([
-                ["x-openai-future-mode", STANDARD.encode(b"first")],
-                ["x-openai-future-mode", STANDARD.encode(b"second")],
-            ])),
+            Some(&serde_json::Value::Array(
+                headers
+                    .iter()
+                    .map(|(name, value)| json!([name.as_str(), STANDARD.encode(value.as_bytes())]))
+                    .collect()
+            )),
         );
         assert_eq!(request.protocol_payload().body()["input"], input);
     }

@@ -237,9 +237,43 @@ async fn dashboard_summary_should_project_rebuildable_runtime_slots() {
         .expect("dashboard summary")
         .capacity;
 
-    assert_eq!(capacity.total_slots, 7);
+    assert_eq!(capacity.total_slots, Some(7));
     assert_eq!(capacity.used_slots, Some(2));
     assert_eq!(capacity.available_slots, Some(5));
+}
+
+#[tokio::test]
+async fn dashboard_capacity_distinguishes_unlimited_inheritance_finite_overrides_and_empty_pool() {
+    for (inherited_accounts, overridden_slots, expected_total, expected_available) in [
+        (2, 5, None, None),
+        (0, 5, Some(5), Some(3)),
+        (0, 0, Some(0), Some(0)),
+    ] {
+        let now = Utc::now();
+        let store = Arc::new(FixtureObservabilityStore::new(observation_range(now)));
+        store.replace_runtime_slots(Some(DashboardRuntimeSlots {
+            inherited_accounts,
+            overridden_slots,
+            used_slots: Some(2),
+        }));
+        let services = super::AdminHarness::new()
+            .observability(store)
+            .settings(Arc::new(FixtureSettingsStore {
+                max_concurrent_per_account: 0,
+            }))
+            .provider(super::dashboard_profile_provider())
+            .build()
+            .await;
+        let capacity = services
+            .observability()
+            .dashboard_summary(observation_range(now), TrendKind::Usage)
+            .await
+            .expect("dashboard")
+            .capacity;
+        assert_eq!(capacity.total_slots, expected_total);
+        assert_eq!(capacity.available_slots, expected_available);
+        assert_eq!(capacity.used_slots, Some(2));
+    }
 }
 
 #[tokio::test]
@@ -372,6 +406,7 @@ async fn observability_services_should_calculate_usage_insights_and_diagnostic_s
         }],
     }]);
     store.replace_calculated_billing_facts(vec![UsageCalculatedBillingFact {
+        breakdown: None,
         bucket_start: quarter_hour_start(now),
         provider_kind: "openai".to_owned(),
         upstream_model_id: "gpt-5.5".to_owned(),
@@ -467,7 +502,31 @@ async fn observability_services_should_calculate_usage_insights_and_diagnostic_s
     );
     assert_eq!(diagnostics.items[0].request_share, 0.75);
     assert_eq!(diagnostics.items[1].request_share, 0.25);
-    assert!((diagnostics.items[0].impact_score - 0.075).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn diagnostics_should_preserve_request_order_when_a_small_sample_fails() {
+    let now = Utc::now();
+    let range = observation_range(now);
+    let store = Arc::new(FixtureObservabilityStore::new(range));
+    let success = diagnostic("popular", 100);
+    let mut failure = diagnostic("single_failure", 1);
+    failure.success_count = 0;
+    failure.failure_count = 1;
+    store.replace_diagnostics(vec![success, failure]);
+    let services = observability_services_with_calculated_billing(store).await;
+
+    let result = services
+        .observability()
+        .diagnostics(range, UsageFilter::default(), DiagnosticDimension::Model)
+        .await
+        .expect("diagnostics");
+
+    assert_eq!(result.items[0].key, "popular");
+    assert_eq!(result.items[1].key, "single_failure");
+    assert_eq!(result.items[0].error_count, 0);
+    assert_eq!(result.items[1].error_count, 1);
+    assert_eq!(result.items[1].error_rate, 1.0);
 }
 
 #[tokio::test]
@@ -543,6 +602,7 @@ async fn usage_insights_should_reject_partial_costs_when_billing_stream_fails() 
     let range = observation_range(now);
     let store = Arc::new(FixtureObservabilityStore::new(range));
     store.replace_calculated_billing_facts(vec![UsageCalculatedBillingFact {
+        breakdown: None,
         bucket_start: quarter_hour_start(now),
         provider_kind: "openai".to_owned(),
         upstream_model_id: "gpt-5.5".to_owned(),
@@ -747,18 +807,44 @@ impl ObservabilityStore for FixtureObservabilityStore {
     }
 }
 
-struct FixtureSettingsStore;
+struct FixtureSettingsStore {
+    max_concurrent_per_account: u32,
+}
 
 #[async_trait]
 impl SettingsStore for FixtureSettingsStore {
+    async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
+        Ok(Default::default())
+    }
+    async fn sync_pricing(
+        &self,
+        _: gateway_admin::model::pricing::PricingSyncChanges,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        panic!("unexpected pricing sync")
+    }
+    async fn update_pricing(
+        &self,
+        _: gateway_admin::model::pricing::UpdatePricing,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        panic!("unexpected pricing update")
+    }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
+            request_profiles: Default::default(),
+            request_location_enabled: false,
+            request_location: Default::default(),
             config_revision: Revision::new(1).expect("revision"),
             model_mappings: Default::default(),
             refresh_margin_seconds: 300,
             refresh_concurrency: 2,
-            max_concurrent_per_account: 1,
+            max_concurrent_per_account: self.max_concurrent_per_account,
             request_interval_ms: 0,
+            max_waiting_per_key: 0,
+            max_waiting_per_account: 0,
+            concurrency_wait_timeout_seconds: 30,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             rotation_strategy: RotationStrategy::Smart,
             min_codex_desktop_version: None,
             min_codex_cli_version: None,
@@ -766,6 +852,16 @@ impl SettingsStore for FixtureSettingsStore {
             ops_event_retention_days: 30,
             audit_retention_days: 30,
             updated_at: Utc::now(),
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
         })
     }
 
@@ -800,7 +896,9 @@ impl SettingsStore for FixtureSettingsStore {
 async fn observability_services(store: Arc<FixtureObservabilityStore>) -> AdminServices {
     super::AdminHarness::new()
         .observability(store)
-        .settings(Arc::new(FixtureSettingsStore))
+        .settings(Arc::new(FixtureSettingsStore {
+            max_concurrent_per_account: 1,
+        }))
         .provider(super::dashboard_profile_provider())
         .build()
         .await
@@ -811,7 +909,9 @@ async fn observability_services_with_calculated_billing(
 ) -> AdminServices {
     super::AdminHarness::new()
         .observability(store)
-        .settings(Arc::new(FixtureSettingsStore))
+        .settings(Arc::new(FixtureSettingsStore {
+            max_concurrent_per_account: 1,
+        }))
         .provider(super::calculated_billing_provider())
         .build()
         .await
@@ -837,6 +937,7 @@ fn total_record(
     now: DateTime<Utc>,
 ) -> UsageListRecord {
     UsageListRecord {
+        client_api_key_name: Some("Production".to_owned()),
         id: id.to_owned(),
         username: Some("test-owner".to_owned()),
         endpoint: "/v1/responses".to_owned(),
@@ -846,9 +947,11 @@ fn total_record(
         provider_account_ref: None,
         provider_account_name: None,
         provider_account_email: None,
+        provider_account_notes: None,
         provider_account_authentication_kind: None,
         upstream_model_id: Some("gpt-5.5".to_owned()),
         upstream_transport: None,
+        upstream_response_model: None,
         service_tier: None,
         input_tokens: Some(800),
         output_tokens: Some(200),

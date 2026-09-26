@@ -1,3 +1,5 @@
+mod location;
+mod model_access;
 mod proxy;
 mod selection;
 mod selection_diagnostics;
@@ -48,7 +50,7 @@ fn candidate(id: &str, in_flight: u32, remaining: Option<u64>) -> AccountCandida
             last_started_at: None,
             quota_reset_at: None,
             quota_remaining_rank: remaining,
-            rate_limited_until: None,
+            cooldown: None,
             failure_rate_basis_points: None,
             first_output_latency_ms: None,
         },
@@ -75,7 +77,7 @@ fn weighted_candidate(id: &str, weight: u16, in_flight: u32) -> AccountCandidate
 
 #[test]
 fn account_scheduling_should_default_and_resolve_concurrency_override() {
-    let default = NonZeroU32::new(12).expect("default concurrency");
+    let default = gateway_core::account::AccountConcurrency::new(12);
     let account = account("acct_scheduling_default");
     assert_eq!(account.concurrency_limit(), None);
     assert_eq!(account.weight(), AccountWeight::DEFAULT);
@@ -221,7 +223,7 @@ fn diagnostic_selection_bypasses_all_local_account_eligibility() {
             last_started_at: None,
             quota_reset_at: None,
             quota_remaining_rank: None,
-            rate_limited_until: None,
+            cooldown: None,
             failure_rate_basis_points: None,
             first_output_latency_ms: None,
         },
@@ -239,7 +241,7 @@ fn diagnostic_selection_bypasses_all_local_account_eligibility() {
             last_started_at: None,
             quota_reset_at: None,
             quota_remaining_rank: None,
-            rate_limited_until: None,
+            cooldown: None,
             failure_rate_basis_points: None,
             first_output_latency_ms: None,
         },
@@ -312,23 +314,23 @@ fn rate_limited_projection_carries_only_the_active_cooldown_deadline() {
     let active_until = now + Duration::from_secs(60);
     let account = account("acct_rate_limited");
 
-    let active = account.status_projection(now, Some(active_until));
+    let active = account.status_projection(now, Some(active_until.into()));
     assert_eq!(active.status, AccountStatus::RateLimited);
-    assert_eq!(active.rate_limited_until, Some(active_until));
+    assert_eq!(active.cooldown, Some(active_until.into()));
 
-    let elapsed = account.status_projection(now, Some(now - Duration::from_secs(1)));
+    let elapsed = account.status_projection(now, Some((now - Duration::from_secs(1)).into()));
     assert_eq!(elapsed.status, AccountStatus::Normal);
-    assert_eq!(elapsed.rate_limited_until, None);
+    assert_eq!(elapsed.cooldown, None);
 }
 
 #[test]
-fn account_without_upstream_identity_should_stay_unknown_and_not_schedulable() {
+fn account_without_upstream_identity_preserves_provider_credential_state() {
     let account = ProviderAccount::new(
         ProviderAccountId::new("acct_pending_identity").expect("valid account"),
         ProviderKind::new("openai").expect("valid provider"),
         "pending identity".to_owned(),
         None,
-        "oauth".to_owned(),
+        "api_key".to_owned(),
         CredentialRevision::new(1).expect("valid revision"),
         Some(SystemTime::now() + Duration::from_secs(3600)),
     )
@@ -345,7 +347,18 @@ fn account_without_upstream_identity_should_stay_unknown_and_not_schedulable() {
             account.credential_state(),
             account.status_projection(SystemTime::now(), None).status
         ),
-        (CredentialState::Unknown, AccountStatus::Error)
+        (CredentialState::Ready, AccountStatus::Normal)
+    );
+    let pending = account.with_account_facts(
+        true,
+        CredentialState::Unknown,
+        QuotaState::unknown(),
+        None,
+        None,
+    );
+    assert_eq!(
+        pending.status_projection(SystemTime::now(), None).status,
+        AccountStatus::Error
     );
 }
 
@@ -480,8 +493,8 @@ fn highest_priority_affinity_should_still_obey_existing_scheduling_constraints()
                 );
             }
             AccountSchedulingBlocker::LocalAvailability => {
-                candidates[0].signals.rate_limited_until =
-                    Some(selection.now + Duration::from_secs(60))
+                candidates[0].signals.cooldown =
+                    Some((selection.now + Duration::from_secs(60)).into())
             }
             _ => unreachable!("test cases"),
         }
@@ -631,7 +644,7 @@ fn provider_quota_overlay_should_preserve_store_concurrency_facts() {
         last_started_at: Some(last_started_at),
         quota_reset_at: None,
         quota_remaining_rank: None,
-        rate_limited_until: None,
+        cooldown: None,
         failure_rate_basis_points: None,
         first_output_latency_ms: None,
     }
@@ -1049,4 +1062,33 @@ fn elapsed_quota_reset_does_not_fabricate_recovery() {
         .select(&candidates, &context(RotationStrategy::Smart))
         .expect("healthy candidate available");
     assert_eq!(selected.candidate().account.id().as_str(), "acct_healthy");
+}
+
+#[test]
+fn due_probe_freeze_blocks_scheduling_and_remains_visible_as_rate_limited() {
+    use gateway_core::account::{AccountCooldown, AccountCooldownKind};
+    let mut candidates = [
+        weighted_candidate("acct_frozen", 100, 0),
+        weighted_candidate("acct_ready", 1, 0),
+    ];
+    let selection = context(RotationStrategy::Smart);
+    candidates[0].signals.cooldown = Some(AccountCooldown {
+        until: selection.now - Duration::from_secs(120),
+        kind: AccountCooldownKind::CapacityFreezeProbe,
+    });
+    let projection = candidates[0]
+        .account
+        .status_projection(selection.now, candidates[0].signals.cooldown);
+    assert_eq!(projection.status, AccountStatus::RateLimited);
+    assert!(
+        projection
+            .cooldown
+            .expect("freeze details")
+            .kind
+            .requires_probe()
+    );
+    let selected = AccountSelector
+        .select(&candidates, &selection)
+        .expect("available account");
+    assert_eq!(selected.candidate().account.id().as_str(), "acct_ready");
 }

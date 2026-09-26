@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use gateway_admin::{
     model::{
         MutationContext, PageSize, Revision,
@@ -82,7 +82,7 @@ async fn group_query_service_enriches_only_current_page_members_with_runtime_fac
         group.capacity,
         AccountGroupCapacity {
             used_slots: Some(2),
-            total_slots: 4,
+            total_slots: Some(4),
         }
     );
 }
@@ -90,6 +90,40 @@ async fn group_query_service_enriches_only_current_page_members_with_runtime_fac
 #[derive(Default)]
 struct FakeGroupStore {
     requested_groups: Mutex<Vec<String>>,
+    members: Option<Vec<AccountGroupMemberFact>>,
+}
+
+#[tokio::test]
+async fn group_capacity_only_becomes_unlimited_for_available_unlimited_members() {
+    for (available_slots, unavailable_slots, expected) in
+        [(None, Some(3), None), (Some(4), None, Some(4))]
+    {
+        let mut available = member("acct_available", 4);
+        available.total_slots = available_slots;
+        let mut unavailable = member("acct_limited", 3);
+        unavailable.total_slots = unavailable_slots;
+        let groups = Arc::new(FakeGroupStore {
+            members: Some(vec![available, unavailable]),
+            ..Default::default()
+        });
+        let service = AdminHarness::new()
+            .account_groups(groups)
+            .account_runtime(Arc::new(FakeRuntimeStore::default()))
+            .build()
+            .await;
+        let page = service
+            .account_groups()
+            .list(AccountGroupListQuery {
+                page: 1,
+                page_size: PageSize::new(20).expect("page size"),
+                search: None,
+                enabled: None,
+            })
+            .await
+            .expect("group capacity");
+        assert_eq!(page.items[0].capacity.total_slots, expected);
+        assert_eq!(page.items[0].capacity.used_slots, Some(2));
+    }
 }
 
 #[async_trait]
@@ -115,7 +149,10 @@ impl AccountGroupStore for FakeGroupStore {
             .iter()
             .map(|group_id| group_id.as_str().to_owned())
             .collect();
-        Ok(vec![member("acct_available", 4), member("acct_limited", 3)])
+        Ok(self
+            .members
+            .clone()
+            .unwrap_or_else(|| vec![member("acct_available", 4), member("acct_limited", 3)]))
     }
 
     async fn create_account_group(
@@ -168,18 +205,41 @@ impl AccountRuntimeStore for FakeRuntimeStore {
     ) -> AdminStoreResult<AccountRuntimeSnapshot> {
         *self.requested_accounts.lock().expect("requested accounts") = account_ids.to_vec();
         Ok(AccountRuntimeSnapshot {
-            rate_limited_until: BTreeMap::from([(
+            cooldown: BTreeMap::from([(
                 "acct_limited".to_owned(),
-                Utc::now() + Duration::minutes(5),
+                std::time::SystemTime::from(Utc::now() + Duration::minutes(5)).into(),
             )]),
             in_flight: Some(BTreeMap::from([("acct_available".to_owned(), 2)])),
         })
+    }
+
+    async fn active_freezes(
+        &self,
+    ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn capacity_peaks(
+        &self,
+        _account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, u32>> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn finish_freeze(
+        &self,
+        _account_id: &str,
+        _expected: &gateway_admin::model::accounts::AccountFreeze,
+        _postpone_until: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
+        Ok(false)
     }
 }
 
 fn group_record() -> AccountGroupRecord {
     let now = Utc::now();
     AccountGroupRecord {
+        disable_fast: false,
         id: group_id(),
         name: "Primary".to_owned(),
         description: None,
@@ -195,7 +255,7 @@ fn group_record() -> AccountGroupRecord {
         },
         capacity: AccountGroupCapacity {
             used_slots: None,
-            total_slots: 0,
+            total_slots: Some(0),
         },
         usage: AccountGroupUsage {
             today_usd: DecimalAmount::from_str("1").expect("today usage"),
@@ -215,11 +275,11 @@ fn member(account_id: &str, total_slots: u64) -> AccountGroupMemberFact {
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
             quota: QuotaState::default(),
-            rate_limited_until: None,
+            cooldown: None,
             last_error_reason: None,
             last_error_message: None,
         },
-        total_slots,
+        total_slots: Some(total_slots),
     }
 }
 

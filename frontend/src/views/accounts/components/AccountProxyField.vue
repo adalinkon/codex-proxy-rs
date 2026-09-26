@@ -1,7 +1,6 @@
 <script setup lang="ts">
+import { BaseFormItem, BaseSelect } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import { useProxyCatalog } from '@/composables/useProxyCatalog'
 
 const props = withDefaults(defineProps<{ accountId?: string, endpoint?: string | null, disabled?: boolean, preserve?: boolean, error?: string }>(), { preserve: true })
@@ -22,7 +21,6 @@ const options = computed(() => [
     label: `${proxy.name}${proxy.lastTest?.success ? '' : proxy.lastTest ? '（测试失败）' : '（未测试）'}`,
     value: proxy.id,
     description: proxy.endpoint,
-    disabled: proxy.lastTest?.success !== true,
   })),
 ])
 const selection = computed({

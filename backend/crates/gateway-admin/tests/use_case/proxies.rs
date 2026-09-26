@@ -12,6 +12,7 @@ use gateway_core::account::{OutboundProxy, ProviderAccountId};
 pub(super) struct TestProxies {
     pub events: Option<super::accounts::EventLog>,
     pub accounts: Option<Vec<ProxyAccountRef>>,
+    pub record: Option<ProxyRecord>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -70,8 +71,11 @@ impl ProxyStore for TestProxies {
             page_size: query.page_size.get(),
         })
     }
-    async fn get(&self, _: &str) -> AdminStoreResult<ProxyRecord> {
-        Err(super::unavailable("proxy"))
+    async fn get(&self, id: &str) -> AdminStoreResult<ProxyRecord> {
+        self.record
+            .clone()
+            .filter(|record| record.id == id)
+            .ok_or_else(|| super::unavailable("proxy"))
     }
     async fn create(&self, _: NewProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
         Err(super::unavailable("proxy"))
@@ -93,15 +97,82 @@ impl ProxyStore for TestProxies {
         _: Revision,
         _: ProxyTestResult,
         _: &MutationContext,
-    ) -> AdminStoreResult<ProxyRecord> {
+    ) -> AdminStoreResult<ProxyMutation> {
         Err(super::unavailable("proxy"))
     }
 }
 
 #[async_trait]
 impl ProxyProbe for TestProxies {
-    async fn test(&self, _: &OutboundProxy) -> ProxyTestResult {
+    async fn test(&self, _: &OutboundProxy, _: bool) -> ProxyTestResult {
         panic!("unexpected proxy probe")
+    }
+}
+
+#[tokio::test]
+async fn authorization_uses_selected_proxy_regardless_of_probe_status() {
+    use super::accounts::{FakeAccountStore, FakeProviderAdmin, context, events, recorded};
+    use gateway_admin::model::provider_credentials::StartAuthorization;
+    use std::sync::Arc;
+
+    for kind in ["openai", "xai"] {
+        for probe_success in [None, Some(false), Some(true)] {
+            let events = events();
+            let now = chrono::Utc::now();
+            let services = super::AdminHarness::new()
+                .provider(FakeProviderAdmin::new(kind, events.clone()))
+                .accounts(FakeAccountStore::new(kind, events.clone()))
+                .proxies(Arc::new(TestProxies {
+                    record: Some(ProxyRecord {
+                        auto_location: false,
+                        detected_location: None,
+                        location: None,
+                        id: "proxy_oauth".to_owned(),
+                        name: "授权出口".to_owned(),
+                        proxy: OutboundProxy::parse("http://127.0.0.1:8080").unwrap(),
+                        revision: Revision::new(1).unwrap(),
+                        account_count: 0,
+                        last_test_at: probe_success.map(|_| now),
+                        last_test: probe_success.map(|success| ProxyTestResult {
+                            location: Default::default(),
+                            success,
+                            latency_ms: 10,
+                            exit_ip: None,
+                            exit_ipv4: None,
+                            exit_ipv6: None,
+                            message: "出口探测结果".to_owned(),
+                        }),
+                        created_at: now,
+                        updated_at: now,
+                    }),
+                    ..Default::default()
+                }))
+                .build()
+                .await;
+            let command = StartAuthorization {
+                outbound_proxy: Some(AccountProxySelection::Saved("proxy_oauth".to_owned())),
+                context: context("oauth-proxy-status"),
+                name: "授权账号".to_owned(),
+                reauthorization: None,
+            };
+            let result = if kind == "openai" {
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("openai").unwrap())
+                    .unwrap()
+                    .start_authorization(command)
+                    .await
+            } else {
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("xai").unwrap())
+                    .unwrap()
+                    .start_authorization(command)
+                    .await
+            };
+            assert!(result.is_ok(), "{kind}, {probe_success:?}: {result:?}");
+            assert_eq!(recorded(&events), ["provider.start_authorization"]);
+        }
     }
 }
 
@@ -205,9 +276,19 @@ async fn credential_import_keeps_proxy_reserved_until_commit_and_releases_on_err
                 document: document(),
             };
             let result = if kind == "openai" {
-                services.openai().import_document(command).await
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("openai").unwrap())
+                    .unwrap()
+                    .import_document(command)
+                    .await
             } else {
-                services.xai().import_document(command).await
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("xai").unwrap())
+                    .unwrap()
+                    .import_document(command)
+                    .await
             };
             assert_eq!(result.is_err(), failure.is_some());
             let events = recorded(&events);

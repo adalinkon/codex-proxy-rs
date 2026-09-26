@@ -38,7 +38,8 @@ pub struct AccountGroupAccountSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountGroupCapacity {
     pub used_slots: Option<u64>,
-    pub total_slots: u64,
+    /// `None` 表示可用账号中存在不限制并发的账号。
+    pub total_slots: Option<u64>,
 }
 
 /// Successful, downstream-committed USD request costs for group accounts.
@@ -55,7 +56,7 @@ pub struct AccountGroupMemberFact {
     pub group_id: AccountGroupId,
     pub account_id: String,
     pub status: AccountStatusFacts,
-    pub total_slots: u64,
+    pub total_slots: Option<u64>,
 }
 
 /// Lightweight group reference embedded in account and client-key views.
@@ -79,6 +80,7 @@ pub struct AccountGroupListQuery {
 /// Complete account group summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountGroupRecord {
+    pub disable_fast: bool,
     pub id: AccountGroupId,
     pub name: String,
     pub description: Option<String>,
@@ -107,6 +109,7 @@ pub struct AccountGroupPage {
 /// Create an account group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateAccountGroup {
+    pub disable_fast: bool,
     pub name: String,
     pub description: Option<String>,
     pub color: AccountGroupColor,
@@ -115,6 +118,7 @@ pub struct CreateAccountGroup {
 /// Store-ready create command with a generated stable ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAccountGroup {
+    pub disable_fast: bool,
     pub id: AccountGroupId,
     pub name: String,
     pub description: Option<String>,
@@ -124,6 +128,7 @@ pub struct NewAccountGroup {
 /// Update an account group's descriptive fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateAccountGroup {
+    pub disable_fast: Option<bool>,
     pub id: AccountGroupId,
     pub name: String,
     pub description: Option<String>,

@@ -74,14 +74,23 @@ pub trait ClientKeyService: Send + Sync {
 }
 
 pub(crate) struct DefaultClientKeyService {
+    providers: crate::ports::provider::ProviderAdminRegistry,
     store: Arc<dyn ClientKeyStore>,
     snapshot: Arc<dyn SnapshotControl>,
 }
 
 impl DefaultClientKeyService {
     #[must_use]
-    pub(crate) fn new(store: Arc<dyn ClientKeyStore>, snapshot: Arc<dyn SnapshotControl>) -> Self {
-        Self { store, snapshot }
+    pub(crate) fn new(
+        store: Arc<dyn ClientKeyStore>,
+        snapshot: Arc<dyn SnapshotControl>,
+        providers: crate::ports::provider::ProviderAdminRegistry,
+    ) -> Self {
+        Self {
+            store,
+            snapshot,
+            providers,
+        }
     }
 }
 
@@ -151,6 +160,7 @@ impl ClientKeyService for DefaultClientKeyService {
                 crate::model::client_keys::OwnedKeyMutation::Create(NewClientKey {
                     id: id.clone(),
                     user_id: Some(user_id.to_owned()),
+                    request_profile_overrides: command.request_profile_overrides,
                     name: command.name,
                     label: command.label,
                     group_ids: command.group_ids,
@@ -219,6 +229,12 @@ impl ClientKeyService for DefaultClientKeyService {
         context: &MutationContext,
         command: CreateClientKey,
     ) -> Result<CreatedClientKey, AdminError> {
+        for (provider, profile) in &command.request_profile_overrides {
+            self.providers
+                .require(provider)
+                .and_then(|provider| provider.preview_client_profile(profile))
+                .map_err(|error| super::map_provider_error(error, "client profile"))?;
+        }
         let id = ClientApiKeyId::new(format!("key_{}", Uuid::now_v7().simple()))
             .map_err(|_| AdminError::internal("创建 Client API Key ID 失败"))?;
         let plaintext = create_plaintext(command.custom_key);
@@ -232,6 +248,7 @@ impl ClientKeyService for DefaultClientKeyService {
                         }
                         _ => None,
                     }),
+                    request_profile_overrides: command.request_profile_overrides,
                     id,
                     name: command.name,
                     label: command.label,
@@ -256,6 +273,14 @@ impl ClientKeyService for DefaultClientKeyService {
         context: &MutationContext,
         command: UpdateClientKey,
     ) -> Result<ClientKeyMutation, AdminError> {
+        for (provider, profile) in &command.request_profile_override_updates {
+            if let Some(profile) = profile {
+                self.providers
+                    .require(provider)
+                    .and_then(|provider| provider.preview_client_profile(profile))
+                    .map_err(|error| super::map_provider_error(error, "client profile"))?;
+            }
+        }
         let id = command.id.clone();
         let (config_revision, record) = self
             .store

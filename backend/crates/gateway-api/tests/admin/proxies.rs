@@ -19,6 +19,71 @@ use tower::ServiceExt as _;
 
 use super::{AdminTestFixture, AdminTestState};
 
+#[tokio::test]
+async fn proxy_location_round_trips_preserves_omitted_and_clears_null() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let location =
+        json!({"country":"JP", "region":"Tokyo", "city":"Tokyo", "timezone":"Asia/Tokyo"});
+    let (status, created) = request(
+        &fixture,
+        "/api/admin/proxies/create",
+        Some(json!({
+            "name":"Tokyo", "proxyUrl":"http://proxy.example:8080", "location":location
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["data"]["record"]["location"], location);
+    let (_, listed) = request(&fixture, "/api/admin/proxies", None, true).await;
+    assert_eq!(listed["data"]["items"][0]["location"], location);
+    for (revision, change, expected) in [
+        (1, None, location.clone()),
+        (2, Some(Value::Null), Value::Null),
+        (3, Some(location.clone()), location.clone()),
+    ] {
+        let mut body = json!({"id":"proxy_test", "revision":revision, "name":"Renamed"});
+        if let Some(change) = change {
+            body["location"] = change;
+        }
+        let (status, changed) =
+            request(&fixture, "/api/admin/proxies/update", Some(body), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(changed["data"]["record"]["location"], expected);
+    }
+}
+
+#[tokio::test]
+async fn proxy_location_rejects_invalid_and_incomplete_input() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    for (field, value) in [
+        ("country", json!("jp")),
+        ("city", json!(" ")),
+        ("region", json!("Tokyo\n")),
+        ("city", json!("x".repeat(129))),
+        ("timezone", json!("Asia/Typo")),
+    ] {
+        let mut invalid =
+            json!({"country":"JP", "region":"Tokyo", "city":"Tokyo", "timezone":"Asia/Tokyo"});
+        invalid[field] = value;
+        let (status, _) = request(&fixture, "/api/admin/proxies/create", Some(json!({"name":"Invalid", "proxyUrl":"http://proxy.example:8080", "location":invalid})), true).await;
+        assert!(status.is_client_error(), "invalid {field} accepted");
+    }
+    let (status, _) = request(&fixture, "/api/admin/proxies/create", Some(json!({"name":"Incomplete", "proxyUrl":"http://proxy.example:8080", "location":{"country":"JP"}})), true).await;
+    assert!(status.is_client_error());
+    let (status, created) = request(
+        &fixture,
+        "/api/admin/proxies/create",
+        Some(json!({"name":"Legacy", "proxyUrl":"http://proxy.example:8080"})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created["data"]["record"]["location"].is_null());
+}
+
 #[derive(Default)]
 pub(super) struct MemoryProxies(Mutex<Option<ProxyRecord>>);
 
@@ -97,7 +162,10 @@ impl ProxyStore for MemoryProxies {
         command: NewProxy,
         _: &MutationContext,
     ) -> AdminStoreResult<ProxyMutation> {
-        let record = ProxyRecord {
+        let mut record = ProxyRecord {
+            auto_location: command.auto_location,
+            detected_location: None,
+            location: command.location,
             id: "proxy_test".to_owned(),
             name: command.name,
             proxy: command.proxy,
@@ -108,6 +176,11 @@ impl ProxyStore for MemoryProxies {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
+        if let Some(result) = command.test {
+            record.detected_location = record.detected_location_after_test(&result);
+            record.last_test = Some(result);
+            record.last_test_at = Some(Utc::now());
+        }
         *self.0.lock().unwrap() = Some(record.clone());
         Ok(ProxyMutation {
             config_revision: record.revision,
@@ -122,8 +195,25 @@ impl ProxyStore for MemoryProxies {
         let mut stored = self.0.lock().unwrap();
         let record = stored.as_mut().ok_or_else(missing)?;
         record.name = command.name;
+        if let Some(auto_location) = command.auto_location {
+            if auto_location != record.auto_location {
+                record.detected_location = None;
+            }
+            record.auto_location = auto_location;
+        }
+        if let Some(location) = command.location {
+            record.location = location;
+        }
         if let Some(proxy) = command.proxy {
+            if record.proxy != proxy {
+                record.detected_location = None;
+            }
             record.proxy = proxy;
+        }
+        if let Some(result) = command.test {
+            record.detected_location = record.detected_location_after_test(&result);
+            record.last_test = Some(result);
+            record.last_test_at = Some(Utc::now());
         }
         record.revision = Revision::new(record.revision.get() + 1).unwrap();
         Ok(ProxyMutation {
@@ -146,12 +236,19 @@ impl ProxyStore for MemoryProxies {
         _: Revision,
         result: ProxyTestResult,
         _: &MutationContext,
-    ) -> AdminStoreResult<ProxyRecord> {
+    ) -> AdminStoreResult<ProxyMutation> {
         let mut stored = self.0.lock().unwrap();
         let record = stored.as_mut().ok_or_else(missing)?;
+        record.detected_location = record.detected_location_after_test(&result);
         record.last_test = Some(result);
         record.last_test_at = Some(Utc::now());
-        Ok(record.clone())
+        if record.auto_location {
+            record.revision = Revision::new(record.revision.get() + 1).unwrap();
+        }
+        Ok(ProxyMutation {
+            config_revision: record.revision,
+            record: record.clone(),
+        })
     }
 }
 
@@ -159,15 +256,22 @@ pub(super) struct SuccessfulProbe;
 
 #[async_trait]
 impl ProxyProbe for SuccessfulProbe {
-    async fn test(&self, proxy: &OutboundProxy) -> ProxyTestResult {
+    async fn test(&self, proxy: &OutboundProxy, detect_location: bool) -> ProxyTestResult {
         assert_eq!(
             proxy.expose_url(),
             "http://test-user:private-password@proxy.example:8080/"
         );
         ProxyTestResult {
+            location: if detect_location {
+                ProxyLocationDetection::Detected { location: serde_json::from_value(json!({"country":"JP","region":"Tokyo","city":"Tokyo","timezone":"Asia/Tokyo"})).unwrap() }
+            } else {
+                ProxyLocationDetection::NotRequested
+            },
             success: true,
             latency_ms: 15,
             exit_ip: Some("203.0.113.2".parse().unwrap()),
+            exit_ipv4: Some("203.0.113.2".parse().unwrap()),
+            exit_ipv6: None,
             message: "Connected".to_owned(),
         }
     }
@@ -321,7 +425,15 @@ async fn proxy_probe_checks_unsaved_address_without_creating_or_changing_records
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         probed["data"],
-        json!({"success": true, "latencyMs": 15, "exitIp": "203.0.113.2", "message": "Connected"})
+        json!({
+            "location": {"status": "notRequested"},
+            "success": true,
+            "latencyMs": 15,
+            "exitIp": "203.0.113.2",
+            "exitIpv4": "203.0.113.2",
+            "exitIpv6": null,
+            "message": "Connected"
+        })
     );
     let (_, listed) = request(&fixture, "/api/admin/proxies", None, true).await;
     assert_eq!(listed["data"]["page"]["total"], 0);
@@ -517,4 +629,95 @@ async fn proxy_account_removal_validates_binding_and_input() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(result["message"], "账号的代理绑定已变化，请刷新后重试");
+}
+
+#[tokio::test]
+async fn auto_location_detects_on_enable_preserves_manual_and_refreshes_only_on_explicit_test() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let manual = json!({"country":"US", "region":"California", "city":"Los Angeles", "timezone":"America/Los_Angeles"});
+    let (status, created) = request(&fixture, "/api/admin/proxies/create", Some(json!({
+        "name":"Automatic", "proxyUrl":"http://test-user:private-password@proxy.example:8080", "autoLocation":true, "location":manual
+    })), true).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let record = &created["data"]["record"];
+    assert_eq!(record["autoLocation"], true);
+    assert_eq!(
+        record["detectedLocation"]["location"]["timezone"],
+        "Asia/Tokyo"
+    );
+    assert_eq!(record["location"], manual);
+    let (_, renamed) = request(
+        &fixture,
+        "/api/admin/proxies/update",
+        Some(json!({
+            "id":"proxy_test", "revision":1, "name":"Renamed", "autoLocation":true
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(
+        renamed["data"]["record"]["detectedLocation"],
+        record["detectedLocation"]
+    );
+    assert_eq!(
+        renamed["data"]["record"]["lastTestAt"],
+        record["lastTestAt"]
+    );
+    let (status, tested) = request(
+        &fixture,
+        "/api/admin/proxies/test",
+        Some(json!({"id":"proxy_test", "revision":2})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tested["data"]["revision"], 3);
+    assert_eq!(tested["data"]["lastTest"]["location"]["status"], "detected");
+    let (_, disabled) = request(
+        &fixture,
+        "/api/admin/proxies/update",
+        Some(json!({
+            "id":"proxy_test", "revision":3, "name":"Manual", "autoLocation":false
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(disabled["data"]["record"]["autoLocation"], false);
+    assert_eq!(disabled["data"]["record"]["location"], manual);
+    assert!(disabled["data"]["record"]["detectedLocation"].is_null());
+}
+
+#[tokio::test]
+async fn manual_proxy_can_detect_location_once_without_enabling_auto_location() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let manual = json!({"country":"US", "region":"California", "city":"Los Angeles", "timezone":"America/Los_Angeles"});
+    let (status, created) = request(&fixture, "/api/admin/proxies/create", Some(json!({
+        "name":"Manual", "proxyUrl":"http://test-user:private-password@proxy.example:8080", "location":manual
+    })), true).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["data"]["record"]["autoLocation"], false);
+
+    let (status, tested) = request(
+        &fixture,
+        "/api/admin/proxies/test",
+        Some(json!({"id":"proxy_test", "revision":1, "detectLocation":true})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let record = &tested["data"];
+    assert_eq!(record["revision"], 1);
+    assert_eq!(record["autoLocation"], false);
+    assert_eq!(record["location"], manual);
+    assert_eq!(
+        record["detectedLocation"]["location"]["timezone"],
+        "Asia/Tokyo"
+    );
+    assert_eq!(record["lastTest"]["location"]["status"], "detected");
+    assert_eq!(
+        record["lastTest"]["location"]["location"]["timezone"],
+        "Asia/Tokyo"
+    );
 }

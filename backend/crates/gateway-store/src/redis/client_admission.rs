@@ -23,6 +23,7 @@ local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 100
 local cutoff = now_ms - 60000
 local lease_ttl_ms = tonumber(ARGV[2])
 if now_ms + lease_ttl_ms > tonumber(ARGV[5]) then return 3 end
+local concurrency_rejected = false
 for level = 0, 1 do
   local active = KEYS[1 + level * 2]
   local recent = KEYS[2 + level * 2]
@@ -32,9 +33,10 @@ for level = 0, 1 do
   redis.call('ZREMRANGEBYSCORE', recent, '-inf', cutoff)
   if not redis.call('ZSCORE', active, ARGV[1]) then
     if rpm > 0 and redis.call('ZCARD', recent) >= rpm then return 1 end
-    if concurrency > 0 and redis.call('ZCARD', active) >= concurrency then return 2 end
+    if tonumber(ARGV[8]) == 0 or concurrency > 0 and redis.call('ZCARD', active) >= concurrency then concurrency_rejected = true end
   end
 end
+if concurrency_rejected then return 2 end
 
 local function extend_ttl(key, ttl)
   local current = redis.call('PTTL', key)
@@ -127,6 +129,7 @@ pub struct ClientAdmissionRequest {
     pub model_request_id: String,
     pub client_api_key_ref: String,
     pub lease_ttl: Duration,
+    pub allow_concurrency_acquire: bool,
     pub limits: ClientAdmissionLimits,
 }
 
@@ -337,6 +340,7 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
             .arg(MAX_REDIS_EXACT_INTEGER)
             .arg(request.limits.max_concurrency)
             .arg(request.limits.requests_per_minute)
+            .arg(u8::from(request.allow_concurrency_acquire))
             .invoke_async::<i64>(&mut connection)
             .await
             .map_err(|_| redis_unavailable("admit client request"))?;
@@ -436,6 +440,25 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
 }
 
 impl ClientAdmissionPort for RedisClientAdmissionRepository {
+    fn abandon(
+        &self,
+        user_id: &str,
+        key: &gateway_core::policy::ClientApiKeyId,
+        request: &gateway_core::engine::ModelRequestId,
+    ) {
+        let repository = self.clone();
+        let user_id = user_id.to_owned();
+        let key = key.clone();
+        let request = request.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                if let Err(error) = repository.release(&user_id, &key, &request).await {
+                    tracing::warn!(%error, "已取消准入的租约释放失败，依赖 TTL 收敛");
+                }
+            }));
+        }
+    }
+
     fn admit(
         &self,
         request: CoreAdmissionRequest,
@@ -450,6 +473,7 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
                 model_request_id: request.model_request_id.as_str().to_owned(),
                 client_api_key_ref: request.client_api_key_id.as_str().to_owned(),
                 lease_ttl: request.lease_ttl,
+                allow_concurrency_acquire: request.allow_concurrency_acquire,
                 limits: ClientAdmissionLimits {
                     max_concurrency: request.limits.max_concurrency,
                     requests_per_minute: request.limits.requests_per_minute,

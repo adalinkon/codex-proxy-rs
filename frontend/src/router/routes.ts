@@ -13,7 +13,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'users', name: 'users', component: () => import('@/views/users/index.vue') },
       { path: 'me/profile', name: 'my-profile', component: () => import('@/views/user/index.vue') },
       { path: 'me/overview', name: 'my-overview', redirect: '/me/profile' },
-      { path: 'me/keys', name: 'my-keys', component: () => import('@/views/api-keys/index.vue'), props: { scope: 'user' } },
+      { path: 'me/keys', name: 'my-keys', component: () => import('@/views/keys/index.vue'), props: { scope: 'user' } },
       { path: 'me/usage', name: 'my-usage', component: () => import('@/views/usage/index.vue'), props: { scope: 'user' } },
       { path: 'me/settings', name: 'my-settings', redirect: '/me/profile' },
       {
@@ -32,19 +32,35 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/proxies/index.vue'),
       },
       {
-        path: 'account-groups',
-        name: 'account-groups',
-        component: () => import('@/views/account-groups/index.vue'),
+        path: 'groups',
+        name: 'groups',
+        component: () => import('@/views/groups/index.vue'),
       },
       {
-        path: 'api-keys',
-        name: 'api-keys',
-        component: () => import('@/views/api-keys/index.vue'),
+        path: 'keys',
+        name: 'keys',
+        component: () => import('@/views/keys/index.vue'),
       },
       {
         path: 'usage',
         name: 'usage',
         component: () => import('@/views/usage/index.vue'),
+      },
+      {
+        path: 'plugins',
+        component: () => import('@/views/plugins/index.vue'),
+        children: [
+          {
+            path: '',
+            name: 'plugins',
+            component: () => import('@/views/plugins/components/PluginManagement.vue'),
+          },
+          {
+            path: ':instanceId/:pageId',
+            name: 'plugin-page',
+            component: () => import('@/views/plugins/components/PluginPage.vue'),
+          },
+        ],
       },
       {
         path: 'theme',
@@ -53,13 +69,33 @@ export const routes: RouteRecordRaw[] = [
       },
       {
         path: 'settings',
-        name: 'settings',
-        component: () => import('@/views/settings/index.vue'),
-      },
-      {
-        path: 'settings/backup',
-        name: 'settings-backup',
-        component: () => import('@/views/settings/index.vue'),
+        children: [
+          {
+            path: '',
+            name: 'settings',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'upstream',
+            name: 'settings-upstream',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'access',
+            name: 'settings-access',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'backup',
+            name: 'settings-backup',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'pricing',
+            name: 'settings-pricing',
+            component: () => import('@/views/settings/index.vue'),
+          },
+        ],
       },
     ],
   },

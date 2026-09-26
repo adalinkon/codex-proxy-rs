@@ -194,6 +194,7 @@ async fn create_key(db: &TestDatabase, user: &str, id: &str) {
         .mutate_owned_key(
             user,
             OwnedKeyMutation::Create(NewClientKey {
+                request_profile_overrides: Default::default(),
                 user_id: Some(user.to_owned()),
                 id: ClientApiKeyId::new(id).unwrap(),
                 name: id.to_owned(),
@@ -231,6 +232,7 @@ async fn owned_creation_preserves_parameters_and_rejects_unassigned_groups() {
     let group = |id: &str| gateway_core::routing::AccountGroupId::new(id.to_owned()).unwrap();
     let keys = PgAdminClientKeyStore::new(db.pool.clone());
     let command = NewClientKey {
+        request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new("custom-key").unwrap(),
         user_id: Some("alice".to_owned()),
         name: "Custom".to_owned(),

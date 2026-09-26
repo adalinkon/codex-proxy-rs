@@ -431,7 +431,7 @@ async fn scheduled_refresh_persists_retryable_message_inside_the_two_hour_window
                 client_id: "test-public-client".to_owned(),
                 token_endpoint: format!("{}/oauth/token", server.uri()),
             },
-            provider_openai::OpenAiConfig::default().wire_profile_state(),
+            provider_openai::transport::profile::CodexWireProfileState::new(Default::default()),
         )),
         Arc::new(RefreshLeases),
         Arc::new(RefreshCredentialState),
@@ -644,6 +644,10 @@ async fn scheduled_refresh_preserves_the_stored_token_set_when_rotation_fields_a
         .expect("test expiry");
     seed_refreshable_account(&store, account_id, expires_at, None).await;
 
+    store.set_oauth_transport(
+        account_id,
+        provider_openai::credential::ResponsesTransport::Http,
+    );
     service.refresh_due().await.expect("refresh cycle");
 
     let account = store.account(account_id).expect("refreshed account");
@@ -653,6 +657,10 @@ async fn scheduled_refresh_preserves_the_stored_token_set_when_rotation_fields_a
         .await
         .expect("refreshed credential");
     let runtime = CodexCredentialCodec::decode(&loaded.credential).expect("runtime credential");
+    assert_eq!(
+        runtime.transport,
+        provider_openai::credential::ResponsesTransport::Http
+    );
     let oauth = runtime.authentication.oauth().expect("OAuth credential");
     assert_eq!(
         oauth.access_token.expose_secret(),

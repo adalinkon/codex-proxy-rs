@@ -1,10 +1,11 @@
 import type { Ref } from 'vue'
-import type { getAccounts } from '@/api'
+import type { AccountModelAccess, getAccounts } from '@/api'
 
-import { ref, shallowRef, watch } from 'vue'
+import { toast } from '@codex-proxy/ui'
+import { computed, ref, shallowRef, watch } from 'vue'
 import { batchUpdateAccounts } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
+import { accountModelAccessError } from '../utils/modelAccess'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
@@ -20,17 +21,35 @@ export function useAccountBatchEditor(options: {
   const schedulingEnabled = shallowRef(true)
   const concurrencyLimit = shallowRef('')
   const weight = shallowRef('1')
+  const modelAccess = ref<AccountModelAccess | undefined>()
+  const editedFields = ref(new Set<'enabled' | 'concurrencyLimit' | 'weight' | 'groupIds'>())
+  const catalogAccountId = shallowRef<string>()
   const proxyMode = shallowRef('preserve')
   const proxyId = shallowRef('')
   const selectedGroupIds = ref<string[]>([])
   const saveAction = useAsyncAction()
   const saving = saveAction.loading
+  const hasChanges = computed(() => Boolean(modelAccess.value) || editedFields.value.size > 0 || proxyMode.value !== 'preserve')
+
+  // 未操作的字段保持每个账号原值，避免展开表单就覆盖混合设置。
+  watch([schedulingEnabled, concurrencyLimit, weight, selectedGroupIds], (values, previous) => {
+    if (!showBatchEditModal.value || saving.value)
+      return
+    const fields = ['enabled', 'concurrencyLimit', 'weight', 'groupIds'] as const
+    fields.forEach((field, index) => {
+      if (values[index] !== previous[index])
+        editedFields.value.add(field)
+    })
+  }, { flush: 'sync' })
 
   function open() {
     const accounts = selectedAccounts()
     if (accounts.length === 0)
       return
 
+    modelAccess.value = undefined
+    editedFields.value.clear()
+    catalogAccountId.value = accounts[0]?.id
     schedulingEnabled.value = accounts.every(account => account.enabled)
     proxyMode.value = 'preserve'
     proxyId.value = ''
@@ -43,7 +62,16 @@ export function useAccountBatchEditor(options: {
   async function save() {
     if (saving.value || options.selectedIds.value.size === 0)
       return
-    const scheduling = parseAccountSchedulingForm(concurrencyLimit.value, weight.value)
+    const modelError = accountModelAccessError(modelAccess.value)
+    if (modelError) {
+      toast.warning(modelError)
+      return
+    }
+    if (!hasChanges.value) {
+      toast.warning('请选择需要更新的设置')
+      return
+    }
+    const scheduling = parseAccountSchedulingForm(editedFields.value.has('concurrencyLimit') ? concurrencyLimit.value : '', editedFields.value.has('weight') ? weight.value : '1')
     if (proxyMode.value === 'proxy' && !proxyId.value.trim()) {
       toast.warning('请选择已通过测试的代理')
       return
@@ -57,16 +85,17 @@ export function useAccountBatchEditor(options: {
       const accountIds = selectedAccounts().map(account => account.id)
       await batchUpdateAccounts({
         accountIds,
+        modelAccess: modelAccess.value,
         outboundProxyId: proxyMode.value === 'preserve' ? undefined : proxyMode.value === 'direct' ? '' : proxyId.value.trim(),
-        enabled: schedulingEnabled.value,
-        concurrencyLimit: scheduling.values.concurrencyLimit,
-        weight: scheduling.values.weight,
-        groupIds: [...new Set(selectedGroupIds.value)],
+        enabled: editedFields.value.has('enabled') ? schedulingEnabled.value : undefined,
+        concurrencyLimit: editedFields.value.has('concurrencyLimit') ? scheduling.values.concurrencyLimit : undefined,
+        weight: editedFields.value.has('weight') ? scheduling.values.weight : undefined,
+        groupIds: editedFields.value.has('groupIds') ? [...new Set(selectedGroupIds.value)] : undefined,
       })
       showBatchEditModal.value = false
       options.selectedIds.value = new Set()
-      await Promise.all([options.reloadAccounts(), options.reloadGroups()])
       toast.success(`已更新 ${accountIds.length} 个账号`)
+      void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])
     }, { onError: () => void options.reloadAccounts() })
   }
 
@@ -110,6 +139,9 @@ export function useAccountBatchEditor(options: {
     schedulingEnabled,
     concurrencyLimit,
     weight,
+    modelAccess,
+    hasChanges,
+    catalogAccountId,
     proxyMode,
     proxyId,
     selectedGroupIds,

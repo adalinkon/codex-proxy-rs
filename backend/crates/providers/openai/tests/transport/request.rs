@@ -118,7 +118,7 @@ fn encoder_should_preserve_openai_wire_fields_without_deriving_accountless_pool_
 
     assert_eq!(encoded.body().get("model"), Some(&json!("gpt-routed")));
     assert!(encoded.body().get("stream").is_none());
-    assert!(encoded.body().get("store").is_none());
+    assert_eq!(encoded.body().get("store"), Some(&json!(false)));
     assert_eq!(encoded.body().get("tool_choice"), Some(&json!("auto")));
     assert_eq!(
         encoded.body().get("future_official_field"),
@@ -177,28 +177,6 @@ fn encoder_should_patch_model_and_preserve_supported_generate_semantics() {
     assert_eq!(body.pointer("/tools/0/strict"), Some(&json!(true)));
     assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
     assert!(!encoded.force_http_sse);
-}
-
-#[test]
-fn encoder_should_remove_unsupported_fields_from_upstream_body() {
-    let request = request(Map::from_iter([
-        ("model".to_owned(), json!("client-model")),
-        ("input".to_owned(), json!("hello")),
-        ("max_output_tokens".to_owned(), json!(512)),
-        ("max_tokens".to_owned(), json!(256)),
-        ("temperature".to_owned(), json!(0.2)),
-    ]));
-
-    let encoded = encode_generate_request(&request, "gpt-test", None).expect("encode");
-
-    assert_eq!(
-        Value::Object(encoded.body().clone()),
-        json!({
-            "model": "gpt-test",
-            "input": "hello",
-            "max_tokens": 256,
-        })
-    );
 }
 
 #[test]

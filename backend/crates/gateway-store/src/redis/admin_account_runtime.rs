@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use gateway_admin::{
     model::accounts::AccountRuntimeSnapshot,
@@ -49,15 +50,23 @@ impl AccountRuntimeStore for RedisAdminAccountRuntimeStore {
                 .read_credential_cooldown(account_id)
                 .await
                 .map(|cooldown| {
-                    cooldown.map(|cooldown| (account_id.clone(), cooldown.cooldown_until))
+                    cooldown.map(|cooldown| {
+                        (
+                            account_id.clone(),
+                            gateway_core::account::AccountCooldown {
+                                until: cooldown.cooldown_until.into(),
+                                kind: cooldown.kind,
+                            },
+                        )
+                    })
                 })
         });
-        let mut rate_limited_until = BTreeMap::new();
+        let mut cooldown = BTreeMap::new();
         for result in join_all(reads).await {
             if let Some((account_id, until)) =
                 result.map_err(|error| crate::admin_store_error("account runtime", error))?
             {
-                rate_limited_until.insert(account_id, until);
+                cooldown.insert(account_id, until);
             }
         }
         let in_flight = self
@@ -72,8 +81,50 @@ impl AccountRuntimeStore for RedisAdminAccountRuntimeStore {
                     .collect()
             });
         Ok(AccountRuntimeSnapshot {
-            rate_limited_until,
+            cooldown,
             in_flight,
         })
+    }
+
+    async fn active_freezes(
+        &self,
+    ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
+        self.cooldowns
+            .active_freezes()
+            .await
+            .map_err(|error| crate::admin_store_error("account runtime", error))
+    }
+
+    async fn capacity_peaks(
+        &self,
+        account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, u32>> {
+        let reads = account_ids.iter().map(|account_id| async move {
+            self.cooldowns
+                .read_capacity_peak(account_id)
+                .await
+                .map(|peak| peak.map(|value| (account_id.clone(), value)))
+        });
+        let mut peaks = BTreeMap::new();
+        for result in join_all(reads).await {
+            if let Some((account_id, peak)) =
+                result.map_err(|error| crate::admin_store_error("account runtime", error))?
+            {
+                peaks.insert(account_id, peak);
+            }
+        }
+        Ok(peaks)
+    }
+
+    async fn finish_freeze(
+        &self,
+        account_id: &str,
+        expected: &gateway_admin::model::accounts::AccountFreeze,
+        postpone_until: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
+        self.cooldowns
+            .finish_freeze(account_id, expected, postpone_until)
+            .await
+            .map_err(|error| crate::admin_store_error("account runtime", error))
     }
 }

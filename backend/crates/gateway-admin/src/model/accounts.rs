@@ -18,12 +18,26 @@ pub use gateway_core::account::{
     QuotaState, resolve_account_status,
 };
 
-/// 导入时统一应用的账号调度与分组设置；缺省时保留原有导入语义。
+/// 账号可用的管理操作。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderAccountCapabilities {
+    pub quota: bool,
+    pub quota_refresh: bool,
+    pub profile: bool,
+    pub subscription: bool,
+    pub avatar: bool,
+    pub reset_credits: bool,
+    pub consume_reset_credit: bool,
+}
+
+/// 导入时统一应用的账号备注、调度与分组设置；缺省时保留原有导入语义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountImportSettings {
+    pub notes: Option<String>,
     pub enabled: bool,
     pub concurrency_limit: Option<AccountConcurrencyLimit>,
     pub weight: AccountWeight,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
     pub group_ids: Vec<gateway_core::routing::AccountGroupId>,
 }
 
@@ -67,9 +81,18 @@ pub struct AccountListQuery {
 /// Admin query service 从运行态存储取得的当前账号冷却快照。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountRuntimeSnapshot {
-    pub rate_limited_until: BTreeMap<String, DateTime<Utc>>,
+    pub cooldown: BTreeMap<String, gateway_core::account::AccountCooldown>,
     /// `None` 表示实时 lease 存储不可用；`Some` 中未出现的账号当前使用量为零。
     pub in_flight: Option<BTreeMap<String, u64>>,
+}
+
+/// 恢复任务读取的冻结快照；generation 将异步结果绑定到本次冻结。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountFreeze {
+    pub credential_revision: Revision,
+    pub until: DateTime<Utc>,
+    pub generation: String,
+    pub requires_probe: bool,
 }
 
 /// Optional account membership filter.
@@ -86,6 +109,7 @@ pub struct AccountRecord {
     pub provider_kind: ProviderKind,
     pub groups: Vec<AccountGroupRef>,
     pub name: String,
+    pub notes: Option<String>,
     pub email: Option<String>,
     pub upstream_user_id: Option<String>,
     pub upstream_account_id: Option<String>,
@@ -98,6 +122,7 @@ pub struct AccountRecord {
     pub enabled: bool,
     pub concurrency_limit: Option<AccountConcurrencyLimit>,
     pub weight: AccountWeight,
+    pub model_access: gateway_core::account::AccountModelAccess,
     pub outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub credential_state: CredentialState,
     pub credential_observed_at: DateTime<Utc>,
@@ -217,9 +242,12 @@ pub struct AccountSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateAccount {
     pub account_id: String,
+    /// 缺省保留备注；空字符串清空备注。
+    pub notes: Option<String>,
     pub enabled: bool,
     pub concurrency_limit: Option<AccountConcurrencyLimit>,
     pub weight: AccountWeight,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
     pub group_ids: Vec<gateway_core::routing::AccountGroupId>,
     pub outbound_proxy: Option<super::proxies::AccountProxySelection>,
 }
@@ -231,14 +259,15 @@ pub struct AccountUpdateResult {
     pub account_id: gateway_core::account::ProviderAccountId,
 }
 
-/// 一批账号可编辑事实的一次性替换命令。
+/// 仅修改显式字段的批量账号设置命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchUpdateAccounts {
     pub account_ids: Vec<String>,
-    pub enabled: bool,
-    pub concurrency_limit: Option<AccountConcurrencyLimit>,
-    pub weight: AccountWeight,
-    pub group_ids: Vec<gateway_core::routing::AccountGroupId>,
+    pub enabled: Option<bool>,
+    pub concurrency_limit: Option<Option<AccountConcurrencyLimit>>,
+    pub weight: Option<AccountWeight>,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
+    pub group_ids: Option<Vec<gateway_core::routing::AccountGroupId>>,
     pub outbound_proxy: Option<super::proxies::AccountProxySelection>,
 }
 

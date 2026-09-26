@@ -27,6 +27,7 @@ use gateway_admin::{
     ports::store::{AdminStoreResult, ClientKeyStore},
 };
 use gateway_core::{
+    account::OpaqueProviderData,
     engine::budget::{ClientBudgetLimits, ClientBudgetStatus},
     engine::execution::ClientApiKeyUsageSink,
     lifecycle::CancellationToken,
@@ -53,6 +54,10 @@ const CLIENT_API_KEY_LAST_USED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientApiKeySnapshot {
     pub user: gateway_core::policy::UserPolicy,
+    pub request_profiles: std::collections::BTreeMap<
+        gateway_core::routing::ProviderKind,
+        gateway_core::account::OpaqueProviderData,
+    >,
     pub id: ClientApiKeyId,
     pub plaintext_key: PlaintextClientApiKey,
     pub group_ids: Vec<AccountGroupId>,
@@ -70,6 +75,7 @@ impl ClientApiKeySnapshot {
     ) -> StoreResult<Self> {
         Ok(Self {
             user,
+            request_profiles: std::collections::BTreeMap::new(),
             id: ClientApiKeyId::new(id).map_err(|_| invalid("persisted key ID is invalid"))?,
             plaintext_key: PlaintextClientApiKey::new(key)
                 .map_err(|_| invalid("persisted plaintext key is invalid"))?,
@@ -110,6 +116,7 @@ impl fmt::Debug for ClientApiKeySecret {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientApiKeyRecord {
     pub user_id: String,
+    pub request_profile_overrides: BTreeMap<ProviderKind, OpaqueProviderData>,
     pub id: String,
     pub name: String,
     pub label: Option<String>,
@@ -272,6 +279,7 @@ pub struct ClientApiKeyPage {
 #[derive(Clone)]
 pub struct NewClientApiKey {
     pub user_id: Option<String>,
+    pub request_profile_overrides: BTreeMap<ProviderKind, OpaqueProviderData>,
     pub id: String,
     pub name: String,
     pub label: Option<String>,
@@ -298,12 +306,14 @@ impl NewClientApiKey {
         require_nonempty(ENTITY, "id", &self.id)?;
         require_nonempty(ENTITY, "name", &self.name)?;
         validate_group_ids(&self.group_ids)?;
+        validate_request_profiles(self.request_profile_overrides.values())?;
         validate_key(&self.key)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateClientApiKeyDetails {
+    pub request_profile_override_updates: BTreeMap<ProviderKind, Option<OpaqueProviderData>>,
     pub id: String,
     pub name: String,
     pub label: Option<String>,
@@ -319,6 +329,14 @@ impl UpdateClientApiKeyDetails {
         require_nonempty(ENTITY, "id", &self.id)?;
         require_nonempty(ENTITY, "name", &self.name)?;
         validate_group_ids(&self.group_ids)?;
+        if self.request_profile_override_updates.len() > 256 {
+            return Err(invalid("request profiles exceed the supported bounds"));
+        }
+        validate_request_profiles(
+            self.request_profile_override_updates
+                .values()
+                .filter_map(Option::as_ref),
+        )?;
         to_i64(self.max_concurrency)?;
         to_i64(self.requests_per_minute)?;
         Ok(())
@@ -365,7 +383,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         )
         .await?;
         let mut statement = QueryBuilder::<Postgres>::new(
-            "select k.id, k.user_id, k.name, k.label,
+            "select k.id, k.user_id, k.name, k.label, k.provider_request_profiles_json as request_profile_overrides,
                     left(k.key, least(10, length(k.key) / 2)) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
                     k.updated_at, '[]'::jsonb as groups, '{}'::text[] as provider_kinds
@@ -428,7 +446,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
     async fn get_client_api_key(&self, id: &str) -> StoreResult<Option<ClientApiKeyRecord>> {
         require_nonempty(ENTITY, "id", id)?;
         let record = sqlx::query(
-            "select k.id, k.user_id, k.name, k.label,
+            "select k.id, k.user_id, k.name, k.label, k.provider_request_profiles_json as request_profile_overrides,
                     left(k.key, least(10, length(k.key) / 2)) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
                     k.updated_at, coalesce(groups.groups, '[]'::jsonb) as groups,
@@ -721,6 +739,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                         &NewClientApiKey {
                             id: key.id.as_str().to_owned(),
                             user_id: Some(user_id.to_owned()),
+                    request_profile_overrides: key.request_profile_overrides,
                             name: key.name,
                             label: key.label,
                             group_ids: key
@@ -792,6 +811,18 @@ impl ClientKeyStore for PgAdminClientKeyStore {
         admin_revision(result)
     }
 
+    async fn get_client_key(
+        &self,
+        id: &ClientApiKeyId,
+    ) -> AdminStoreResult<Option<AdminClientKeyRecord>> {
+        self.keys
+            .get_client_api_key(id.as_str())
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?
+            .map(admin_client_key_record)
+            .transpose()
+    }
+
     async fn list_client_keys(
         &self,
         query: AdminClientKeyListQuery,
@@ -841,6 +872,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .create_client_api_key(
                 NewClientApiKey {
                     user_id: command.user_id,
+                    request_profile_overrides: command.request_profile_overrides,
                     id: id.as_str().to_owned(),
                     name: command.name,
                     label: command.label,
@@ -869,6 +901,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                         "requests_per_minute",
                         "daily_limit_usd",
                         "weekly_limit_usd",
+                        "provider_request_profiles_json",
                     ]
                     .into_iter()
                     .map(str::to_owned)
@@ -890,6 +923,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .control_plane
             .update_client_api_key(
                 UpdateClientApiKeyDetails {
+                    request_profile_override_updates: command.request_profile_override_updates,
                     id: id.as_str().to_owned(),
                     name: command.name,
                     label: command.label,
@@ -916,6 +950,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                         "requests_per_minute",
                         "daily_limit_usd",
                         "weekly_limit_usd",
+                        "provider_request_profiles_json",
                     ]
                     .into_iter()
                     .map(str::to_owned)
@@ -1048,6 +1083,7 @@ fn admin_client_key_cursor(cursor: ClientApiKeyCursor) -> AdminStoreResult<Admin
 fn admin_client_key_record(record: ClientApiKeyRecord) -> AdminStoreResult<AdminClientKeyRecord> {
     Ok(AdminClientKeyRecord {
         user_id: record.user_id,
+        request_profile_overrides: record.request_profile_overrides,
         id: ClientApiKeyId::new(record.id)
             .map_err(|_| admin_store_error(ENTITY, invalid("invalid client key id")))?,
         name: record.name,
@@ -1095,12 +1131,13 @@ pub(crate) async fn insert_client_api_key_in_transaction(
 ) -> StoreResult<()> {
     key.validate()?;
     ensure_client_key_name_available(transaction, &key.id, key.name.trim()).await?;
+    let request_profile_overrides = encode_request_profiles(&key.request_profile_overrides);
     sqlx::query(
         "insert into client_api_keys (
            id, name, label, key, enabled, max_concurrency, requests_per_minute,
-           last_used_at, created_at, updated_at, daily_limit_usd, weekly_limit_usd, user_id
-         ) values ($1, $2, $3, $4, true, $5, $6, null, now(), now(), $7::text::numeric, $8::text::numeric,
-             coalesce($9,(select id from admin_users where role='admin' and deleted_at is null order by created_at,id limit 1)))",
+           last_used_at, created_at, updated_at, daily_limit_usd, weekly_limit_usd, provider_request_profiles_json, user_id
+         ) values ($1, $2, $3, $4, true, $5, $6, null, now(), now(), $7::text::numeric, $8::text::numeric, $9::jsonb,
+             coalesce($10,(select id from admin_users where role='admin' and deleted_at is null order by created_at,id limit 1)))",
     )
     .bind(&key.id)
     .bind(key.name.trim())
@@ -1110,6 +1147,7 @@ pub(crate) async fn insert_client_api_key_in_transaction(
     .bind(to_i64(key.requests_per_minute)?)
     .bind(key.budget.daily_usd.canonical())
     .bind(key.budget.weekly_usd.canonical())
+    .bind(sqlx::types::Json(request_profile_overrides))
     .bind(&key.user_id)
     .execute(&mut **transaction)
     .await
@@ -1137,12 +1175,31 @@ pub(crate) async fn update_client_api_key_in_transaction(
 ) -> StoreResult<()> {
     key.validate()?;
     ensure_client_key_name_available(transaction, &key.id, key.name.trim()).await?;
+    let removed_profiles = key
+        .request_profile_override_updates
+        .keys()
+        .map(|provider| provider.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let replacement_profiles = key
+        .request_profile_override_updates
+        .iter()
+        .filter_map(|(provider, profile)| {
+            profile.as_ref().map(|profile| {
+                (
+                    provider.as_str().to_owned(),
+                    profile.expose_to_provider().clone(),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
     let result = sqlx::query(
         "update client_api_keys
          set name = $2, label = $3, max_concurrency = $4,
              requests_per_minute = $5, updated_at = now(),
              daily_limit_usd = coalesce($6::text::numeric, daily_limit_usd),
-             weekly_limit_usd = coalesce($7::text::numeric, weekly_limit_usd)
+             weekly_limit_usd = coalesce($7::text::numeric, weekly_limit_usd),
+             provider_request_profiles_json = (provider_request_profiles_json - $8::text[])
+                 || $9::jsonb
          where id = $1",
     )
     .bind(&key.id)
@@ -1152,6 +1209,8 @@ pub(crate) async fn update_client_api_key_in_transaction(
     .bind(to_i64(key.requests_per_minute)?)
     .bind(key.daily_limit_usd.map(|amount| amount.canonical()))
     .bind(key.weekly_limit_usd.map(|amount| amount.canonical()))
+    .bind(removed_profiles)
+    .bind(sqlx::types::Json(replacement_profiles))
     .execute(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update client API key in transaction"))?;
@@ -1288,6 +1347,48 @@ fn validate_key(key: &str) -> StoreResult<()> {
         .map_err(|_| invalid("key must contain nonempty visible ASCII characters"))
 }
 
+fn validate_request_profiles<'a>(
+    profiles: impl IntoIterator<Item = &'a OpaqueProviderData>,
+) -> StoreResult<()> {
+    for (index, profile) in profiles.into_iter().enumerate() {
+        if index >= 256
+            || serde_json::to_vec(profile.expose_to_provider())
+                .map_or(true, |encoded| encoded.len() > 64 * 1024)
+        {
+            return Err(invalid("request profiles exceed the supported bounds"));
+        }
+    }
+    Ok(())
+}
+
+fn encode_request_profiles(
+    profiles: &BTreeMap<ProviderKind, OpaqueProviderData>,
+) -> BTreeMap<String, serde_json::Map<String, serde_json::Value>> {
+    profiles
+        .iter()
+        .map(|(provider, profile)| {
+            (
+                provider.as_str().to_owned(),
+                profile.expose_to_provider().clone(),
+            )
+        })
+        .collect()
+}
+
+fn decode_request_profiles(
+    profiles: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+) -> StoreResult<BTreeMap<ProviderKind, OpaqueProviderData>> {
+    profiles
+        .into_iter()
+        .map(|(provider, profile)| {
+            Ok((
+                ProviderKind::new(provider).map_err(|_| invalid("invalid request profile key"))?,
+                OpaqueProviderData::new(profile),
+            ))
+        })
+        .collect()
+}
+
 fn client_secret_from_row(
     row: (String, String, bool, i64, i64),
 ) -> StoreResult<ClientApiKeySecret> {
@@ -1305,42 +1406,52 @@ fn client_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ClientApiK
     let groups: serde_json::Value = row
         .try_get("groups")
         .map_err(|_| invalid("invalid groups"))?;
-    Ok(ClientApiKeyRecord {
-        user_id: row
-            .try_get("user_id")
-            .map_err(|_| invalid("missing key owner"))?,
-        id: row.try_get("id").map_err(|_| invalid("invalid id"))?,
-        name: row.try_get("name").map_err(|_| invalid("invalid name"))?,
-        label: row.try_get("label").map_err(|_| invalid("invalid label"))?,
-        groups: serde_json::from_value(groups).map_err(|_| invalid("invalid groups"))?,
-        provider_kinds: row
-            .try_get("provider_kinds")
-            .map_err(|_| invalid("invalid provider kinds"))?,
-        prefix: row
-            .try_get("prefix")
-            .map_err(|_| invalid("invalid prefix"))?,
-        enabled: row
-            .try_get("enabled")
-            .map_err(|_| invalid("invalid enabled"))?,
-        max_concurrency: to_u64(
-            row.try_get("max_concurrency")
-                .map_err(|_| invalid("invalid max concurrency"))?,
-        )?,
-        requests_per_minute: to_u64(
-            row.try_get("requests_per_minute")
-                .map_err(|_| invalid("invalid requests per minute"))?,
-        )?,
-        budget: ClientBudgetStatus::default(),
-        last_used_at: row
-            .try_get("last_used_at")
-            .map_err(|_| invalid("invalid last used at"))?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(|_| invalid("invalid created at"))?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(|_| invalid("invalid updated at"))?,
-    })
+    Ok(
+        ClientApiKeyRecord {
+            user_id: row
+                .try_get("user_id")
+                .map_err(|_| invalid("missing key owner"))?,
+            request_profile_overrides:
+                decode_request_profiles(
+                    row.try_get::<sqlx::types::Json<
+                        BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+                    >, _>("request_profile_overrides")
+                        .map_err(|_| invalid("invalid request profiles"))?
+                        .0,
+                )?,
+            id: row.try_get("id").map_err(|_| invalid("invalid id"))?,
+            name: row.try_get("name").map_err(|_| invalid("invalid name"))?,
+            label: row.try_get("label").map_err(|_| invalid("invalid label"))?,
+            groups: serde_json::from_value(groups).map_err(|_| invalid("invalid groups"))?,
+            provider_kinds: row
+                .try_get("provider_kinds")
+                .map_err(|_| invalid("invalid provider kinds"))?,
+            prefix: row
+                .try_get("prefix")
+                .map_err(|_| invalid("invalid prefix"))?,
+            enabled: row
+                .try_get("enabled")
+                .map_err(|_| invalid("invalid enabled"))?,
+            max_concurrency: to_u64(
+                row.try_get("max_concurrency")
+                    .map_err(|_| invalid("invalid max concurrency"))?,
+            )?,
+            requests_per_minute: to_u64(
+                row.try_get("requests_per_minute")
+                    .map_err(|_| invalid("invalid requests per minute"))?,
+            )?,
+            budget: ClientBudgetStatus::default(),
+            last_used_at: row
+                .try_get("last_used_at")
+                .map_err(|_| invalid("invalid last used at"))?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|_| invalid("invalid created at"))?,
+            updated_at: row
+                .try_get("updated_at")
+                .map_err(|_| invalid("invalid updated at"))?,
+        },
+    )
 }
 
 async fn count_client_api_keys(

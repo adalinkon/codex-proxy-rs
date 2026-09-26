@@ -29,6 +29,16 @@ fn login_request_should_deny_unknown_fields_and_redact_password_debug() {
 }
 
 #[test]
+fn browser_login_rejects_key_credentials() {
+    for body in [
+        json!({"mode":"key","key":"test-key"}),
+        json!({"key":"test-key"}),
+    ] {
+        assert!(serde_json::from_value::<AdminLoginRequest>(body).is_err());
+    }
+}
+
+#[test]
 fn auth_responses_should_keep_stable_wire_shapes() {
     assert_eq!(
         serde_json::to_value(AdminLoginData::new("2026-07-18T08:00:00+08:00".to_owned()))

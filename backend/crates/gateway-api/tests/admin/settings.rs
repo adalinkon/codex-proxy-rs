@@ -37,6 +37,8 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 fn update_body() -> Value {
     json!({
+        "requestLocationEnabled": false,
+        "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
         "modelMappings": {
             "gpt-5.4": "gpt-5.5",
             "grok-latest": "grok-4.5"
@@ -45,12 +47,26 @@ fn update_body() -> Value {
         "refreshConcurrency": 4,
         "maxConcurrentPerAccount": 5,
         "requestIntervalMs": 25,
+        "maxWaitingPerKey": 0,
+        "maxWaitingPerAccount": 0,
+        "concurrencyWaitTimeoutSeconds": 30,
+        "responsesMaxDecompressedBodyBytes": 67108864,
         "rotationStrategy": "round_robin",
         "minCodexDesktopVersion": "26.825.6671",
         "minCodexCliVersion": "0.40.0",
         "usageRetentionDays": 32,
         "opsEventRetentionDays": 31,
-        "auditRetentionDays": 91
+        "auditRetentionDays": 91,
+        "accountAutoFreezeEnabled": true,
+        "accountAutoFreezeThreshold": 12,
+        "accountAutoFreezeWindowSeconds": 600,
+        "accountAutoFreezeDurationSeconds": 7200,
+        "accountAutoFreezeProbeEnabled": true,
+        "accountAutoFreezeProbeModel": null,
+        "accountAutoFreezeAdaptiveConcurrency": true,
+        "accountWarmupEnabled": false,
+        "accountWarmupScheduleTime": "08:00",
+        "accountWarmupModel": null
     })
 }
 
@@ -62,6 +78,28 @@ fn settings_request_should_reject_unknown_rotation_strategy() {
         serde_json::from_value(body).expect("decode settings");
 
     assert_eq!(request.validate().unwrap_err().field(), "rotationStrategy");
+}
+
+#[test]
+fn settings_request_accepts_unlimited_default_account_concurrency() {
+    let mut body = update_body();
+    body["maxConcurrentPerAccount"] = json!(0);
+    let request: UpdateRuntimeSettingsRequest =
+        serde_json::from_value(body).expect("decode settings");
+    request.validate().expect("zero means unlimited");
+}
+
+#[test]
+fn settings_request_requires_model_when_warmup_is_enabled() {
+    let mut body = update_body();
+    body["accountWarmupEnabled"] = json!(true);
+    let request: UpdateRuntimeSettingsRequest =
+        serde_json::from_value(body).expect("decode settings");
+
+    assert_eq!(
+        request.validate().unwrap_err().field(),
+        "accountWarmupModel"
+    );
 }
 
 #[test]
@@ -89,6 +127,9 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     use gateway_core::routing::{PublicModelId, UpstreamModelId};
 
     let settings = RuntimeSettings {
+        request_profiles: Default::default(),
+        request_location_enabled: false,
+        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: BTreeMap::from_iter([
             (
@@ -104,12 +145,26 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
         refresh_concurrency: 4,
         max_concurrent_per_account: 5,
         request_interval_ms: 25,
+        max_waiting_per_key: 0,
+        max_waiting_per_account: 0,
+        concurrency_wait_timeout_seconds: 30,
+        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::RoundRobin,
         min_codex_desktop_version: Some("26.825.6671".to_owned()),
         min_codex_cli_version: Some("0.40.0".to_owned()),
         usage_retention_days: 32,
         ops_event_retention_days: 31,
         audit_retention_days: 91,
+        account_auto_freeze_enabled: true,
+        account_auto_freeze_threshold: 12,
+        account_auto_freeze_window_seconds: 600,
+        account_auto_freeze_duration_seconds: 7_200,
+        account_auto_freeze_probe_enabled: true,
+        account_auto_freeze_probe_model: None,
+        account_auto_freeze_adaptive_concurrency: true,
+        account_warmup_enabled: false,
+        account_warmup_schedule_time: "08:00".to_owned(),
+        account_warmup_model: None,
         updated_at: Utc
             .with_ymd_and_hms(2026, 8, 2, 10, 30, 0)
             .single()
@@ -120,6 +175,11 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     assert_eq!(
         value,
         json!({
+            "providerRequestProfiles": {},
+            "openaiClientProfile": null,
+            "xaiClientProfile": null,
+        "requestLocationEnabled": false,
+        "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
             "modelMappings": {
                 "gpt-5.4": "gpt-5.5",
                 "grok-latest": "grok-4.5"
@@ -128,13 +188,27 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "refreshConcurrency": 4,
             "maxConcurrentPerAccount": 5,
             "requestIntervalMs": 25,
+            "maxWaitingPerKey": 0,
+            "maxWaitingPerAccount": 0,
+            "concurrencyWaitTimeoutSeconds": 30,
+            "responsesMaxDecompressedBodyBytes": 67108864,
             "rotationStrategy": "round_robin",
             "minCodexDesktopVersion": "26.825.6671",
             "minCodexCliVersion": "0.40.0",
             "usageRetentionDays": 32,
             "opsEventRetentionDays": 31,
             "auditRetentionDays": 91,
-            "updatedAt": "2026-08-02T10:30:00Z"
+            "accountAutoFreezeEnabled": true,
+            "accountAutoFreezeThreshold": 12,
+            "accountAutoFreezeWindowSeconds": 600,
+            "accountAutoFreezeDurationSeconds": 7200,
+                "accountAutoFreezeProbeEnabled": true,
+                "accountAutoFreezeProbeModel": null,
+                "accountAutoFreezeAdaptiveConcurrency": true,
+                "accountWarmupEnabled": false,
+                "accountWarmupScheduleTime": "08:00",
+                "accountWarmupModel": null,
+                "updatedAt": "2026-08-02T10:30:00Z"
         })
     );
 }
@@ -160,6 +234,9 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         .cloned()
         .collect();
     let settings = RuntimeSettings {
+        request_profiles: Default::default(),
+        request_location_enabled: false,
+        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: request
             .model_mappings
@@ -176,6 +253,10 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         refresh_concurrency: u32::try_from(request.refresh_concurrency).expect("u32"),
         max_concurrent_per_account: u32::try_from(request.max_concurrent_per_account).expect("u32"),
         request_interval_ms: request.request_interval_ms,
+        max_waiting_per_key: 0,
+        max_waiting_per_account: 0,
+        concurrency_wait_timeout_seconds: 30,
+        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::parse(&request.rotation_strategy)
             .expect("fixture rotation strategy"),
         min_codex_desktop_version: request.min_codex_desktop_version,
@@ -183,6 +264,16 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         usage_retention_days: u32::try_from(request.usage_retention_days).expect("u32"),
         ops_event_retention_days: u32::try_from(request.ops_event_retention_days).expect("u32"),
         audit_retention_days: u32::try_from(request.audit_retention_days).expect("u32"),
+        account_auto_freeze_enabled: true,
+        account_auto_freeze_threshold: 12,
+        account_auto_freeze_window_seconds: 600,
+        account_auto_freeze_duration_seconds: 7_200,
+        account_auto_freeze_probe_enabled: true,
+        account_auto_freeze_probe_model: None,
+        account_auto_freeze_adaptive_concurrency: true,
+        account_warmup_enabled: false,
+        account_warmup_schedule_time: "08:00".to_owned(),
+        account_warmup_model: None,
         updated_at: chrono::Utc::now(),
     };
 
@@ -195,6 +286,9 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
             .cloned()
             .collect();
     let mut expected_fields = request_fields;
+    expected_fields.insert("providerRequestProfiles".to_owned());
+    expected_fields.insert("openaiClientProfile".to_owned());
+    expected_fields.insert("xaiClientProfile".to_owned());
     expected_fields.insert("updatedAt".to_owned());
 
     assert_eq!(response_fields, expected_fields);
@@ -386,4 +480,662 @@ async fn admin_auth_should_accept_a_configured_request_id_header_name() {
     let response = app.oneshot(unlabelled).await.expect("settings response");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn concurrency_queue_fields_validate_bounds_and_accept_disabled_queues() {
+    for (field, invalid) in [
+        ("maxWaitingPerKey", 1001),
+        ("maxWaitingPerAccount", 1001),
+        ("concurrencyWaitTimeoutSeconds", 0),
+        ("concurrencyWaitTimeoutSeconds", 121),
+    ] {
+        let mut body = update_body();
+        body[field] = json!(invalid);
+        let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(request.validate().unwrap_err().field(), field);
+    }
+    let mut body = update_body();
+    body["maxWaitingPerKey"] = json!(0);
+    body["maxWaitingPerAccount"] = json!(1000);
+    body["concurrencyWaitTimeoutSeconds"] = json!(120);
+    serde_json::from_value::<UpdateRuntimeSettingsRequest>(body)
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn request_location_should_normalize_toggle_and_round_trip() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let mut body = update_body();
+    body["requestLocationEnabled"] = json!(true);
+    body["requestLocation"] =
+        json!({"country":"JP", "region":" Tokyo ", "city":" Tokyo ", "timezone":"Asia/Tokyo"});
+    let expected =
+        json!({"country":"JP", "region":"Tokyo", "city":"Tokyo", "timezone":"Asia/Tokyo"});
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["data"]["requestLocation"],
+        expected
+    );
+    let response = app(fixture.state())
+        .oneshot(request(Method::GET, "/api/admin/settings", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(response).await["data"]["requestLocation"],
+        expected
+    );
+    for enabled in [false, true] {
+        let mut body = update_body();
+        body["requestLocationEnabled"] = json!(enabled);
+        body["requestLocation"] = expected.clone();
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app(fixture.state())
+            .oneshot(request(Method::GET, "/api/admin/settings", None))
+            .await
+            .unwrap();
+        let data = response_json(response).await["data"].clone();
+        assert_eq!(data["requestLocationEnabled"], json!(enabled));
+        assert_eq!(data["requestLocation"], expected);
+    }
+}
+
+#[tokio::test]
+async fn request_location_should_reject_invalid_or_missing_fields_without_replacing_settings() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let original = update_body()["requestLocation"].clone();
+    // JSON 结构或时区解析失败由 Axum 返回 422，业务校验失败返回 400。
+    let mut invalid = vec![
+        (Value::Null, StatusCode::UNPROCESSABLE_ENTITY),
+        (json!({}), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            json!({"timezone":"Asia/Tokyo"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ];
+    for (field, value, status) in [
+        ("country", "USA", StatusCode::BAD_REQUEST),
+        ("country", "us", StatusCode::BAD_REQUEST),
+        ("city", "", StatusCode::BAD_REQUEST),
+        ("region", "\nTokyo", StatusCode::BAD_REQUEST),
+        (
+            "timezone",
+            "Not/A_Timezone",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let mut location = original.clone();
+        location[field] = json!(value);
+        invalid.push((location, status));
+    }
+    for (location, expected_status) in invalid {
+        let mut body = update_body();
+        body["requestLocation"] = location;
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+    }
+    let mut body = update_body();
+    body.as_object_mut().unwrap().remove("requestLocation");
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = app(fixture.state())
+        .oneshot(request(Method::GET, "/api/admin/settings", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(response).await["data"]["requestLocation"],
+        original
+    );
+}
+
+#[test]
+fn decompression_setting_should_reject_invalid_values() {
+    let field = "responsesMaxDecompressedBodyBytes";
+    for invalid in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(u64::MAX),
+        Value::Null,
+    ] {
+        let mut body = update_body();
+        body[field] = invalid;
+        if let Ok(request) = serde_json::from_value::<UpdateRuntimeSettingsRequest>(body) {
+            assert_eq!(request.validate().unwrap_err().field(), field);
+        }
+    }
+    let mut body = update_body();
+    body.as_object_mut().unwrap().remove(field);
+    assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body).is_err());
+}
+
+#[tokio::test]
+async fn settings_reject_removed_global_fast_policy() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    let initial = fixture.settings.settings.lock().unwrap().clone();
+    for value in [json!(true), json!(false), Value::Null] {
+        let mut body = update_body();
+        body["disableFast"] = value;
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(*fixture.settings.settings.lock().unwrap(), initial);
+    }
+    let response = app
+        .oneshot(request(Method::GET, "/api/admin/settings", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response_json(response).await["data"]
+            .get("disableFast")
+            .is_none()
+    );
+}
+
+#[test]
+fn global_profile_can_be_omitted_but_cannot_be_cleared() {
+    for field in ["openaiClientProfile", "xaiClientProfile"] {
+        let mut body = update_body();
+        body.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body.clone()).is_ok());
+        body[field] = json!(null);
+        assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body.clone()).is_err());
+        body[field] = json!({"versionMode":"latest"});
+        assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn generic_global_profiles_decode_native_providers_and_reject_legacy_conflicts() {
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "openai":{"preset":"desktop"},
+        "xai":{"preset":"managed"},
+    });
+    body["openaiClientProfile"] = json!({"preset":"desktop"});
+    let decoded = serde_json::from_value::<UpdateRuntimeSettingsRequest>(body.clone()).unwrap();
+    assert!(decoded.provider_request_profiles.contains_key("xai"));
+
+    body["openaiClientProfile"] = json!({"preset":"cli"});
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn settings_update_rejects_a_new_unknown_profile() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "plugin.unknown":{"preset":"new"}
+    });
+
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body.clone()),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    body["providerRequestProfiles"] = json!({"plugin.unknown":null});
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+fn custom_pricing() -> Value {
+    json!({"multiplierBps":12500,"bands":{"standard":{"input":"3","output":"12","cacheRead":"0","cacheWrite":"0"}}})
+}
+
+#[tokio::test]
+async fn pricing_routes_keep_manual_overrides_during_sync_and_reset_to_source() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    let response = app.clone().oneshot(request(Method::POST, "/api/admin/settings/pricing/update", Some(json!({
+        "provider":"openai", "models":["gpt-5.4"], "change":{"action":"replace", "pricing":custom_pricing()}
+    })))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let preview = response_json(
+        app.clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/pricing/sync/preview",
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let approved = preview["data"].clone();
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/sync",
+            Some(json!({"preview": approved, "models": {"openai": ["gpt-5.4"]}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = response_json(
+        app.clone()
+            .oneshot(request(Method::GET, "/api/admin/settings/pricing", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        result["data"]["overrides"]["openai"]["gpt-5.4"],
+        custom_pricing()
+    );
+    assert_eq!(
+        result["data"]["synced"]["openai"]["gpt-5.4"]["bands"]["standard"]["input"],
+        "2.5"
+    );
+    assert!(result["data"]["syncedAt"].is_string());
+    for _ in 0..2 {
+        let response = app.clone().oneshot(request(Method::POST, "/api/admin/settings/pricing/update", Some(json!({
+            "provider":"openai", "models":["gpt-5.4"], "change":{"action":"multiplier", "multiplierBps":20000}
+        })))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let result = response_json(
+        app.clone()
+            .oneshot(request(Method::GET, "/api/admin/settings/pricing", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        result["data"]["overrides"]["openai"]["gpt-5.4"]["multiplierBps"],
+        20000
+    );
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/update",
+            Some(json!({
+                "provider":"openai", "models":["gpt-5.4"], "change":{"action":"reset"}
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = response_json(
+        app.oneshot(request(Method::GET, "/api/admin/settings/pricing", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(result["data"]["overrides"]["openai"]["gpt-5.4"].is_null());
+    assert!(result["data"]["synced"]["openai"]["gpt-5.4"].is_object());
+}
+
+#[tokio::test]
+async fn pricing_delete_rejects_builtin_models_even_with_overrides_without_partial_writes() {
+    for overridden in [false, true] {
+        let fixture = AdminTestFixture::new().await;
+        fixture.auth.insert_session("valid-session");
+        let app = app(fixture.state());
+        {
+            let mut stored = fixture.settings.pricing.lock().unwrap();
+            stored.synced = serde_json::from_value(json!({
+                "openai": {"builtin-model": custom_pricing(), "custom-model": custom_pricing()}
+            }))
+            .unwrap();
+            if overridden {
+                stored.overrides = stored.synced.clone();
+            }
+        }
+        let before = fixture.settings.pricing.lock().unwrap().clone();
+        let revision = fixture.settings.settings.lock().unwrap().config_revision;
+        for models in [
+            json!(["builtin-model"]),
+            json!(["custom-model", "builtin-model"]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/api/admin/settings/pricing/update",
+                    Some(
+                        json!({"provider":"openai", "models":models, "change":{"action":"delete"}}),
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(*fixture.settings.pricing.lock().unwrap(), before);
+            assert_eq!(
+                fixture.settings.settings.lock().unwrap().config_revision,
+                revision
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pricing_delete_removes_selected_nonbuiltin_models_from_both_layers() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    {
+        let mut stored = fixture.settings.pricing.lock().unwrap();
+        stored.synced = serde_json::from_value(json!({
+            "openai": {"shared":custom_pricing(), "synced-only":custom_pricing(), "untouched":custom_pricing()},
+            "xai": {"shared":custom_pricing()}
+        })).unwrap();
+        stored.overrides = serde_json::from_value(json!({
+            "openai": {"shared":custom_pricing(), "custom-only":custom_pricing(), "untouched":custom_pricing()},
+            "xai": {"shared":custom_pricing()}
+        })).unwrap();
+    }
+    for _ in 0..2 {
+        let response = app.clone().oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/update",
+            Some(json!({
+                "provider":"openai", "models":["shared", "synced-only", "custom-only"], "change":{"action":"delete"}
+            })),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let result = response_json(
+        app.oneshot(request(Method::GET, "/api/admin/settings/pricing", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let expected =
+        json!({"openai":{"untouched":custom_pricing()},"xai":{"shared":custom_pricing()}});
+    assert_eq!(result["data"]["overrides"], expected);
+    assert_eq!(result["data"]["synced"], expected);
+    assert!(result["data"]["defaults"]["openai"]["builtin-model"].is_object());
+}
+
+#[tokio::test]
+async fn pricing_rejects_invalid_edits_and_tampered_sync_without_writes() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    for body in [
+        json!({"provider":"unknown","models":["model"],"change":{"action":"reset"}}),
+        json!({"provider":"openai","models":[],"change":{"action":"reset"}}),
+        json!({"provider":"openai","models":["bad model"],"change":{"action":"reset"}}),
+        json!({"provider":"openai","models":["model"],"change":{"action":"multiplier","multiplierBps":1_000_001}}),
+        json!({"provider":"openai","models":["model"],"change":{"action":"replace","pricing":{"multiplierBps":10000,"bands":{}}}}),
+    ] {
+        let scenario = body.to_string();
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/pricing/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{scenario}");
+    }
+    // JSON 合同错误沿用 AdminJson 的 422，业务校验错误为 400。
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/update",
+            Some(json!({
+                "provider":"openai","models":["model"],"change":{"action":"reset","extra":true}
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/sync",
+            Some(json!({"preview":{"prices":{},"skipped":[]},"models":{"openai":["gpt-5.4"]}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let result = response_json(
+        app.oneshot(request(Method::GET, "/api/admin/settings/pricing", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(result["data"]["overrides"], json!({}));
+    assert_eq!(result["data"]["synced"], json!({}));
+}
+
+#[tokio::test]
+async fn pricing_sync_only_updates_selected_provider_models() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let old = custom_pricing();
+    {
+        let mut pricing = fixture.settings.pricing.lock().unwrap();
+        pricing.synced = serde_json::from_value(json!({
+            "openai": {"gpt-5.4": old, "untouched": old},
+            "xai": {"gpt-5.4": old}
+        }))
+        .unwrap();
+        pricing.overrides = serde_json::from_value(json!({"openai": {"gpt-5.4": old}})).unwrap();
+    }
+    let app = app(fixture.state());
+    let preview = response_json(
+        app.clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/pricing/sync/preview",
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/sync",
+            Some(json!({"preview": preview["data"], "models": {"openai": ["gpt-5.4"]}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let pricing = fixture.settings.pricing.lock().unwrap();
+    assert_eq!(
+        serde_json::to_value(&pricing.synced).unwrap(),
+        json!({
+            "openai": {"gpt-5.4": preview["data"]["prices"]["openai"]["gpt-5.4"], "untouched": old},
+            "xai": {"gpt-5.4": old}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&pricing.overrides).unwrap(),
+        json!({"openai": {"gpt-5.4": old}})
+    );
+}
+
+#[tokio::test]
+async fn pricing_sync_removes_only_selected_retired_source_prices() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    {
+        let mut pricing = fixture.settings.pricing.lock().unwrap();
+        pricing.synced = serde_json::from_value(json!({
+            "openai": {"retired": custom_pricing(), "untouched": custom_pricing()}
+        }))
+        .unwrap();
+    }
+    let app = app(fixture.state());
+    let preview = response_json(
+        app.clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/pricing/sync/preview",
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/pricing/sync",
+            Some(json!({"preview": preview["data"], "models": {"openai": ["retired"]}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let pricing = fixture.settings.pricing.lock().unwrap();
+    assert_eq!(
+        serde_json::to_value(&pricing.synced).unwrap(),
+        json!({
+            "openai": {"untouched": custom_pricing()}
+        })
+    );
+}
+
+#[tokio::test]
+async fn pricing_sync_rejects_empty_unknown_or_oversized_selections_without_writes() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    let preview = response_json(
+        app.clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/pricing/sync/preview",
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    for models in [
+        json!({}),
+        json!({"openai": []}),
+        json!({"unknown": ["gpt-5.4"]}),
+        json!({"openai": ["gpt-5.4", "missing"]}),
+        json!({"openai": ["gpt-5.4"], "xai": []}),
+        json!({"openai": (0..10_001).map(|index| format!("model-{index}")).collect::<Vec<_>>()}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/pricing/sync",
+                Some(json!({"preview": preview["data"], "models": models})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let pricing = fixture.settings.pricing.lock().unwrap();
+    assert_eq!(
+        *pricing,
+        gateway_admin::model::pricing::StoredPricing::default()
+    );
+}
+
+#[tokio::test]
+async fn pricing_endpoints_require_administrator_authentication() {
+    let fixture = AdminTestFixture::new().await;
+    let app = app(fixture.state());
+    for (method, path, body) in [
+        (Method::GET, "/api/admin/settings/pricing", None),
+        (
+            Method::POST,
+            "/api/admin/settings/pricing/update",
+            Some(json!({"provider":"openai","models":["model"],"change":{"action":"reset"}})),
+        ),
+        (
+            Method::POST,
+            "/api/admin/settings/pricing/sync/preview",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/admin/settings/pricing/sync",
+            Some(json!({"preview":{"prices":{},"skipped":[]},"models":{"openai":["gpt-5.4"]}})),
+        ),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(request(method, path, body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 }

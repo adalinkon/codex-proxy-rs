@@ -18,16 +18,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::StreamExt as _;
 use gateway_core::account::{
     AccountErrorReason, AccountQuotaSignals, CredentialRevision, CredentialState,
     OpaqueProviderData, ProviderAccount, ProviderAccountId, ProviderAccountStore,
     QuotaAccessChange, QuotaAccessState, QuotaEvidence, QuotaObservation, QuotaObservationTouch,
     QuotaState, QuotaWriteOutcome,
 };
-use gateway_core::provider_ports::{ProviderCooldown, ProviderCooldownPort};
+use gateway_core::provider_ports::{
+    ProviderCooldown, ProviderCooldownKind, ProviderCooldownPort, ProviderFreezePolicy,
+    ProviderLeasePort, ProviderRuntimePolicyPort,
+};
 use gateway_protocol::openai::events::{
     ParsedRateLimits, RateLimitDetails, RateLimitWindow, parse_rate_limit_headers,
 };
+use gateway_protocol::openai::sse::{SseEvent, SseEventDecoder};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
@@ -36,9 +41,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::transport::profile::CodexWireProfileState;
+use crate::transport::protocol::responses::CodexResponsesRequest;
 use crate::transport::{
-    CodexBackendClient, CodexClientError, CodexRateLimitResetCredits,
-    CodexRateLimitResetCreditsConsumeResult, CodexRequestContext,
+    CodexBackendClient, CodexBackendStreamingResponse, CodexClientError,
+    CodexRateLimitResetCredits, CodexRateLimitResetCreditsConsumeResult, CodexRequestContext,
 };
 
 use super::repository::{CodexCredentialRepository, CredentialRepositoryError};
@@ -57,13 +63,15 @@ use snapshot::{
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 pub(crate) const QUOTA_SCHEDULING_TTL: Duration = Duration::from_secs(10 * 60);
 const QUOTA_HYDRATION_FAILURE_TTL: Duration = Duration::from_secs(5);
-const EXHAUSTED_QUOTA_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
-const EXHAUSTED_QUOTA_RESET_GRACE: Duration = Duration::from_secs(2 * 60);
+const PERIODIC_QUOTA_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const QUOTA_RESET_GRACE: Duration = Duration::from_secs(2 * 60);
 /// 首次 OAuth 异步观察失败时，由既有 quota worker 兜底重试的单轮上限。
 const INITIAL_QUOTA_SYNC_BATCH: usize = 100;
 // 5xx 上游拒绝的短退避重试预算；指数退避 1s/2s，吞掉瞬时抖动。
 const QUOTA_FETCH_5XX_MAX_RETRIES: u32 = 2;
 const QUOTA_FETCH_5XX_BASE_DELAY: Duration = Duration::from_secs(1);
+const WARMUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const WARMUP_STREAM_MAX_BYTES: usize = 256 * 1024;
 
 /// OpenAI Provider 主动额度刷新的调度策略。
 ///
@@ -100,6 +108,82 @@ impl CodexQuotaSyncSummary {
     #[must_use]
     pub const fn has_operational_failures(self) -> bool {
         self.transient > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodexWarmupSummary {
+    pub warmed_up: u64,
+    pub skipped_active: u64,
+    pub skipped_exhausted: u64,
+    pub failed: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarmupTerminal {
+    Missing,
+    Completed,
+    Failed,
+}
+
+fn observe_warmup_events(events: Vec<SseEvent>, terminal: &mut WarmupTerminal) {
+    for event in events {
+        let parsed = serde_json::from_str::<Value>(&event.data).ok();
+        let kind = parsed
+            .as_ref()
+            .and_then(|data| data.get("type"))
+            .and_then(Value::as_str)
+            .or(event.event.as_deref());
+        match kind {
+            Some("response.completed") => {
+                // 只有明确完成的响应才算预热成功；失败事件即使随后出现完成帧也优先。
+                if *terminal != WarmupTerminal::Failed {
+                    *terminal = if parsed.is_some()
+                        && parsed
+                            .as_ref()
+                            .and_then(|data| data.pointer("/response/status"))
+                            .and_then(Value::as_str)
+                            .is_none_or(|status| status == "completed")
+                    {
+                        WarmupTerminal::Completed
+                    } else {
+                        WarmupTerminal::Failed
+                    };
+                }
+            }
+            Some("response.failed" | "response.incomplete" | "error") => {
+                *terminal = WarmupTerminal::Failed;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn consume_warmup_sse(
+    response: &mut CodexBackendStreamingResponse,
+) -> Result<(), &'static str> {
+    let mut decoder = SseEventDecoder::default();
+    let mut terminal = WarmupTerminal::Missing;
+    let mut received_bytes = 0usize;
+    while let Some(chunk) = response.body.next().await {
+        let chunk = chunk.map_err(|_| "stream_read_failed")?;
+        received_bytes = received_bytes.saturating_add(chunk.len());
+        if received_bytes > WARMUP_STREAM_MAX_BYTES {
+            return Err("stream_size_limit_exceeded");
+        }
+        let events = decoder.push(&chunk).map_err(|_| "invalid_sse")?;
+        observe_warmup_events(events, &mut terminal);
+        if terminal != WarmupTerminal::Missing {
+            break;
+        }
+    }
+    if terminal == WarmupTerminal::Missing {
+        observe_warmup_events(decoder.finish().map_err(|_| "invalid_sse")?, &mut terminal);
+    }
+    match terminal {
+        WarmupTerminal::Completed => Ok(()),
+        WarmupTerminal::Missing => Err("completion_event_missing"),
+        WarmupTerminal::Failed => Err("response_failed"),
     }
 }
 
@@ -184,9 +268,16 @@ pub struct CodexCredentialQuotaService {
     http: Client,
     base_url: String,
     cooldowns: Arc<dyn ProviderCooldownPort>,
+    leases: Arc<dyn ProviderLeasePort>,
+    runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
+    /// 冻结策略的短 TTL 缓存：失败路径热读，避免每个容量错误都查询设置。
+    freeze_policy_cache: Mutex<Option<(ProviderFreezePolicy, Instant)>>,
     scheduling: CodexQuotaSchedulingProjection,
     reset_consume_locks: Mutex<HashMap<ProviderAccountId, Arc<Mutex<()>>>>,
 }
+
+/// 冻结策略缓存活跃期；过期后下一次容量错误重新读取运行时设置。
+const FREEZE_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuotaRefreshAuthority {
@@ -384,15 +475,19 @@ impl CodexQuotaSchedulingProjection {
     fn reserve_periodic_refreshes(
         &self,
         accounts: Vec<ProviderAccount>,
+        observed_snapshots: &BTreeMap<ProviderAccountId, CodexAccountQuotaSnapshot>,
         now: SystemTime,
     ) -> Vec<ProviderAccount> {
         let candidates = accounts
             .into_iter()
-            .filter_map(|account| quota_refresh_candidate(account, now))
+            .filter_map(|account| {
+                let snapshot = observed_snapshots.get(account.id());
+                quota_refresh_candidate(account, snapshot, now)
+            })
             .collect::<Vec<_>>();
         let candidate_ids = candidates
             .iter()
-            .map(|account| account.id().clone())
+            .map(|(account, _)| account.id().clone())
             .collect::<BTreeSet<_>>();
         let refreshed_at = Instant::now();
         let mut state = self
@@ -403,18 +498,12 @@ impl CodexQuotaSchedulingProjection {
             .last_periodic_refresh_at
             .retain(|account_id, _| candidate_ids.contains(account_id));
 
-        // 正常账号只由真实请求的响应头和 `codex.rate_limits` 被动同步。
-        // 已耗尽账号每 30 分钟复核，不能等待旧 reset：官方活动可能提前重置额度。
-        // reset + 2 分钟可提前触发一次复核，给上游重置留出传播时间。
+        // 已耗尽账号首次立即复核，之后每 30 分钟复核，以发现官方提前重置。
+        // reset + 2 分钟额外触发一次复核，给上游重置留出传播时间。
+        // 正常账号仅在非零用量窗口经过宽限期后参与，未更新时复用周期节流。
         let mut reserved = Vec::new();
-        for account in candidates {
-            if !periodic_quota_refresh_due(
-                &state,
-                account.id(),
-                account.quota().reset_at(),
-                now,
-                refreshed_at,
-            ) {
+        for (account, target_reset) in candidates {
+            if !periodic_quota_refresh_due(&state, account.id(), target_reset, now, refreshed_at) {
                 continue;
             }
             state.last_periodic_refresh_at.insert(
@@ -430,9 +519,35 @@ impl CodexQuotaSchedulingProjection {
     }
 }
 
-fn quota_refresh_candidate(account: ProviderAccount, now: SystemTime) -> Option<ProviderAccount> {
-    (eligible_periodic_quota_refresh(&account, now) && account.quota().is_exhausted())
-        .then_some(account)
+fn quota_refresh_candidate(
+    account: ProviderAccount,
+    snapshot: Option<&CodexAccountQuotaSnapshot>,
+    now: SystemTime,
+) -> Option<(ProviderAccount, Option<SystemTime>)> {
+    if !eligible_periodic_quota_refresh(&account, now) {
+        return None;
+    }
+    if account.quota().is_exhausted() {
+        let reset_at = account.quota().reset_at();
+        return Some((account, reset_at));
+    }
+    // 正常账号首次进入周期候选也要等待宽限期，不能由“无刷新历史”绕过。
+    let snapshot = snapshot?;
+    let expired_window_reset = snapshot
+        .windows()
+        .iter()
+        .filter(|window| {
+            window.used_percent().is_some_and(|used| used > 0.0) || window.limit_reached()
+        })
+        .filter_map(CodexQuotaWindow::reset_at)
+        .map(SystemTime::from)
+        .filter(|reset| {
+            reset
+                .checked_add(QUOTA_RESET_GRACE)
+                .is_some_and(|due_at| due_at <= now)
+        })
+        .min();
+    expired_window_reset.map(|reset_at| (account, Some(reset_at)))
 }
 
 fn periodic_quota_refresh_due(
@@ -447,9 +562,9 @@ fn periodic_quota_refresh_due(
         .get(account_id)
         .is_none_or(|last| {
             monotonic_now.saturating_duration_since(last.monotonic_at)
-                >= EXHAUSTED_QUOTA_REFRESH_RETRY_INTERVAL
+                >= PERIODIC_QUOTA_REFRESH_RETRY_INTERVAL
                 || reset_at
-                    .and_then(|reset| reset.checked_add(EXHAUSTED_QUOTA_RESET_GRACE))
+                    .and_then(|reset| reset.checked_add(QUOTA_RESET_GRACE))
                     // 已在该边界之后复核过时回到周期重试，避免过期 reset 每轮触发。
                     .is_some_and(|due_at| last.wall_at < due_at && due_at <= now)
         })
@@ -481,6 +596,8 @@ impl CodexCredentialQuotaService {
         http: Client,
         base_url: String,
         cooldowns: Arc<dyn ProviderCooldownPort>,
+        leases: Arc<dyn ProviderLeasePort>,
+        runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
     ) -> Self {
         Self {
             store: Arc::clone(repository.store()),
@@ -489,9 +606,87 @@ impl CodexCredentialQuotaService {
             http,
             base_url,
             cooldowns,
+            leases,
+            runtime_policy,
+            freeze_policy_cache: Mutex::new(None),
             scheduling: CodexQuotaSchedulingProjection::default(),
             reset_consume_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 读取容量熔断策略（带短 TTL 缓存）；读取失败退化为关闭，熔断不得放大失败。
+    async fn freeze_policy(&self) -> ProviderFreezePolicy {
+        {
+            let cache = self.freeze_policy_cache.lock().await;
+            if let Some((policy, loaded_at)) = cache.as_ref()
+                && loaded_at.elapsed() < FREEZE_POLICY_CACHE_TTL
+            {
+                return policy.clone();
+            }
+        }
+        let loaded = self.runtime_policy.load_freeze_policy().await.ok();
+        let mut cache = self.freeze_policy_cache.lock().await;
+        if let Some(policy) = loaded {
+            *cache = Some((policy.clone(), Instant::now()));
+            return policy;
+        }
+        cache
+            .as_ref()
+            .filter(|(_, loaded_at)| loaded_at.elapsed() < FREEZE_POLICY_CACHE_TTL)
+            .map_or_else(ProviderFreezePolicy::disabled, |(policy, _)| policy.clone())
+    }
+
+    /// 容量熔断入口：滑动窗口内累计容量类失败，达到阈值即写入带
+    /// `CapacityFreeze` 类别的账号级冷却。调度侧立即屏蔽该账号，恢复由
+    /// freeze-recovery worker 处理；本路径只依赖 Redis 可丢失事实。
+    pub async fn apply_capacity_failure(&self, account: &ProviderAccount, observed_at: SystemTime) {
+        let policy = self.freeze_policy().await;
+        if !policy.enabled() {
+            return;
+        }
+        let in_flight = self.current_in_flight(account.id()).await;
+        let Ok(count) = self
+            .cooldowns
+            .record_capacity_failure(account.id(), policy.window(), in_flight)
+            .await
+        else {
+            return;
+        };
+        if count < policy.threshold() {
+            return;
+        }
+        let Some(until) = observed_at.checked_add(policy.freeze_duration()) else {
+            return;
+        };
+        let cooldown = ProviderCooldown::new_with_kind(
+            account.id().clone(),
+            account.revision(),
+            until,
+            if policy.probe_enabled() {
+                ProviderCooldownKind::CapacityFreezeProbe
+            } else {
+                ProviderCooldownKind::CapacityFreeze
+            },
+        );
+        if self.cooldowns.put_if_later(cooldown).await.is_ok() {
+            tracing::warn!(
+                account_id = account.id().as_str(),
+                threshold = policy.threshold(),
+                window_seconds = policy.window().as_secs(),
+                freeze_seconds = policy.freeze_duration().as_secs(),
+                peak_in_flight = in_flight,
+                "账号容量熔断触发：冻结该账号一段时间",
+            );
+        }
+    }
+
+    async fn current_in_flight(&self, account_id: &ProviderAccountId) -> u32 {
+        self.leases
+            .account_in_flight(std::slice::from_ref(account_id))
+            .await
+            .ok()
+            .and_then(|signals| signals.get(account_id).copied())
+            .unwrap_or(0)
     }
 
     /// 查询当前账号由 Codex Desktop 暴露的主动额度重置卡。
@@ -607,7 +802,7 @@ impl CodexCredentialQuotaService {
     }
 
     /// 成功推理是额度可访问的权威证据，同时解除账号级 429 冷却。
-    pub(crate) async fn record_successful_inference(
+    pub async fn record_successful_inference(
         &self,
         account: &ProviderAccount,
         observed_at: SystemTime,
@@ -628,7 +823,7 @@ impl CodexCredentialQuotaService {
             }
         }
         self.cooldowns
-            .clear(account.id(), account.revision())
+            .clear_after_success(account.id(), account.revision())
             .await
             .map_err(|error| CodexCredentialQuotaError::Store {
                 detail: error.to_string(),
@@ -685,11 +880,32 @@ impl CodexCredentialQuotaService {
     }
 
     pub async fn synchronize(&self) -> Result<CodexQuotaSyncSummary, CodexCredentialQuotaError> {
-        let accounts = self.repository.list_for_provider().await?;
+        let mut accounts = self.repository.list_for_provider().await?;
+        accounts.retain(|account| {
+            account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        });
         let mut summary = CodexQuotaSyncSummary::default();
         let now = SystemTime::now();
-        let initial = self.initial_quota_sync_accounts(&accounts, now).await?;
-        let periodic = self.scheduling.reserve_periodic_refreshes(accounts, now);
+        let account_ids = accounts
+            .iter()
+            .map(|account| account.id().clone())
+            .collect::<Vec<_>>();
+        let observed = self.store.get_quotas(&account_ids).await?;
+        let observed_snapshots = observed
+            .iter()
+            .filter_map(|obs| {
+                quota_snapshot_from_observation(obs)
+                    .map(|snapshot| (obs.account_id.clone(), snapshot))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let observed_ids = observed
+            .into_iter()
+            .map(|observation| observation.account_id)
+            .collect::<BTreeSet<_>>();
+        let initial = Self::initial_quota_sync_accounts(&accounts, &observed_ids, now);
+        let periodic =
+            self.scheduling
+                .reserve_periodic_refreshes(accounts, &observed_snapshots, now);
         let accounts = initial
             .into_iter()
             .chain(periodic)
@@ -763,29 +979,212 @@ impl CodexCredentialQuotaService {
         Ok(summary)
     }
 
-    /// `quota_observed_at` 为空代表首次异步观察尚未成功；不另建同步状态表。
-    async fn initial_quota_sync_accounts(
+    #[must_use]
+    pub fn runtime_policy(&self) -> &Arc<dyn ProviderRuntimePolicyPort> {
+        &self.runtime_policy
+    }
+
+    /// 批量预激活 OAuth 账号的 5h 配额滑动窗口。
+    pub async fn execute_warmup(
         &self,
-        accounts: &[ProviderAccount],
-        now: SystemTime,
-    ) -> Result<Vec<ProviderAccount>, CodexCredentialQuotaError> {
+        model: &str,
+    ) -> Result<CodexWarmupSummary, CodexCredentialQuotaError> {
+        let mut accounts = self.repository.list_for_provider().await?;
+        accounts.retain(|account| {
+            account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+                && account.enabled()
+                && matches!(
+                    account.credential_state(),
+                    CredentialState::Unknown | CredentialState::Ready
+                )
+        });
+        let mut summary = CodexWarmupSummary::default();
+        if accounts.is_empty() {
+            return Ok(summary);
+        }
         let account_ids = accounts
             .iter()
             .map(|account| account.id().clone())
             .collect::<Vec<_>>();
         let observed = self.store.get_quotas(&account_ids).await?;
-        let observed_ids = observed
-            .into_iter()
-            .map(|observation| observation.account_id)
-            .collect::<BTreeSet<_>>();
-        Ok(accounts
+        let observed_snapshots = observed
+            .iter()
+            .filter_map(|obs| {
+                quota_snapshot_from_observation(obs)
+                    .map(|snapshot| (obs.account_id.clone(), snapshot))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let client = CodexBackendClient::new(
+            self.http.clone(),
+            self.base_url.clone(),
+            self.profile.clone(),
+        );
+
+        let now_utc = chrono::Utc::now();
+        for account in accounts {
+            if let Some(snapshot) = observed_snapshots.get(account.id()) {
+                // 1. 周线已触顶或耗尽跳过
+                let weekly_exhausted = snapshot
+                    .windows()
+                    .iter()
+                    .any(|w| w.kind() == CodexQuotaWindowKind::Weekly && w.limit_reached());
+                if weekly_exhausted {
+                    summary.skipped_exhausted += 1;
+                    continue;
+                }
+                // 2. 5h 窗口当前活跃且距重置时间 > 30 分钟跳过
+                let has_active_5h = snapshot.windows().iter().any(|w| {
+                    w.kind() == CodexQuotaWindowKind::ShortTerm
+                        && w.reset_at().is_some_and(|reset_at| {
+                            reset_at > now_utc + chrono::Duration::minutes(30)
+                        })
+                });
+                if has_active_5h {
+                    summary.skipped_active += 1;
+                    continue;
+                }
+            }
+
+            let credential = match self.repository.load_runtime_credential(&account).await {
+                Ok(cred) => cred,
+                Err(_) => {
+                    summary.failed += 1;
+                    continue;
+                }
+            };
+            let authorization = match credential.authentication.authorization_header() {
+                Ok(auth) => auth,
+                Err(_) => {
+                    summary.failed += 1;
+                    continue;
+                }
+            };
+
+            let mut body = Map::new();
+            body.insert("model".to_owned(), Value::String(model.to_owned()));
+            body.insert(
+                "input".to_owned(),
+                serde_json::json!([{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }]),
+            );
+            body.insert("stream".to_owned(), Value::Bool(true));
+            body.insert("store".to_owned(), Value::Bool(false));
+            body.insert(
+                "service_tier".to_owned(),
+                Value::String("default".to_owned()),
+            );
+            body.insert(
+                "reasoning".to_owned(),
+                serde_json::json!({"effort": "none"}),
+            );
+            body.insert("text".to_owned(), serde_json::json!({"verbosity": "low"}));
+
+            let upstream_request = CodexResponsesRequest::from_body(body);
+            let request_id = format!("warmup_{}", Uuid::now_v7().simple());
+            let client_for_account = match client.for_account(&account) {
+                Ok(c) => c,
+                Err(error) => {
+                    tracing::warn!(account_id = %account.id(), error = %error, "warmup client for account failed");
+                    summary.failed += 1;
+                    continue;
+                }
+            };
+            let context = crate::transport::CodexRequestContext::auxiliary(
+                authorization.expose_secret(),
+                account.upstream_account_id(),
+                &request_id,
+                None,
+            );
+
+            // HTTP 200 只确认响应头；必须消费 SSE 直到终态才能确认预热结果和额度事件。
+            let attempt = tokio::time::timeout(WARMUP_REQUEST_TIMEOUT, async {
+                let mut response = client_for_account
+                    .create_response_stream_http_sse(&upstream_request, context)
+                    .await
+                    .map_err(|_| "request_rejected")?;
+                let terminal = consume_warmup_sse(&mut response).await;
+                let rate_limit_updates = match response.rate_limit_updates.as_ref() {
+                    Some(updates) => std::mem::take(&mut *updates.lock().await),
+                    None => Vec::new(),
+                };
+                Ok::<_, &'static str>((terminal, response.rate_limit_headers, rate_limit_updates))
+            })
+            .await;
+            match attempt {
+                Ok(Ok((terminal, headers, rate_limit_updates))) => {
+                    match terminal {
+                        Ok(()) => {
+                            // 被动额度同步会把成功请求的窗口事实标为可用，失败流不能复用该结论。
+                            if !headers.is_empty()
+                                && let Err(error) =
+                                    self.synchronize_passive_headers(&account, &headers).await
+                            {
+                                tracing::warn!(account_id = %account.id(), error = %error, "OpenAI warmup rate-limit header sync failed");
+                            }
+                            if !rate_limit_updates.is_empty()
+                                && let Err(error) = self
+                                    .synchronize_passive_rate_limits(&account, &rate_limit_updates)
+                                    .await
+                            {
+                                tracing::warn!(account_id = %account.id(), error = %error, "OpenAI warmup rate-limit event sync failed");
+                            }
+                            summary.warmed_up += 1;
+                            tracing::info!(
+                                account_id = %account.id(),
+                                model,
+                                "OpenAI account warmed up successfully"
+                            );
+                        }
+                        Err(reason) => {
+                            summary.failed += 1;
+                            tracing::warn!(
+                                account_id = %account.id(),
+                                reason,
+                                "OpenAI account warmup stream failed"
+                            );
+                        }
+                    }
+                }
+                Ok(Err(reason)) => {
+                    summary.failed += 1;
+                    tracing::warn!(
+                        account_id = %account.id(),
+                        reason,
+                        "OpenAI account warmup request rejected by upstream"
+                    );
+                }
+                Err(_) => {
+                    summary.failed += 1;
+                    tracing::warn!(
+                        account_id = %account.id(),
+                        "OpenAI account warmup request timed out"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        Ok(summary)
+    }
+
+    /// `quota_observed_at` 为空代表首次异步观察尚未成功；不另建同步状态表。
+    fn initial_quota_sync_accounts(
+        accounts: &[ProviderAccount],
+        observed_ids: &BTreeSet<ProviderAccountId>,
+        now: SystemTime,
+    ) -> Vec<ProviderAccount> {
+        accounts
             .iter()
             .filter(|account| {
                 !observed_ids.contains(account.id()) && eligible_initial_quota_sync(account, now)
             })
             .take(INITIAL_QUOTA_SYNC_BATCH)
             .cloned()
-            .collect())
+            .collect()
     }
 
     /// 解析并 revision-fenced 落库单账号的 Provider quota JSON。
@@ -824,6 +1223,7 @@ impl CodexCredentialQuotaService {
         let outcome = self
             .store
             .compare_and_swap_quota(QuotaObservation {
+                plan_type: observed_account_plan(account.plan_type(), snapshot.plan_type()),
                 account_id: account.id().clone(),
                 expected_revision: account.revision(),
                 quota: OpaqueProviderData::new(object),
@@ -863,7 +1263,9 @@ impl CodexCredentialQuotaService {
         account: &ProviderAccount,
         rate_limits: &[ParsedRateLimits],
     ) -> Result<bool, CodexCredentialQuotaError> {
-        if rate_limits.is_empty() {
+        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+            || rate_limits.is_empty()
+        {
             return Ok(false);
         }
         let has_quota_facts = rate_limits.iter().any(|observation| {
@@ -885,6 +1287,17 @@ impl CodexCredentialQuotaService {
         let existing = existing
             .map(|observation| observation.quota.into_inner())
             .unwrap_or_default();
+        // 只用本次响应明确携带的套餐更新账号，不能把合并前的旧快照重新当作新证据。
+        let observed_plan = rate_limits
+            .iter()
+            .rev()
+            .filter_map(|observation| {
+                observation.plan_type.as_deref().filter(|plan| {
+                    !plan.trim().is_empty() && !plan.trim().eq_ignore_ascii_case("unknown")
+                })
+            })
+            .next();
+        let plan_type = observed_account_plan(account.plan_type(), observed_plan);
         // 套餐、credits 等元数据可以更新，但没有额度窗口事实时必须保留旧观察时刻，
         // 也不能借旧快照重新推导 quota state。
         if !has_quota_facts {
@@ -894,6 +1307,7 @@ impl CodexCredentialQuotaService {
             let outcome = self
                 .store
                 .compare_and_swap_quota(QuotaObservation {
+                    plan_type,
                     account_id: account.id().clone(),
                     expected_revision: account.revision(),
                     quota: OpaqueProviderData::new(merge_passive_quota(existing, rate_limits)),
@@ -916,6 +1330,7 @@ impl CodexCredentialQuotaService {
         let outcome = self
             .store
             .compare_and_swap_quota(QuotaObservation {
+                plan_type,
                 account_id: account.id().clone(),
                 expected_revision: account.revision(),
                 quota: OpaqueProviderData::new(quota),
@@ -956,11 +1371,11 @@ impl CodexCredentialQuotaService {
         Ok(())
     }
 
-    /// 读取账号当前是否处于临时限流（429）冷却，及到期时间。
-    pub async fn rate_limited_until(
+    /// 读取有效的账号冷却事实；等待恢复探测的冻结到期后仍有效。
+    pub async fn cooldown(
         &self,
         account_id: &ProviderAccountId,
-    ) -> Result<Option<SystemTime>, CodexCredentialQuotaError> {
+    ) -> Result<Option<gateway_core::account::AccountCooldown>, CodexCredentialQuotaError> {
         let Some(cooldown) = self.cooldowns.read(account_id).await.map_err(|error| {
             CodexCredentialQuotaError::Store {
                 detail: error.to_string(),
@@ -969,11 +1384,8 @@ impl CodexCredentialQuotaService {
         else {
             return Ok(None);
         };
-        let until = cooldown.until();
-        if until <= SystemTime::now() {
-            return Ok(None);
-        }
-        Ok(Some(until))
+        let state = cooldown.scheduling_state();
+        Ok(state.is_active(SystemTime::now()).then_some(state))
     }
 
     /// 读取单账号最后一次落库的 Provider quota，并由 Codex 域解析展示窗口。
@@ -1056,6 +1468,9 @@ impl CodexCredentialQuotaService {
             .await?
             .filter(|account| account.provider().as_str() == "openai")
             .ok_or(CodexCredentialQuotaError::NotFound)?;
+        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH {
+            return Err(CodexCredentialQuotaError::NotFound);
+        }
         let observed_at = SystemTime::now();
         if !access_token_is_current(&account, observed_at) {
             return Err(CodexCredentialQuotaError::CredentialRefreshRequired);
@@ -1144,6 +1559,7 @@ impl CodexCredentialQuotaService {
         if self
             .store
             .compare_and_swap_quota(QuotaObservation {
+                plan_type: observed_account_plan(account.plan_type(), snapshot.plan_type()),
                 account_id: account.id().clone(),
                 expected_revision: account.revision(),
                 quota: OpaqueProviderData::new(object),
@@ -1376,6 +1792,27 @@ async fn fetch_usage_with_5xx_retry(
         );
         tokio::time::sleep(delay).await;
     }
+}
+
+/// 上游额度可确认套餐变更；同族泛化值不能丢弃 JWT 已给出的具体 SKU。
+fn observed_account_plan(current: Option<&str>, observed: Option<&str>) -> Option<String> {
+    let plan = observed?.trim().to_ascii_lowercase();
+    if plan.is_empty() || plan == "unknown" {
+        return None;
+    }
+    // 套餐族沿用官方 codex_protocol::account::PlanType 的分类。
+    let current = current.unwrap_or_default().trim().to_ascii_lowercase();
+    let generalized = matches!(
+        (plan.as_str(), current.as_str()),
+        (
+            "team",
+            "self_serve_business_prolite" | "self_serve_business_usage_based"
+        ) | (
+            "business",
+            "ent26" | "enterprise_cbp_automation" | "enterprise_cbp_usage_based"
+        ) | ("edu" | "education", "edu_plus" | "edu_pro")
+    );
+    (!generalized).then_some(plan)
 }
 
 fn eligible_periodic_quota_refresh(account: &ProviderAccount, now: SystemTime) -> bool {

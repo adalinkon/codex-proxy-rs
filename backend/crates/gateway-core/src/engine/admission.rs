@@ -15,6 +15,8 @@ pub struct ClientAdmissionRequest {
     pub model_request_id: ModelRequestId,
     pub client_api_key_id: ClientApiKeyId,
     pub lease_ttl: Duration,
+    /// 有等待者时只允许队首取得槽位，RPM 仍由原子准入检查。
+    pub allow_concurrency_acquire: bool,
     pub limits: RateLimits,
 }
 
@@ -61,6 +63,14 @@ pub struct ClientAdmissionRestoreResult {
 pub struct ClientAdmissionError;
 
 pub trait ClientAdmissionPort: Send + Sync {
+    /// 请求 future 被取消时移交幂等释放，具体实现拥有异步清理执行器。
+    fn abandon(
+        &self,
+        user_id: &str,
+        client_api_key_id: &ClientApiKeyId,
+        model_request_id: &ModelRequestId,
+    );
+
     fn admit(
         &self,
         request: ClientAdmissionRequest,

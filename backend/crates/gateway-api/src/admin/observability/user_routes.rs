@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::admin::users::UserAuth;
+use crate::auth::SessionState;
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -36,7 +37,7 @@ impl PersonalUsageQuery {
     }
 }
 
-pub(super) fn router<S: AdminSessionState + Clone + Send + Sync + 'static>() -> Router<S> {
+pub(super) fn router<S: SessionState + Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/api/user/usage/records", get(records::<S>))
         .route("/api/user/usage/records/summary", get(summary::<S>))
@@ -47,7 +48,7 @@ pub(super) fn router<S: AdminSessionState + Clone + Send + Sync + 'static>() -> 
         )
 }
 
-async fn records<S: AdminSessionState + Send + Sync>(
+async fn records<S: SessionState + Send + Sync>(
     auth: UserAuth,
     State(state): State<S>,
     AdminQuery(query): AdminQuery<PersonalUsageQuery>,
@@ -71,7 +72,7 @@ async fn records<S: AdminSessionState + Send + Sync>(
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }
 
-async fn summary<S: AdminSessionState + Send + Sync>(
+async fn summary<S: SessionState + Send + Sync>(
     auth: UserAuth,
     State(state): State<S>,
     AdminQuery(query): AdminQuery<PersonalUsageQuery>,
@@ -89,7 +90,7 @@ async fn summary<S: AdminSessionState + Send + Sync>(
     ))
 }
 
-async fn overview<S: AdminSessionState + Send + Sync>(
+async fn overview<S: SessionState + Send + Sync>(
     auth: UserAuth,
     State(state): State<S>,
     AdminQuery(query): AdminQuery<PersonalUsageQuery>,
@@ -113,7 +114,7 @@ async fn overview<S: AdminSessionState + Send + Sync>(
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(view)))
 }
 
-async fn diagnostics<S: AdminSessionState + Send + Sync>(
+async fn diagnostics<S: SessionState + Send + Sync>(
     auth: UserAuth,
     State(state): State<S>,
     AdminQuery(query): AdminQuery<PersonalUsageQuery>,

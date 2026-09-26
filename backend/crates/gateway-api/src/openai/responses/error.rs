@@ -42,7 +42,10 @@ pub enum RequestDecodeError {
     MalformedJson,
     /// 请求体解压后超过允许上限。
     #[error("decompressed request body is too large")]
-    DecompressedBodyTooLarge,
+    DecompressedBodyTooLarge {
+        /// 当前请求快照中的解压输出上限。
+        limit_bytes: usize,
+    },
     /// 请求使用了网关不支持的 `Content-Encoding`。
     #[error("request content-encoding `{encoding}` is not supported")]
     UnsupportedContentEncoding {
@@ -108,9 +111,11 @@ impl RequestDecodeError {
                 "Request body must be valid JSON.".to_owned(),
                 None,
             ),
-            Self::DecompressedBodyTooLarge => (
+            Self::DecompressedBodyTooLarge { limit_bytes } => (
                 "request_too_large",
-                "Decompressed request body exceeds the allowed size.".to_owned(),
+                format!(
+                    "Decompressed request body exceeds the allowed size ({limit_bytes} bytes)."
+                ),
                 None,
             ),
             Self::UnsupportedContentEncoding { encoding } => (
@@ -171,6 +176,9 @@ pub enum ResponseEncodeError {
     /// 协议原生流缺少可返回的终态 response object。
     #[error("responses wire stream has no terminal response")]
     MissingWireTerminal,
+    /// 缺少完整终态输出，已交付的完成项也存在缺项或冲突，不能伪造完整结果。
+    #[error("responses wire stream has inconsistent output items")]
+    InvalidOutputItems,
     /// 终态 response object 无法序列化为完整 HTTP JSON 响应。
     #[error("responses wire terminal serialization failed")]
     Serialization,

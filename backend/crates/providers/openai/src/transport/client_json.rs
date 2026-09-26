@@ -27,6 +27,15 @@ impl CodexBackendClient {
         image_turn_id: Option<&str>,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<CodexBackendJsonResponse> {
+        // Provider 端点以 Codex 路径标识；API Key 在自己的 API 前缀下使用对应相对路径。
+        let endpoint_path = if self.protocol == super::client::OpenAiUpstreamProtocol::ResponsesApi
+        {
+            endpoint_path
+                .strip_prefix("/codex")
+                .unwrap_or(endpoint_path)
+        } else {
+            endpoint_path
+        };
         let profile = self.profile.snapshot();
         let mut headers = self.model_request_headers(&profile, context)?;
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -36,6 +45,7 @@ impl CodexBackendClient {
             "x-codex-turn-metadata",
             context.turn_metadata,
         );
+        self.append_middleware_headers(&mut headers)?;
 
         let trace = context
             .trace

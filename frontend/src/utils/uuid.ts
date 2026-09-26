@@ -1,4 +1,4 @@
-export function createOperationId() {
+export function generateRequestId() {
   // 普通 HTTP 管理端没有 randomUUID；getRandomValues 仍可生成密码学安全的 UUIDv4。
   const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
   bytes[6] = (bytes[6] & 0x0F) | 0x40

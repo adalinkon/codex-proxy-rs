@@ -47,6 +47,7 @@ impl fmt::Display for AccountGroupId {
 pub struct RuntimeAccount {
     provider_kind: ProviderKind,
     group_ids: Arc<BTreeSet<AccountGroupId>>,
+    model_access: super::AccountModelAccess,
 }
 
 impl RuntimeAccount {
@@ -55,7 +56,19 @@ impl RuntimeAccount {
         Self {
             provider_kind,
             group_ids: Arc::new(group_ids),
+            model_access: super::AccountModelAccess::all(),
         }
+    }
+
+    #[must_use]
+    pub fn with_model_access(mut self, model_access: super::AccountModelAccess) -> Self {
+        self.model_access = model_access;
+        self
+    }
+
+    #[must_use]
+    pub const fn model_access(&self) -> &super::AccountModelAccess {
+        &self.model_access
     }
 
     #[must_use]
@@ -243,20 +256,102 @@ impl ClientRoutingScope {
 /// 一次认证随 RuntimeSnapshot 冻结的账号目录与 Key 权限。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenAccountScope {
+    disable_fast: bool,
+    request_profiles: BTreeMap<ProviderKind, super::OpaqueProviderData>,
     directory: Arc<RuntimeAccountDirectory>,
     client_scope: ClientRoutingScope,
+    provider_kinds: Arc<BTreeSet<ProviderKind>>,
+    allowed_account_ids: Option<Arc<BTreeSet<ProviderAccountId>>>,
+    excluded_account_ids: Arc<BTreeSet<ProviderAccountId>>,
 }
 
 impl FrozenAccountScope {
+    /// 与 Key 授权范围一同冻结；具体字段只由对应 Provider 解释。
     #[must_use]
-    pub const fn new(
-        directory: Arc<RuntimeAccountDirectory>,
-        client_scope: ClientRoutingScope,
+    pub fn with_request_profiles(
+        mut self,
+        profiles: BTreeMap<ProviderKind, super::OpaqueProviderData>,
     ) -> Self {
+        self.request_profiles = profiles;
+        self
+    }
+
+    #[must_use]
+    pub fn request_profile(&self, provider: &ProviderKind) -> Option<&super::OpaqueProviderData> {
+        self.request_profiles.get(provider)
+    }
+
+    /// Key 绑定分组的冻结 Fast 限制，与账号成员资格无关。
+    #[must_use]
+    pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {
+        self.disable_fast = disable_fast;
+        self
+    }
+
+    #[must_use]
+    pub const fn disable_fast(&self) -> bool {
+        self.disable_fast
+    }
+
+    #[must_use]
+    pub fn new(directory: Arc<RuntimeAccountDirectory>, client_scope: ClientRoutingScope) -> Self {
+        let provider_kinds = match &client_scope {
+            ClientRoutingScope::AllAccounts => Arc::new(directory.providers_with_accounts.clone()),
+            ClientRoutingScope::Restricted { provider_kinds, .. } => Arc::clone(provider_kinds),
+        };
         Self {
+            disable_fast: false,
+            request_profiles: BTreeMap::new(),
             directory,
             client_scope,
+            provider_kinds,
+            allowed_account_ids: None,
+            excluded_account_ids: Arc::default(),
         }
+    }
+
+    /// 在已经冻结的 Key 范围内施加一次请求局部的 Provider/账号交集。
+    ///
+    /// 空集合表示该维度不额外收窄；非空集合即使没有有效交集也保持为空，
+    /// 不能回退为父请求的完整范围。
+    #[must_use]
+    pub fn restricted_to(
+        &self,
+        providers: &BTreeSet<ProviderKind>,
+        accounts: &BTreeSet<ProviderAccountId>,
+    ) -> Self {
+        let mut restricted = self.clone();
+        let mut provider_kinds = self.provider_kinds.as_ref().clone();
+        if !providers.is_empty() {
+            provider_kinds.retain(|provider| providers.contains(provider));
+        }
+        if !accounts.is_empty() {
+            let allowed_account_ids = accounts
+                .iter()
+                .filter(|account| self.allows(account))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            provider_kinds.retain(|provider| {
+                allowed_account_ids.iter().any(|account| {
+                    self.directory
+                        .account(account)
+                        .is_some_and(|entry| entry.provider_kind() == provider)
+                })
+            });
+            restricted.allowed_account_ids = Some(Arc::new(allowed_account_ids));
+        }
+        restricted.provider_kinds = Arc::new(provider_kinds);
+        restricted
+    }
+
+    /// 排除父 attempt 当前已经持有的账号，避免嵌套调用形成账号 lease 自等待。
+    #[must_use]
+    pub fn excluding_account(&self, account: ProviderAccountId) -> Self {
+        let mut restricted = self.clone();
+        let mut excluded = self.excluded_account_ids.as_ref().clone();
+        excluded.insert(account);
+        restricted.excluded_account_ids = Arc::new(excluded);
+        restricted
     }
 
     #[must_use]
@@ -264,6 +359,15 @@ impl FrozenAccountScope {
         let Some(account) = self.directory.account(account_id) else {
             return false;
         };
+        if self.excluded_account_ids.contains(account_id)
+            || !self.provider_kinds.contains(account.provider_kind())
+            || self
+                .allowed_account_ids
+                .as_ref()
+                .is_some_and(|accounts| !accounts.contains(account_id))
+        {
+            return false;
+        }
         match &self.client_scope {
             ClientRoutingScope::AllAccounts => true,
             ClientRoutingScope::Restricted {
@@ -276,11 +380,34 @@ impl FrozenAccountScope {
     }
 
     #[must_use]
+    pub fn allows_model(&self, account_id: &ProviderAccountId, upstream_model: &str) -> bool {
+        self.allows(account_id)
+            && self
+                .directory
+                .account(account_id)
+                .is_some_and(|account| account.model_access.allows(upstream_model))
+    }
+
+    /// 目录按整个授权账号池过滤，不能只看用于获取元数据的账号政策。
+    #[must_use]
+    pub fn allows_provider_model(&self, provider: &ProviderKind, upstream_model: &str) -> bool {
+        self.provider_kinds.contains(provider)
+            && self.directory.accounts.iter().any(|(id, account)| {
+                account.provider_kind() == provider && self.allows_model(id, upstream_model)
+            })
+    }
+
+    #[must_use]
     pub fn provider_kinds(&self) -> &BTreeSet<ProviderKind> {
-        match &self.client_scope {
-            ClientRoutingScope::AllAccounts => self.directory.providers_with_accounts(),
-            ClientRoutingScope::Restricted { provider_kinds, .. } => provider_kinds,
-        }
+        &self.provider_kinds
+    }
+
+    /// 返回冻结目录中账号所属 Provider；调用方仍须另行检查 [`Self::allows`]。
+    #[must_use]
+    pub fn account_provider(&self, account_id: &ProviderAccountId) -> Option<&ProviderKind> {
+        self.directory
+            .account(account_id)
+            .map(RuntimeAccount::provider_kind)
     }
 
     #[must_use]

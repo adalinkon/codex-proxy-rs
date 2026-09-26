@@ -387,6 +387,9 @@ pub(super) fn map_request_error(error: GrokRequestEncodeError) -> ProviderError 
 /// 将选择阶段失败映射为带结构化 code 与 retry_after 的 Provider 错误。
 pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderError {
     let (retry_after, message, code) = match error {
+        GrokSessionSelectorError::QueueRejected(error) => {
+            return provider_error(error.provider_kind(), UpstreamSendState::NotSent);
+        }
         GrokSessionSelectorError::AccountCoolingDown { retry_after } => (
             retry_after,
             cooling_down_message(retry_after),
@@ -412,6 +415,15 @@ pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderEr
             "account scheduling state is temporarily unreadable".to_owned(),
             "account_selector_unavailable",
         ),
+        GrokSessionSelectorError::PolicyRejected => {
+            return provider_error(
+                ProviderErrorKind::RequestPolicyDenied,
+                UpstreamSendState::NotSent,
+            );
+        }
+        GrokSessionSelectorError::PolicyUnavailable => {
+            return provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent);
+        }
         GrokSessionSelectorError::InvalidSession => {
             return provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent);
         }

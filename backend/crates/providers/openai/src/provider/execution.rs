@@ -6,7 +6,7 @@ use super::*;
 
 impl CodexProvider {
     pub(super) async fn execute_image(
-        &self,
+        self: Arc<Self>,
         image: &ImageRequest,
         candidate: &ProviderCandidate,
         context: AttemptContext,
@@ -38,6 +38,7 @@ impl CodexProvider {
         self.execute_raw_json_endpoint(
             context,
             RawJsonEndpointRequest {
+                operation: Operation::GenerateImage(image.clone()),
                 response_origin,
                 endpoint_path,
                 body: image.payload().body().clone(),
@@ -50,7 +51,7 @@ impl CodexProvider {
     }
 
     pub(super) async fn execute_search(
-        &self,
+        self: Arc<Self>,
         search: &StandaloneSearchRequest,
         candidate: &ProviderCandidate,
         context: AttemptContext,
@@ -72,10 +73,12 @@ impl CodexProvider {
             context.client_api_key_ref(),
             "id",
         );
+        let response_origin = self.search_url.clone();
         self.execute_raw_json_endpoint(
             context,
             RawJsonEndpointRequest {
-                response_origin: self.search_url.clone(),
+                operation: Operation::Search(search.clone()),
+                response_origin,
                 endpoint_path: CODEX_ALPHA_SEARCH_PATH,
                 body: search.payload().body().clone(),
                 image_turn_id: None,
@@ -87,7 +90,7 @@ impl CodexProvider {
     }
 
     async fn execute_raw_json_endpoint(
-        &self,
+        self: Arc<Self>,
         context: AttemptContext,
         request: RawJsonEndpointRequest,
     ) -> Result<ProviderStream, ProviderError> {
@@ -104,6 +107,91 @@ impl CodexProvider {
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lease = Arc::new(lease);
+        let operation = request.operation.clone();
+        let provider_kind = ProviderKind::new(PROVIDER_NAME)
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
+        let account_id = lease.account_id().clone();
+        let provider = Arc::clone(&self);
+        let terminal_context = context.clone();
+        context
+            .execute_middleware(
+                operation,
+                provider_kind,
+                None,
+                account_id,
+                Box::new(move |operation, middleware_headers| {
+                    Box::pin(async move {
+                        provider
+                            .execute_selected_raw_json_endpoint(
+                                terminal_context,
+                                operation,
+                                middleware_headers,
+                                request,
+                                lease,
+                                account_selection_wait_ms,
+                            )
+                            .await
+                    })
+                }),
+            )
+            .await
+    }
+
+    async fn execute_selected_raw_json_endpoint(
+        self: Arc<Self>,
+        context: AttemptContext,
+        operation: Operation,
+        middleware_headers: Vec<MiddlewareHeader>,
+        mut request: RawJsonEndpointRequest,
+        lease: Arc<CodexCredentialLease>,
+        account_selection_wait_ms: u64,
+    ) -> Result<ProviderStream, ProviderError> {
+        match operation {
+            Operation::GenerateImage(image) => {
+                let Operation::GenerateImage(original) = &request.operation else {
+                    return Err(provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    ));
+                };
+                if image.kind() != original.kind() || image.payload().protocol() != PROVIDER_NAME {
+                    return Err(provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    ));
+                }
+                request.body = image.payload().body().clone();
+                request.image_turn_id = image
+                    .payload()
+                    .context()
+                    .get("image_turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Operation::Search(search) => {
+                if !matches!(&request.operation, Operation::Search(_))
+                    || search.payload().protocol() != PROVIDER_NAME
+                {
+                    return Err(provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    ));
+                }
+                request.body = search.payload().body().clone();
+                request.turn_metadata = search
+                    .payload()
+                    .context()
+                    .get("turn_metadata")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            _ => {
+                return Err(provider_error(
+                    ProviderErrorKind::InvalidRequest,
+                    UpstreamSendState::NotSent,
+                ));
+            }
+        }
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
@@ -124,9 +212,14 @@ impl CodexProvider {
             crate::transport::request::scope_turn_metadata(metadata, lease.installation_id(), true)
         });
         let events = cold_json_response_stream(ColdJsonResponse {
-            client: self.client.for_account(lease.account()).map_err(|_| {
-                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-            })?,
+            client: self
+                .client_for_request(&context)?
+                .for_account(lease.account())
+                .map_err(|_| {
+                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+                })?
+                .with_authentication(lease.authentication())
+                .with_middleware_headers(middleware_headers),
             response_origin: request.response_origin,
             endpoint_path: request.endpoint_path,
             body: request.body,
@@ -152,6 +245,7 @@ impl CodexProvider {
 }
 
 struct RawJsonEndpointRequest {
+    operation: Operation,
     response_origin: Url,
     endpoint_path: &'static str,
     body: Bytes,
@@ -198,6 +292,8 @@ pub(super) struct ColdJsonResponse {
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct OpenAiSessionState {
     pub(super) account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) credential_revision: Option<u64>,
     pub(super) conversation_id: Option<String>,
     #[serde(default)]
     pub(super) turn_state: Option<String>,
@@ -216,6 +312,7 @@ pub(super) enum OpenAiContinuationScope {
 
 pub(super) struct OpenAiSessionCapture {
     pub(super) account_id: String,
+    pub(super) credential_revision: Option<u64>,
     pub(super) conversation_id: Option<String>,
     pub(super) turn_state: Option<String>,
     pub(super) client_turn_id: Option<String>,
@@ -261,6 +358,7 @@ fn encode_openai_session_capture(
     };
     encode_openai_session_state(OpenAiSessionState {
         account_id: capture.account_id.clone(),
+        credential_revision: capture.credential_revision,
         conversation_id: capture.conversation_id.clone(),
         turn_state: capture.turn_state.clone(),
         client_turn_id: capture.client_turn_id.clone(),
@@ -399,6 +497,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             response_origin: &request.response_origin,
             cyber_policy_scope: None,
             allows_account_state_mutation,
+            allows_capacity_feedback: !request.context.is_diagnostic_required_account(),
         };
         let active_account = request.lease.account().clone();
         let cookie_header = build_cookie_header(request.lease.cookies())?;
@@ -495,7 +594,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             ResponseMeta::for_provider_endpoint(request.context.request_id().as_str());
         yield ProviderEvent::canonical(GatewayEvent::Started(response_meta.clone()));
         if matches!(request.endpoint_path, CODEX_IMAGE_GENERATIONS_PATH | CODEX_IMAGE_EDITS_PATH)
-            && let Some((usage, cost)) = image_response_metering(&request.body, &response.body)
+            && let Some((usage, cost)) = image_response_metering(&request.body, &response.body, request.context.pricing())
         {
             yield ProviderEvent::canonical(GatewayEvent::Usage(usage));
             if let Some(cost) = cost {
@@ -515,6 +614,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
 fn image_response_metering(
     request_body: &[u8],
     body: &[u8],
+    prices: &gateway_core::metering::PricingOverrides,
 ) -> Option<(Usage, Option<CalculatedCost>)> {
     // 只保留 usage，跳过通常很大的 base64 图片；原始响应仍按字节透传。
     #[derive(Deserialize)]
@@ -539,7 +639,7 @@ fn image_response_metering(
         .and_then(Value::as_u64);
     // 总量是上游独立报告的事实；图片明细是总输入/输出的子集，不能再次相加。
     usage.total_tokens = raw.get("total_tokens").and_then(Value::as_u64);
-    let cost = crate::transport::usage::image_calculated_cost(request_body, &raw);
+    let cost = crate::transport::usage::image_calculated_cost(request_body, &raw, prices);
     (usage != Usage::default()).then_some((usage, cost))
 }
 
@@ -573,6 +673,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             response_origin: &response_origin,
             cyber_policy_scope: cyber_policy_scope.as_ref(),
             allows_account_state_mutation,
+            allows_capacity_feedback: !context.is_diagnostic_required_account(),
         };
         let mut active_account = lease.account().clone();
         let cookie_header = build_cookie_header(lease.cookies())?;
@@ -651,10 +752,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 }
                 apply_failure(&failure_context, &active_account, &failure)
                 .await;
-                Err(failure.error)?;
+                Err(quota_continuation_replay_error(
+                    failure.error,
+                    &request,
+                    ReplayBoundary::BeforeSemanticOutput,
+                ))?;
                 return;
             }
         };
+        context.connection_budget().complete();
         if !accepts_backend_transport(transport_policy, response.transport) {
             let failure = MappedProviderFailure::plain(provider_error(
                 ProviderErrorKind::Protocol,
@@ -720,12 +826,14 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let mut passive_quota_observation =
             OpenAiPassiveQuotaObservation::new(response.rate_limit_headers);
         let rate_limit_updates = response.rate_limit_updates;
-        let turn_state_updates = response.turn_state_update;
+        let response_metadata_updates = response.response_metadata_updates;
         // OpenAI 线路为透明代理：HTTP SSE 与 WebSocket 两条上游均启用 raw 透传，
         // 下游按字节转发上游原文，避免 serde 往返改写数值/精度（大整数→f64、logprobs 等）。
         // WS 帧由 reducer 以 encode_sse_event(&event, raw) 逐字节内嵌上游原始 JSON
         // （transport/protocol/websocket.rs），push_frames 抽出的 data 即上游原文。
         let mut decoder = CodexCanonicalDecoder::new(upstream_model.as_str())
+            .with_pricing(context.pricing().get("openai").and_then(|models| models.get(upstream_model.as_str())).cloned())
+            .with_reported_model(response.response_metadata.effective_model.as_deref())
             .with_requested_service_tier(request.service_tier())
             .with_request_tool_pricing(upstream_model.as_str(), request.tools())
             .with_raw_sse_passthrough();
@@ -788,13 +896,14 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         let update_headers = rate_limit_update_headers(&updates);
                         observation_state.merge_rate_limit_headers(&update_headers)
                     };
-                    let turn_state_merge = merge_turn_state_update(
-                        turn_state_updates.as_ref(),
+                    let metadata_merge = merge_response_metadata_updates(
+                        response_metadata_updates.as_ref(),
                         &mut session_capture,
                         &mut observation_state,
+                        &mut decoder,
                     )
                     .await;
-                    let observation_event = if rate_limits_changed || turn_state_merge.is_some() {
+                    let observation_event = if rate_limits_changed || metadata_merge.is_some() {
                         observation_state.observation(None).map(ProviderEvent::observation)
                     } else {
                         None
@@ -835,7 +944,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     }
                     apply_failure(&failure_context, &active_account, &failure)
                     .await;
-                    Err(failure.error)?;
+                    Err(quota_continuation_replay_error(
+                        failure.error,
+                        &request,
+                        ReplayBoundary::from_semantic_output(pre_commit_events.is_committed()),
+                    ))?;
                     return;
                 }
             };
@@ -847,13 +960,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 passive_quota_observation.observe(&updates);
                 observation_state.merge_rate_limit_headers(&rate_limit_update_headers(&updates))
             };
-            let turn_state_merge = merge_turn_state_update(
-                turn_state_updates.as_ref(),
-                &mut session_capture,
-                &mut observation_state,
-            )
-            .await;
-            let turn_state_changed = turn_state_merge.unwrap_or(false);
             let first_event_changed =
                 observation_state.observe_stream_chunk(&chunk, output_started_at);
             let chunk_len = chunk.len();
@@ -864,7 +970,17 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     (events, Some((error, semantic_output_seen)))
                 }
             };
+            let metadata_merge = merge_response_metadata_updates(
+                response_metadata_updates.as_ref(),
+                &mut session_capture,
+                &mut observation_state,
+                &mut decoder,
+            )
+            .await;
+            let metadata_changed = metadata_merge.unwrap_or(false);
             pre_commit_events.observe_chunk(chunk_len);
+            let response_model_changed = observation_state
+                .observe_upstream_response_model(decoder.response_model());
             let service_tier_changed = observation_state
                 .observe_upstream_service_tier(decoder.response_service_tier());
             let terminal_failure = canonical_failure.map(|(error, semantic_output_seen)| {
@@ -935,9 +1051,10 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     .await;
             }
             if (rate_limits_changed
+                || response_model_changed
                 || service_tier_changed
                 || timing_changed
-                || turn_state_changed
+                || metadata_changed
                 || terminal_changed
                 || (response_transport == CodexBackendTransport::WebSocket && terminal_failure.is_some()))
                 && let Some(observation) = observation_state.observation(
@@ -958,7 +1075,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         .error
                         .with_atomic_client_events(pre_commit_events.take_for_failure(events));
                 }
-                Err(failure.error)?;
+                Err(quota_continuation_replay_error(
+                    failure.error,
+                    &request,
+                    ReplayBoundary::from_semantic_output(failure_after_commit),
+                ))?;
                 return;
             }
             let events = pre_commit_events.stage(events, timing_signals, completed);
@@ -1001,6 +1122,8 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             )
         });
         let timing_signals = decoder.take_timing_signals();
+        let response_model_changed = observation_state
+            .observe_upstream_response_model(decoder.response_model());
         let service_tier_changed = observation_state
             .observe_upstream_service_tier(decoder.response_service_tier());
         let timing_changed = observation_state
@@ -1024,10 +1147,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             apply_failure(&failure_context, &active_account, failure)
             .await;
         }
-        let turn_state_changed = merge_turn_state_update(
-            turn_state_updates.as_ref(),
+        let metadata_changed = merge_response_metadata_updates(
+            response_metadata_updates.as_ref(),
             &mut session_capture,
             &mut observation_state,
+            &mut decoder,
         )
         .await
         .unwrap_or(false);
@@ -1057,10 +1181,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 .observe_cyber_policy_success(cyber_policy_scope.as_ref())
                 .await;
         }
-        if (service_tier_changed
+        if (response_model_changed
+            || service_tier_changed
             || timing_changed
             || rate_limits_changed
-            || turn_state_changed
+            || metadata_changed
             || terminal_changed
             || (response_transport == CodexBackendTransport::WebSocket && terminal_failure.is_some()))
             && let Some(observation) = observation_state.observation(
@@ -1081,7 +1206,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     .error
                     .with_atomic_client_events(pre_commit_events.take_for_failure(events));
             }
-            Err(failure.error)?;
+            Err(quota_continuation_replay_error(
+                failure.error,
+                &request,
+                ReplayBoundary::from_semantic_output(failure_after_commit),
+            ))?;
             return;
         }
         let events = pre_commit_events.finish(events, timing_signals, completed);
@@ -1091,15 +1220,30 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     })
 }
 
-async fn merge_turn_state_update(
-    updates: Option<&CodexTurnStateUpdate>,
+async fn merge_response_metadata_updates(
+    updates: Option<&CodexResponseMetadataUpdates>,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
+    decoder: &mut CodexCanonicalDecoder,
 ) -> Option<bool> {
     let updates = updates?;
-    let turn_state = updates.lock().await.take()?;
-    if let Some(capture) = session_capture.as_mut() {
-        capture.turn_state = Some(turn_state.clone());
+    let mut pending = updates.lock().await;
+    let turn_state = pending.turn_state.take();
+    let reported_model = pending.reported_model.clone();
+    drop(pending);
+    if turn_state.is_none() && reported_model.is_none() {
+        return None;
     }
-    Some(observation_state.merge_client_header("x-codex-turn-state", &turn_state))
+    let mut changed = false;
+    if let Some(turn_state) = turn_state {
+        if let Some(capture) = session_capture.as_mut() {
+            capture.turn_state = Some(turn_state.clone());
+        }
+        changed |= observation_state.merge_client_header("x-codex-turn-state", &turn_state);
+    }
+    if let Some(model) = reported_model {
+        decoder.observe_reported_model(&model);
+        changed |= observation_state.observe_upstream_response_model(decoder.response_model());
+    }
+    Some(changed)
 }

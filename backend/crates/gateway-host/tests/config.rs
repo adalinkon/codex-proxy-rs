@@ -16,16 +16,66 @@ fn system_update_defaults_should_use_host_build_metadata_and_official_repository
         (
             env!("CPR_VERSION"),
             env!("CPR_BUILD_TYPE"),
-            Some("zyycn/codex-proxy-rs"),
+            Some("adalinkon/codex-proxy-rs"),
         )
     );
+}
+
+#[test]
+fn host_config_should_default_update_assets_to_the_resolved_api_directory() {
+    let mut config = valid_config();
+    config.system_update.web_dist_dir = None;
+    let assets = std::path::Path::new("/srv/gateway/web/dist");
+
+    config
+        .resolve_and_validate(std::path::Path::new("/srv/gateway/deploy"), assets)
+        .expect("host config");
+
+    assert_eq!(config.system_update.web_dist_dir.as_deref(), Some(assets));
+}
+
+#[test]
+fn host_config_should_preserve_explicit_update_asset_directory() {
+    let mut config = valid_config();
+    config.system_update.web_dist_dir = Some(PathBuf::from("../custom/dist"));
+
+    config
+        .resolve_and_validate(
+            std::path::Path::new("/srv/gateway/deploy"),
+            std::path::Path::new("/srv/gateway/web/dist"),
+        )
+        .expect("host config");
+
+    assert_eq!(
+        config.system_update.web_dist_dir,
+        Some(PathBuf::from("/srv/gateway/deploy/../custom/dist"))
+    );
+}
+
+#[test]
+fn host_config_should_reject_empty_update_asset_directory() {
+    let mut config = valid_config();
+    config.system_update.web_dist_dir = Some(PathBuf::new());
+
+    assert!(matches!(
+        config.resolve_and_validate(
+            std::path::Path::new("/srv/gateway/deploy"),
+            std::path::Path::new("/srv/gateway/web/dist"),
+        ),
+        Err(gateway_host::ConfigError::InvalidField(
+            "host.system_update.web_dist_dir"
+        ))
+    ));
 }
 
 #[test]
 fn host_config_resolves_only_host_owned_relative_paths() {
     let mut config = valid_config();
     config
-        .resolve_and_validate(std::path::Path::new("/srv/gateway"))
+        .resolve_and_validate(
+            std::path::Path::new("/srv/gateway"),
+            std::path::Path::new("/srv/gateway/web/dist"),
+        )
         .expect("valid host config");
 
     assert_eq!(
@@ -38,7 +88,10 @@ fn host_config_resolves_only_host_owned_relative_paths() {
 fn host_config_resolves_runtime_data_dir_relative_to_configuration() {
     let mut config = valid_config();
     config
-        .resolve_and_validate(std::path::Path::new("/srv/gateway"))
+        .resolve_and_validate(
+            std::path::Path::new("/srv/gateway"),
+            std::path::Path::new("/srv/gateway/web/dist"),
+        )
         .expect("valid host config");
 
     assert_eq!(
@@ -51,7 +104,10 @@ fn host_config_resolves_runtime_data_dir_relative_to_configuration() {
 fn host_config_derives_update_paths_from_runtime_data_dir() {
     let mut config = valid_config();
     config
-        .resolve_and_validate(std::path::Path::new("/srv/gateway"))
+        .resolve_and_validate(
+            std::path::Path::new("/srv/gateway"),
+            std::path::Path::new("/srv/gateway/web/dist"),
+        )
         .expect("valid host config");
 
     assert_eq!(
@@ -75,7 +131,10 @@ fn host_config_rejects_zero_drain_window() {
 
     assert!(
         config
-            .resolve_and_validate(std::path::Path::new("/srv/gateway"))
+            .resolve_and_validate(
+                std::path::Path::new("/srv/gateway"),
+                std::path::Path::new("/srv/gateway/web/dist"),
+            )
             .is_err()
     );
 }
@@ -91,14 +150,17 @@ fn logging_rejects_zero_retention_windows() {
         }
         assert!(
             config
-                .resolve_and_validate(std::path::Path::new("/srv/gateway"))
+                .resolve_and_validate(
+                    std::path::Path::new("/srv/gateway"),
+                    std::path::Path::new("/srv/gateway/web/dist"),
+                )
                 .is_err()
         );
     }
 }
 
 #[test]
-fn logging_defaults_to_seven_days_and_one_day_for_payloads_and_rejects_count_retention() {
+fn logging_defaults_to_time_retention_and_ignores_removed_count_retention() {
     let mut value = serde_json::json!({
         "level": "info", "stdout": true,
         "file": { "enabled": true, "directory": "logs", "max_file_size_mb": 20 }
@@ -108,7 +170,10 @@ fn logging_defaults_to_seven_days_and_one_day_for_payloads_and_rejects_count_ret
     assert_eq!(config.file.retention_days, 7);
     assert!(!config.oauth_recovery);
     value["file"]["max_files"] = serde_json::json!(20);
-    assert!(serde_json::from_value::<LoggingConfig>(value).is_err());
+    assert_eq!(
+        serde_json::from_value::<LoggingConfig>(value).unwrap(),
+        config
+    );
 }
 
 #[test]
@@ -120,7 +185,10 @@ fn dedicated_file_channels_can_be_enabled_without_application_sinks() {
         config.logging.oauth_recovery = oauth_recovery;
         config.logging.request_dump = !oauth_recovery;
         config
-            .resolve_and_validate(std::path::Path::new("/srv/gateway"))
+            .resolve_and_validate(
+                std::path::Path::new("/srv/gateway"),
+                std::path::Path::new("/srv/gateway/web/dist"),
+            )
             .unwrap();
     }
 }

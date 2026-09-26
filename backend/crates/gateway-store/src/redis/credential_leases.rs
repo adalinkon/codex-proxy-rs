@@ -38,7 +38,7 @@ local max_concurrent = tonumber(ARGV[4])
 local interval_ms = tonumber(ARGV[5])
 local retry_ms = 0
 
-if in_flight >= max_concurrent then
+if max_concurrent > 0 and in_flight >= max_concurrent then
   local earliest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
   if #earliest == 2 then
     retry_ms = math.max(retry_ms, math.ceil(tonumber(earliest[2]) - now_ms))
@@ -177,7 +177,7 @@ impl CredentialBoundedLeaseRequest {
     pub fn validate(&self) -> StoreResult<()> {
         require_nonempty("credential bounded lease", "resource_id", &self.resource_id)?;
         require_nonempty("credential bounded lease", "owner_id", &self.owner_id)?;
-        if self.max_concurrent == 0 {
+        if self.max_concurrent == 0 && self.scope != CredentialLeaseScope::ProviderAccount {
             return Err(invalid("max_concurrent must be positive"));
         }
         supported_duration(self.request_interval, true, "request interval")?;
@@ -395,7 +395,7 @@ impl RedisCredentialLeaseRepository {
         request_interval: Duration,
     ) -> StoreResult<LeaseAttempt> {
         request.validate()?;
-        if max_concurrent == 0 {
+        if max_concurrent == 0 && request.scope != CredentialLeaseScope::ProviderAccount {
             return Err(invalid("max_concurrent must be positive"));
         }
         let keys = self.keys(request)?;
@@ -524,7 +524,7 @@ impl RedisProviderLeaseCoordinator {
                         last_started_at: signal.last_started_at.map(Into::into),
                         quota_reset_at: None,
                         quota_remaining_rank: None,
-                        rate_limited_until: None,
+                        cooldown: None,
                         failure_rate_basis_points: None,
                         first_output_latency_ms: None,
                     },
@@ -643,6 +643,36 @@ impl ProviderLeasePort for RedisProviderLeaseCoordinator {
                         .map_err(|_| provider_unavailable("acquire refresh lease"))
                 }
             }
+        })
+    }
+
+    fn account_in_flight<'a>(
+        &'a self,
+        account_ids: &'a [ProviderAccountId],
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<std::collections::BTreeMap<ProviderAccountId, u32>, ProviderStoreError>,
+    > {
+        Box::pin(async move {
+            if account_ids.is_empty() {
+                return Ok(std::collections::BTreeMap::new());
+            }
+            let ids = account_ids
+                .iter()
+                .map(|account_id| account_id.as_str().to_owned())
+                .collect::<Vec<_>>();
+            let signals = self
+                .repository
+                .credential_runtime_signals(&ids)
+                .await
+                .map_err(|_| provider_unavailable("load account in-flight signals"))?;
+            Ok(signals
+                .into_iter()
+                .filter_map(|signal| {
+                    let account_id = ProviderAccountId::new(signal.resource_id).ok()?;
+                    Some((account_id, signal.in_flight))
+                })
+                .collect())
         })
     }
 }

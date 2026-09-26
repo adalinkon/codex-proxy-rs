@@ -1,20 +1,42 @@
 import type { RequestOptions } from '../request'
+import type { RequestLocation } from '../types/request-location'
+import type { ClientProfileSelection, ProviderRequestProfiles, ProviderRequestProfileUpdates, XaiClientProfileSelection } from './client-profiles'
 import request from '../request'
 
 export type RotationStrategy = 'smart' | 'quota_reset_priority' | 'round_robin' | 'sticky'
 
 export interface RuntimeSettings {
+  providerRequestProfiles: ProviderRequestProfiles
+  openaiClientProfile: ClientProfileSelection | null
+  xaiClientProfile: XaiClientProfileSelection | null
+
+  requestLocationEnabled: boolean
+  requestLocation: RequestLocation
   modelMappings: Record<string, string>
   refreshMarginSeconds: number
   refreshConcurrency: number
   maxConcurrentPerAccount: number
   requestIntervalMs: number
+  maxWaitingPerKey: number
+  maxWaitingPerAccount: number
+  concurrencyWaitTimeoutSeconds: number
+  responsesMaxDecompressedBodyBytes: number
   rotationStrategy: RotationStrategy
   minCodexDesktopVersion: string | null
   minCodexCliVersion: string | null
   usageRetentionDays: number
   opsEventRetentionDays: number
   auditRetentionDays: number
+  accountAutoFreezeEnabled: boolean
+  accountAutoFreezeThreshold: number
+  accountAutoFreezeWindowSeconds: number
+  accountAutoFreezeDurationSeconds: number
+  accountAutoFreezeProbeEnabled: boolean
+  accountAutoFreezeProbeModel: string | null
+  accountAutoFreezeAdaptiveConcurrency: boolean
+  accountWarmupEnabled: boolean
+  accountWarmupScheduleTime: string
+  accountWarmupModel: string | null
   updatedAt: string
 }
 
@@ -58,7 +80,9 @@ export function getSettings(options: RequestOptions = {}) {
   })
 }
 
-type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt'>
+type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'openaiClientProfile' | 'xaiClientProfile' | 'providerRequestProfiles'> & {
+  providerRequestProfiles: ProviderRequestProfileUpdates
+}
 
 export function updateSettings(data: UpdateSettingsParam) {
   return request<RuntimeSettings>({

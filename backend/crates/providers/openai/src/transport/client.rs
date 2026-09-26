@@ -12,6 +12,7 @@ use crate::transport::profile::CodexWireProfileState;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::{Stream, StreamExt};
+use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_protocol::openai::{
     WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY, events::retry_after_seconds_from_body,
     sse::SseError,
@@ -33,7 +34,7 @@ use super::response_meta::CodexResponseMetadata;
 use super::tls::{CustomCaError, build_reqwest_client_with_custom_ca, custom_ca_env_cache_key};
 use super::websocket::{
     CodexWebSocketExchangeError, CodexWebSocketPool, CodexWebSocketPoolKey,
-    CodexWebSocketRateLimitUpdates, CodexWebSocketRequest, CodexWebSocketTurnStateUpdate,
+    CodexWebSocketRateLimitUpdates, CodexWebSocketRequest, CodexWebSocketResponseMetadataUpdates,
     PreparedWebSocket, WebSocketOriginBreaker, WebSocketPoolDecision,
 };
 
@@ -45,7 +46,7 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
     "x-codex-ws-stream-request-start-ms";
-type ReqwestClientCacheKey = (Option<String>, String);
+type ReqwestClientCacheKey = (Option<String>, String, Duration);
 type ReqwestClientCache = Mutex<HashMap<ReqwestClientCacheKey, Client>>;
 
 /// 构建带缓存、自动协商 HTTP/2 的 reqwest Client。
@@ -57,8 +58,20 @@ pub fn build_account_http_client(
     account_id: &str,
     proxy: Option<&gateway_core::account::OutboundProxy>,
 ) -> Result<Client, CustomCaError> {
+    build_account_http_client_with_timeout(account_id, proxy, UPSTREAM_CONNECT_TIMEOUT)
+}
+
+pub(super) fn build_account_http_client_with_timeout(
+    account_id: &str,
+    proxy: Option<&gateway_core::account::OutboundProxy>,
+    timeout: Duration,
+) -> Result<Client, CustomCaError> {
     super::tls::ensure_rustls_provider();
-    let cache_key = (custom_ca_env_cache_key(), egress_key(account_id, proxy));
+    let cache_key = (
+        custom_ca_env_cache_key(),
+        egress_key(account_id, proxy),
+        timeout,
+    );
     static CLIENTS: OnceLock<ReqwestClientCache> = OnceLock::new();
     let cache = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(client) = cache
@@ -74,7 +87,8 @@ pub fn build_account_http_client(
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(4)
         .pool_idle_timeout(None::<Duration>)
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .connect_timeout(timeout)
+        .connector_layer(super::connection::ConnectionLayer)
         .tcp_keepalive(Duration::from_secs(30))
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_timeout(Duration::from_secs(5))
@@ -187,6 +201,8 @@ impl fmt::Debug for CodexClientVisibleUpstreamResponse {
 /// Codex 上游 HTTP 客户端错误。
 #[derive(Error)]
 pub enum CodexClientError {
+    #[error("connection recovery budget exhausted")]
+    ConnectionBudgetExhausted,
     /// Reqwest 传输失败。
     #[error("http transport error: {0}")]
     Http(#[from] reqwest::Error),
@@ -212,6 +228,9 @@ pub enum CodexClientError {
     /// 请求头值无效。
     #[error("invalid request header value: {0}")]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
+    /// 中间件业务头试图覆盖 Provider 已构造的受管头。
+    #[error("middleware request header conflicts with a provider-managed header")]
+    MiddlewareHeaderConflict,
     /// SSE 响应解析失败。
     #[error("invalid upstream SSE response: {0}")]
     InvalidSse(#[from] SseError),
@@ -265,6 +284,9 @@ pub enum CodexClientError {
 impl fmt::Debug for CodexClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConnectionBudgetExhausted => {
+                formatter.write_str("CodexClientError::ConnectionBudgetExhausted")
+            }
             Self::Http(_) => formatter.write_str("CodexClientError::Http([REDACTED])"),
             Self::HttpJson(_) => formatter.write_str("CodexClientError::HttpJson([REDACTED])"),
             Self::ErrorBodyRead {
@@ -280,6 +302,9 @@ impl fmt::Debug for CodexClientError {
             }
             Self::InvalidHeaderValue(_) => {
                 formatter.write_str("CodexClientError::InvalidHeaderValue([REDACTED])")
+            }
+            Self::MiddlewareHeaderConflict => {
+                formatter.write_str("CodexClientError::MiddlewareHeaderConflict")
             }
             Self::InvalidSse(_) => formatter.write_str("CodexClientError::InvalidSse([REDACTED])"),
             Self::ModelCatalog(error) => formatter
@@ -331,9 +356,11 @@ impl CodexClientError {
             Self::Upstream { transport, .. } | Self::ErrorBodyRead { transport, .. } => {
                 Some(*transport)
             }
-            Self::CustomCa(_)
+            Self::ConnectionBudgetExhausted
+            | Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
+            | Self::MiddlewareHeaderConflict
             | Self::WebSocketEncode(_)
             | Self::RequestBodyEncode(_)
             | Self::RequestCompression(_) => None,
@@ -556,6 +583,7 @@ pub enum CodexTransportDecision {
     ExactWebSocket,
     RequiredWebSocket,
     Http2WebSocketBudgetExhausted,
+    Http2LocalConnectionCapacity,
     Http2BreakerOpen,
     Http2PoolUnavailable,
 }
@@ -569,6 +597,7 @@ impl CodexTransportDecision {
             Self::ExactWebSocket => "ws_exact_required",
             Self::RequiredWebSocket => "ws_required",
             Self::Http2WebSocketBudgetExhausted => "http2_ws_budget_exhausted",
+            Self::Http2LocalConnectionCapacity => "http2_local_connection_capacity",
             Self::Http2BreakerOpen => "http2_breaker_open",
             Self::Http2PoolUnavailable => "http2_pool_unavailable",
         }
@@ -589,8 +618,8 @@ pub struct CodexTransportMetrics {
 /// 响应头之后在 live 流中采集的结构化限流更新。
 pub type CodexRateLimitUpdates = CodexWebSocketRateLimitUpdates;
 
-/// 响应头之后在 live 流中采集的 turn state 更新。
-pub type CodexTurnStateUpdate = CodexWebSocketTurnStateUpdate;
+/// 响应头之后在 live 流中采集的请求级 metadata 更新。
+pub type CodexResponseMetadataUpdates = CodexWebSocketResponseMetadataUpdates;
 
 /// Codex Responses 上游 live SSE 响应。
 pub struct CodexBackendStreamingResponse {
@@ -608,8 +637,8 @@ pub struct CodexBackendStreamingResponse {
     pub rate_limit_headers: Vec<(String, String)>,
     /// live stream 期间捕获的结构化限流更新。
     pub rate_limit_updates: Option<CodexRateLimitUpdates>,
-    /// live stream 期间捕获的 turn-state 更新。
-    pub turn_state_update: Option<CodexTurnStateUpdate>,
+    /// live stream 期间捕获的请求级 metadata 更新。
+    pub response_metadata_updates: Option<CodexResponseMetadataUpdates>,
     /// WebSocket 连接池决策。
     pub websocket_pool_decision: Option<WebSocketPoolDecision>,
     /// 上游诊断元数据。
@@ -642,21 +671,119 @@ pub struct CodexBackendJsonResponse {
 // CodexBackendClient
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpenAiUpstreamProtocol {
+    Codex,
+    ResponsesApi,
+}
+
+impl OpenAiUpstreamProtocol {
+    pub(super) const fn responses_path(self) -> &'static str {
+        match self {
+            Self::Codex => super::endpoints::CODEX_RESPONSES_PATH,
+            Self::ResponsesApi => "/responses",
+        }
+    }
+}
+
 /// Codex HTTP/SSE 上游客户端。
 #[derive(Clone)]
 pub struct CodexBackendClient {
+    pub(super) connection_budget: Option<gateway_core::engine::connection::ConnectionBudget>,
     pub(super) client: Client,
     pub(super) direct_client: Client,
     pub(super) base_url: String,
+    pub(super) official_base_url: String,
+    pub(super) protocol: OpenAiUpstreamProtocol,
     pub(super) profile: CodexWireProfileState,
     pub(super) websocket_pool: Option<Arc<CodexWebSocketPool>>,
     pub(super) websocket_origin_breaker: WebSocketOriginBreaker,
     pub(super) websocket_origin_key: String,
     pub(super) outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub(super) egress_key: String,
+    pub(super) middleware_headers: Vec<MiddlewareHeader>,
 }
 
 impl CodexBackendClient {
+    pub(crate) fn with_connection_budget(
+        mut self,
+        budget: gateway_core::engine::connection::ConnectionBudget,
+    ) -> Self {
+        self.connection_budget = Some(budget);
+        self
+    }
+
+    pub(super) fn connection_opening(&self) -> Result<Option<Duration>, CodexClientError> {
+        self.connection_budget.as_ref().map_or(Ok(None), |budget| {
+            budget
+                .begin()
+                .map_err(|_| CodexClientError::ConnectionBudgetExhausted)
+        })
+    }
+
+    pub(super) fn http_opening_client(&self) -> Result<Client, CodexClientError> {
+        let Some(remaining) = self.connection_opening()? else {
+            return Ok(self.client.clone());
+        };
+        if remaining >= UPSTREAM_CONNECT_TIMEOUT {
+            return Ok(self.client.clone());
+        }
+        // 按整秒向下取整限制缓存种类；不足一秒不缓存新的 client 配置。
+        let timeout = Duration::from_secs(remaining.as_secs());
+        if timeout.is_zero() {
+            return Err(CodexClientError::ConnectionBudgetExhausted);
+        }
+        Ok(build_account_http_client_with_timeout(
+            &self.egress_key,
+            self.outbound_proxy.as_ref(),
+            timeout,
+        )?)
+    }
+
+    /// 覆盖官方账号接口基址，用于隔离上游联调与协议测试。
+    #[must_use]
+    pub fn with_official_base_url(mut self, official_base_url: impl Into<String>) -> Self {
+        self.official_base_url = official_base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// 自定义账号路由明确不存在时才回退一次；调用方继续解释最后一次响应。
+    pub(super) async fn send_account_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        fallback: reqwest::RequestBuilder,
+    ) -> CodexClientResult<ReqwestResponse> {
+        let response = request.send().await.map_err(CodexClientError::HttpJson)?;
+        if response.status() != StatusCode::NOT_FOUND
+            || self.base_url.trim_end_matches('/') == self.official_base_url.trim_end_matches('/')
+        {
+            return Ok(response);
+        }
+        tracing::debug!(
+            endpoint = response.url().path(),
+            "custom account endpoint returned 404; falling back to official endpoint"
+        );
+        drop(response);
+        // 消费可能已在回退端完成，传输失败不能被先前的 404 覆盖。
+        fallback.send().await.map_err(CodexClientError::HttpJson)
+    }
+
+    pub(crate) fn with_authentication(
+        mut self,
+        authentication: &crate::credential::CodexRuntimeAuthentication,
+    ) -> Self {
+        if let crate::credential::CodexRuntimeAuthentication::ApiKey(auth) = authentication {
+            self.base_url = auth.configuration.base_url.trim_end_matches('/').to_owned();
+            self.protocol = OpenAiUpstreamProtocol::ResponsesApi;
+            self.websocket_origin_key = format!(
+                "{}:{}",
+                websocket_origin_key(&self.base_url),
+                self.egress_key
+            );
+        }
+        self
+    }
+
     pub fn for_account(
         &self,
         account: &gateway_core::account::ProviderAccount,
@@ -664,6 +791,11 @@ impl CodexBackendClient {
         let mut client = self.clone();
         client.outbound_proxy = account.outbound_proxy().cloned();
         client.egress_key = egress_key(account.id().as_str(), account.outbound_proxy());
+        if account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
+            client
+                .egress_key
+                .push_str(&format!(":revision:{}", account.revision().get()));
+        }
         client.websocket_origin_key = format!(
             "{}:{}",
             websocket_origin_key(&self.base_url),
@@ -940,6 +1072,9 @@ pub(super) fn websocket_success_decision(
 pub(super) fn local_http_fallback_decision(
     error: &CodexWebSocketExchangeError,
 ) -> Option<CodexTransportDecision> {
+    if crate::transport::connection::is_admission_failure(error) {
+        return Some(CodexTransportDecision::Http2LocalConnectionCapacity);
+    }
     match error.classified() {
         CodexWebSocketExchangeError::OriginCircuitOpen
         | CodexWebSocketExchangeError::OriginHalfOpenBusy => {

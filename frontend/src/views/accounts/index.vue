@@ -1,14 +1,9 @@
 <script setup lang="ts">
+import { BaseCard, BaseCheckbox, BaseConfirmModal, BasePageHeader, BaseTable, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
+
 import { ChevronDown } from '@lucide/vue'
 import { ref } from 'vue'
-
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
@@ -18,6 +13,7 @@ import AccountCreateModal from './components/AccountCreateModal/index.vue'
 import AccountEditModal from './components/AccountEditModal.vue'
 import AccountFilters from './components/AccountFilters.vue'
 import AccountIdentityCell from './components/AccountIdentityCell.vue'
+import AccountImportTasks from './components/AccountImportTasks/index.vue'
 import AccountOverviewCards from './components/AccountOverviewCards.vue'
 import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
@@ -28,12 +24,14 @@ import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
 import { useAccountEditor } from './composables/useAccountEditor'
+import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
 import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(accountColumns, 'accounts')
 const {
   loading,
   accounts,
@@ -58,6 +56,20 @@ const {
   loadGroups,
 } = useAccountGroupCatalog()
 
+const importTasks = useAccountImportTasks({
+  reload: () => Promise.all([loadAccounts(), loadGroups()]),
+})
+const {
+  open: showImportTasks,
+  tasks: recentImportTasks,
+  selectedId: importTaskId,
+  detail: importTaskDetail,
+  loading: loadingImportTasks,
+  stopping: stoppingImportTask,
+  error: importTaskError,
+  activeCount: activeImportCount,
+} = importTasks
+
 const {
   showCreateModal,
   showDeleteModal,
@@ -66,11 +78,16 @@ const {
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
+  downloadingCatalogAccountIds,
+  togglingSchedulingAccountIds,
   deletingAccount,
   creatingAccount,
   authorizingOAuth,
+  authorization,
+  authorizationCallback,
   batchDeleting,
   exportingAccounts,
+  exportDisabledReason,
   reauthorizingAccount,
   createForm,
   handleCreate,
@@ -81,10 +98,14 @@ const {
   handleDelete,
   handleBatchDelete,
   handleExportAccounts,
+  handleDownloadModelCatalog,
   handleRecover,
   handleRefresh,
   handleRefreshQuota,
+  handleQuotaReset,
+  handleToggleScheduling,
 } = useAccountMutations({
+  onImportTaskCreated: importTasks.created,
   accounts,
   selectedIds,
   reload: () => Promise.all([loadAccounts(), loadGroups()]),
@@ -128,6 +149,9 @@ const {
   schedulingEnabled: batchSchedulingEnabled,
   concurrencyLimit: batchConcurrencyLimit,
   weight: batchWeight,
+  modelAccess: batchModelAccess,
+  hasChanges: batchHasChanges,
+  catalogAccountId: batchCatalogAccountId,
   proxyMode: batchProxyMode,
   proxyId: batchProxyId,
   selectedGroupIds: batchGroupIds,
@@ -142,11 +166,17 @@ const {
 })
 
 const {
+  apiKey: editingApiKey,
+  oauthTransport: editingOAuthTransport,
+  configurationLoading,
+  configurationReady,
   showEditModal,
   editingAccount,
+  notes: editingNotes,
   schedulingEnabled,
   concurrencyLimit: editingConcurrencyLimit,
   weight: editingWeight,
+  modelAccess: editingModelAccess,
   proxyMode: editingProxyMode,
   proxyId: editingProxyId,
   selectedGroupIds: editingGroupIds,
@@ -184,18 +214,31 @@ const {
           :selected-count="selectedIds.size"
           :batch-deleting="batchDeleting"
           :exporting-accounts="exportingAccounts"
+          :export-disabled-reason="exportDisabledReason"
+          :has-import-tasks="recentImportTasks.length > 0"
+          :active-import-count="activeImportCount"
+          @import-tasks="showImportTasks = true"
           @delete-selected="showDeleteModal = true"
           @export-selected="handleExportAccounts"
           @create="openCreateAccount"
           @edit-selected="openBatchEdit"
-        />
+        >
+          <template #actions>
+            <BaseTableColumnSettings
+              :options="columnOptions"
+              @change="setColumnVisible"
+              @reorder="setColumnOrder"
+              @reset="resetColumns"
+            />
+          </template>
+        </AccountFilters>
       </template>
 
       <template #body>
         <div class="flex min-h-0 flex-col xl:h-full">
           <BaseTable
             class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] xl:h-auto! xl:min-h-0 xl:flex-1"
-            :columns="accountColumns"
+            :columns="visibleColumns"
             :rows="accounts"
             :loading="loading"
             :selected-row-keys="selectedRowKeys"
@@ -236,7 +279,7 @@ const {
             </template>
 
             <template #identity="{ row }">
-              <AccountIdentityCell :account="row" />
+              <AccountIdentityCell :account="row" show-notes />
             </template>
 
             <template #provider="{ row }">
@@ -252,12 +295,14 @@ const {
                 :error-reason="row.errorReason"
                 :error-message="row.errorMessage"
                 :rate-limited-until="row.quota.rateLimitedUntil"
+                :rate-limit-reason="row.quota.rateLimitReason"
+                :recovery-probe-required="row.quota.recoveryProbeRequired"
                 :next-refresh-at="row.nextRefreshAt"
               />
             </template>
 
             <template #planType="{ row }">
-              <AccountPlanBadge :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+              <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
             </template>
 
             <template #usage="{ row }">
@@ -278,15 +323,19 @@ const {
               <AccountTableActions
                 :account="row"
                 :deleting="deletingAccount"
+                :downloading-catalog="downloadingCatalogAccountIds.has(row.id)"
                 :recovering="recoveringAccountIds.has(row.id)"
                 :refreshing="refreshingAccountIds.has(row.id)"
                 :testing="testingConnectionIds.has(row.id)"
+                :toggling-scheduling="togglingSchedulingAccountIds.has(row.id)"
                 @edit="openAccountEdit"
                 @delete="requestDeleteAccount"
+                @download-model-catalog="handleDownloadModelCatalog"
                 @recover="handleRecover"
                 @refresh="handleRefresh"
                 @reauthorize="openReauthorizeAccount"
                 @test="openConnectionTest"
+                @toggle-scheduling="handleToggleScheduling"
               />
             </template>
 
@@ -295,7 +344,7 @@ const {
                 <AccountQuotaPanel
                   :account="row"
                   :refreshing="refreshingQuotaAccountIds.has(row.id)"
-                  @account-updated="void replaceAccount($event)"
+                  @quota-reset="handleQuotaReset"
                   @refresh-quota="handleRefreshQuota"
                 />
                 <AccountUsagePanel
@@ -334,9 +383,25 @@ const {
       @test="handleTestConnection()"
     />
 
+    <AccountImportTasks
+      v-model="showImportTasks"
+      :tasks="recentImportTasks"
+      :selected-id="importTaskId"
+      :detail="importTaskDetail"
+      :loading="loadingImportTasks"
+      :stopping="stoppingImportTask"
+      :error="importTaskError"
+      @select="importTasks.select"
+      @refresh="importTasks.refresh"
+      @stop="importTasks.stop"
+      @view-accounts="showImportTasks = false; loadAccounts()"
+    />
+
     <AccountCreateModal
       v-model="showCreateModal"
       v-model:form="createForm"
+      v-model:callback="authorizationCallback"
+      :authorization="authorization"
       :account="reauthorizingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
@@ -349,12 +414,18 @@ const {
 
     <AccountEditModal
       v-model="showEditModal"
+      v-model:api-key="editingApiKey"
+      v-model:oauth-transport="editingOAuthTransport"
+      v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
       v-model:concurrency-limit="editingConcurrencyLimit"
       v-model:weight="editingWeight"
+      v-model:model-access="editingModelAccess"
       v-model:proxy-mode="editingProxyMode"
       v-model:proxy-id="editingProxyId"
       v-model:selected-group-ids="editingGroupIds"
+      :configuration-loading="configurationLoading"
+      :configuration-ready="configurationReady"
       :account="editingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
@@ -367,13 +438,16 @@ const {
       v-model:enabled="batchSchedulingEnabled"
       v-model:concurrency-limit="batchConcurrencyLimit"
       v-model:weight="batchWeight"
+      v-model:model-access="batchModelAccess"
       v-model:proxy-mode="batchProxyMode"
       v-model:proxy-id="batchProxyId"
       v-model:selected-group-ids="batchGroupIds"
+      :catalog-account-id="batchCatalogAccountId"
       :selected-count="selectedIds.size"
       :groups="groups"
       :groups-loading="groupsLoading"
       :saving="savingBatchEdit"
+      :has-changes="batchHasChanges"
       @save="saveBatchEdit"
     />
 

@@ -1,6 +1,16 @@
 //! OpenAI Provider 向 Host 贡献的后台 worker。
 
+use std::sync::Mutex;
+
 use super::*;
+use crate::transport::profile::cli_release::CliReleaseService;
+use crate::transport::profile::platform_release::PlatformDesktopReleaseService;
+
+pub(crate) struct ClientReleaseServices {
+    pub desktop: Arc<CodexDesktopReleaseService>,
+    pub cli: Arc<CliReleaseService>,
+    pub platforms: Arc<PlatformDesktopReleaseService>,
+}
 
 pub(super) const WORKER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub(super) const WORKER_MAXIMUM_BACKOFF: Duration = Duration::from_secs(60);
@@ -11,6 +21,8 @@ pub(super) const QUOTA_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DESKTOP_RELEASE_WORKER_OWNER: &str = "openai-desktop-release";
 pub(super) const MODEL_ETAG_WORKER_OWNER: &str = "openai-model-etag";
 pub(super) const MODEL_CATALOG_WORKER_OWNER: &str = "openai-model-catalog";
+pub(super) const WARMUP_WORKER_OWNER: &str = "openai-account-warmup";
+pub(super) const WARMUP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) fn worker_contributions(
     refresh: Arc<CodexCredentialRefreshService>,
@@ -18,7 +30,7 @@ pub(crate) fn worker_contributions(
     catalog: Arc<CodexCredentialCatalogService>,
     quota_refresh_policy: CodexQuotaRefreshPolicy,
     oauth_refresh_enabled: bool,
-    desktop_release: Arc<CodexDesktopReleaseService>,
+    releases: ClientReleaseServices,
 ) -> Result<Vec<WorkerContribution>, WorkerDefinitionError> {
     let refresh_id = WorkerId::try_new(WorkerKind::OAuthRefresh, PROVIDER_NAME)?;
     let quota_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, PROVIDER_NAME)?;
@@ -26,6 +38,8 @@ pub(crate) fn worker_contributions(
     let etag_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, MODEL_ETAG_WORKER_OWNER)?;
     let desktop_release_id =
         WorkerId::try_new(WorkerKind::QuotaCatalogHealth, DESKTOP_RELEASE_WORKER_OWNER)?;
+    let cli_release_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-cli-release")?;
+    let warmup_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, WARMUP_WORKER_OWNER)?;
     let mut contributions = Vec::new();
     if oauth_refresh_enabled {
         contributions.push(WorkerContribution::Registration(scheduled_registration(
@@ -36,9 +50,33 @@ pub(crate) fn worker_contributions(
     }
     contributions.extend([
         WorkerContribution::Registration(scheduled_registration(
+            WorkerId::try_new(
+                WorkerKind::QuotaCatalogHealth,
+                "openai-platform-desktop-release",
+            )?,
+            APPCAST_POLL_INTERVAL,
+            Box::new(OpenAiPlatformDesktopReleaseTask {
+                service: releases.platforms,
+            }),
+        )?),
+        WorkerContribution::Registration(scheduled_registration(
+            cli_release_id,
+            APPCAST_POLL_INTERVAL,
+            Box::new(OpenAiCliReleaseTask {
+                service: releases.cli,
+            }),
+        )?),
+        WorkerContribution::Registration(scheduled_registration(
             quota_id,
             QUOTA_CHECK_INTERVAL,
-            Box::new(OpenAiQuotaTask { quota }),
+            Box::new(OpenAiQuotaTask {
+                quota: Arc::clone(&quota),
+            }),
+        )?),
+        WorkerContribution::Registration(scheduled_registration(
+            warmup_id,
+            WARMUP_CHECK_INTERVAL,
+            Box::new(OpenAiWarmupTask::new(Arc::clone(&quota))),
         )?),
         WorkerContribution::Registration(scheduled_registration(
             catalog_id,
@@ -61,7 +99,7 @@ pub(crate) fn worker_contributions(
             desktop_release_id,
             APPCAST_POLL_INTERVAL,
             Box::new(OpenAiDesktopReleaseTask {
-                service: desktop_release,
+                service: releases.desktop,
             }),
         )?),
     ]);
@@ -267,6 +305,139 @@ impl DaemonTask for OpenAiCatalogEtagTask {
                     );
                 }
             }
+        })
+    }
+}
+
+struct OpenAiCliReleaseTask {
+    service: Arc<CliReleaseService>,
+}
+
+impl ScheduledTask for OpenAiCliReleaseTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = context.cancellation().cancelled() => {},
+                result = self.service.refresh() => {
+                    if let Err(error) = result { tracing::warn!(error = %error, "OpenAI CLI release check failed"); }
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+struct OpenAiPlatformDesktopReleaseTask {
+    service: Arc<PlatformDesktopReleaseService>,
+}
+impl ScheduledTask for OpenAiPlatformDesktopReleaseTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = context.cancellation().cancelled() => {},
+                () = self.service.refresh() => {},
+            }
+            Ok(())
+        })
+    }
+}
+
+pub(super) struct OpenAiWarmupTask {
+    quota: Arc<CodexCredentialQuotaService>,
+    last_slot_executed: Mutex<Option<String>>,
+}
+
+impl OpenAiWarmupTask {
+    pub(super) fn new(quota: Arc<CodexCredentialQuotaService>) -> Self {
+        Self {
+            quota,
+            last_slot_executed: Mutex::new(None),
+        }
+    }
+}
+
+impl ScheduledTask for OpenAiWarmupTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            if context.cancellation().is_cancelled() {
+                return Ok(());
+            }
+            let policy = self
+                .quota
+                .runtime_policy()
+                .load_warmup_policy()
+                .await
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "OpenAI warmup policy load failed");
+                    WorkerTaskError::safe("OpenAI warmup policy load failed")
+                })?;
+            if !policy.enabled() {
+                return Ok(());
+            }
+            use chrono::{Datelike as _, Timelike as _};
+            let china_now = chrono::Utc::now() + chrono::Duration::hours(8);
+            let hour = china_now.time().hour();
+            let minute = china_now.time().minute();
+            let scheduled_times = policy.scheduled_times();
+            let matched = scheduled_times
+                .iter()
+                .any(|&(h, m)| h == hour && m == minute);
+            if !matched {
+                return Ok(());
+            }
+            let slot_key = format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                china_now.date_naive().year(),
+                china_now.date_naive().month(),
+                china_now.date_naive().day(),
+                hour,
+                minute
+            );
+            {
+                let mut last = self
+                    .last_slot_executed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last.as_deref() == Some(&slot_key) {
+                    return Ok(());
+                }
+                *last = Some(slot_key);
+            }
+            let Some(model) = policy.model() else {
+                return Err(WorkerTaskError::safe("OpenAI warmup model is missing"));
+            };
+            tracing::info!(hour, minute, model, "OpenAI account warmup cycle started");
+            let outcome = tokio::select! {
+                () = context.cancellation().cancelled() => return Ok(()),
+                outcome = self.quota.execute_warmup(model) => outcome,
+            };
+            match outcome {
+                Ok(summary) => {
+                    tracing::info!(
+                        warmed_up = summary.warmed_up,
+                        skipped_active = summary.skipped_active,
+                        skipped_exhausted = summary.skipped_exhausted,
+                        failed = summary.failed,
+                        "OpenAI account warmup cycle completed"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "OpenAI account warmup cycle failed");
+                }
+            }
+            let china_after = chrono::Utc::now() + chrono::Duration::hours(8);
+            if china_after.date_naive() == china_now.date_naive()
+                && china_after.hour() == hour
+                && china_after.minute() == minute
+            {
+                // 持有本轮 leader lease 到时间槽结束，避免其他实例在同一分钟再次执行。
+                let hold = Duration::from_secs(u64::from(61 - china_after.second()));
+                tokio::select! {
+                    () = context.cancellation().cancelled() => return Ok(()),
+                    () = tokio::time::sleep(hold) => {}
+                }
+            }
+            Ok(())
         })
     }
 }

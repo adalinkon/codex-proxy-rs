@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import type { AccountErrorReason, AccountStatus } from '@/api'
-import { computed } from 'vue'
+import { BasePopover, BaseScrollbar } from '@codex-proxy/ui'
 
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import { computed } from 'vue'
 import { useUiClock } from '@/composables/useUiClock'
 import { resolveAccountStatusPresentation } from './presenter'
 
@@ -13,6 +12,8 @@ const props = withDefaults(
     errorReason?: AccountErrorReason | null
     errorMessage?: string | null
     rateLimitedUntil?: string | null
+    rateLimitReason?: 'upstream_rate_limit' | 'capacity_freeze' | null
+    recoveryProbeRequired?: boolean
     nextRefreshAt?: string | null
     variant?: 'inline' | 'pill'
   }>(),
@@ -20,6 +21,8 @@ const props = withDefaults(
     errorReason: null,
     errorMessage: null,
     rateLimitedUntil: null,
+    rateLimitReason: null,
+    recoveryProbeRequired: false,
     nextRefreshAt: null,
     variant: 'inline',
   },
@@ -32,6 +35,8 @@ const presentation = computed(() =>
     errorReason: props.errorReason,
     errorMessage: props.errorMessage,
     rateLimitedUntil: props.rateLimitedUntil,
+    rateLimitReason: props.rateLimitReason,
+    recoveryProbeRequired: props.recoveryProbeRequired,
     nextRefreshAt: props.nextRefreshAt,
     now: now.value.getTime(),
   }),
@@ -102,7 +107,7 @@ const presentation = computed(() =>
           v-if="presentation.rateLimitRecovery"
           class="flex items-center justify-between gap-3 rounded-cp bg-cp-fill-quaternary px-3 py-2"
         >
-          <span class="font-heavy text-cp-text-tertiary">预计恢复</span>
+          <span class="font-heavy text-cp-text-tertiary">{{ presentation.recoveryTimeLabel }}</span>
           <span class="font-mono font-emphasis tabular-nums text-cp-text">
             {{ presentation.rateLimitRecovery }}
           </span>

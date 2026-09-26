@@ -46,6 +46,16 @@ use crate::transport::{
 use super::client::*;
 
 impl CodexBackendClient {
+    pub(crate) const fn profile_state(&self) -> &CodexWireProfileState {
+        &self.profile
+    }
+
+    /// 请求只持有自己的画像副本；连接池和 HTTP client 继续共享既有资源。
+    pub fn with_request_profile(mut self, profile: super::profile::CodexWireProfile) -> Self {
+        self.profile = CodexWireProfileState::new(profile);
+        self
+    }
+
     /// 构造客户端。
     pub fn new(
         client: Client,
@@ -54,12 +64,16 @@ impl CodexBackendClient {
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
+            connection_budget: None,
             direct_client: client.clone(),
             client,
             websocket_origin_key: websocket_origin_key(&base_url),
             outbound_proxy: None,
             egress_key: String::new(),
+            middleware_headers: Vec::new(),
             base_url,
+            official_base_url: crate::OFFICIAL_CODEX_BASE_URL.to_owned(),
+            protocol: OpenAiUpstreamProtocol::Codex,
             profile,
             websocket_pool: None,
             websocket_origin_breaker: WebSocketOriginBreaker::default(),
@@ -69,6 +83,16 @@ impl CodexBackendClient {
     /// 为 Responses WebSocket 请求启用连接池。
     pub fn with_websocket_pool(mut self, pool: Arc<CodexWebSocketPool>) -> Self {
         self.websocket_pool = Some(pool);
+        self
+    }
+
+    /// 附加当前 attempt 经 Core 复核的业务请求头。
+    #[must_use]
+    pub(crate) fn with_middleware_headers(
+        mut self,
+        middleware_headers: Vec<gateway_core::engine::middleware::MiddlewareHeader>,
+    ) -> Self {
+        self.middleware_headers = middleware_headers;
         self
     }
 
@@ -87,7 +111,7 @@ impl CodexBackendClient {
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
         let headers = self.request_headers_for_http_response(upstream_request, context)?;
         let headers_started_at = Instant::now();
-        // 与官方 Codex app-server 一致：/v1/responses 请求体默认 zstd 压缩。
+        // OAuth 请求遵循 Codex 压缩合同；API Key 上游使用普通 JSON。
         // Codex 上游只交付 SSE；即使下游请求 `stream: false`，也要上游流式执行，
         // 再由 API 层收集 canonical events 并返回完整 JSON。不能把下游的传输偏好
         // 直接透传给 Codex，否则上游会以 400 拒绝非流式请求。
@@ -95,7 +119,7 @@ impl CodexBackendClient {
         upstream_body.insert("stream".to_owned(), serde_json::Value::Bool(true));
         let body =
             serde_json::to_vec(&upstream_body).map_err(CodexClientError::RequestBodyEncode)?;
-        let endpoint = endpoint_url(&self.base_url, CODEX_RESPONSES_PATH);
+        let endpoint = endpoint_url(&self.base_url, self.protocol.responses_path());
         let trace = context
             .trace
             .cloned()
@@ -111,16 +135,16 @@ impl CodexBackendClient {
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
         trace.capture("upstream.request.body", &body);
-        let body = zstd::stream::encode_all(std::io::Cursor::new(body), 3)
-            .map_err(CodexClientError::RequestCompression)?;
-        let response = self
-            .client
-            .post(endpoint)
-            .headers(headers)
-            .header(CONTENT_ENCODING, HeaderValue::from_static("zstd"))
-            .body(body)
-            .send()
-            .await?;
+        let client = self.http_opening_client()?;
+        let mut outbound = client.post(endpoint).headers(headers);
+        let body = if self.protocol == OpenAiUpstreamProtocol::Codex {
+            outbound = outbound.header(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+            zstd::stream::encode_all(std::io::Cursor::new(body), 3)
+                .map_err(CodexClientError::RequestCompression)?
+        } else {
+            body
+        };
+        let response = outbound.body(body).send().await?;
         let upstream_headers_ms = elapsed_duration_millis(headers_started_at.elapsed());
         let http_version = http_version_name(response.version()).to_string();
         let status = response.status();
@@ -197,7 +221,7 @@ impl CodexBackendClient {
             set_cookie_headers,
             rate_limit_headers,
             rate_limit_updates: Some(rate_limit_updates),
-            turn_state_update: None,
+            response_metadata_updates: None,
             websocket_pool_decision: None,
             diagnostics,
             response_metadata,
@@ -251,14 +275,16 @@ impl CodexBackendClient {
 
         let websocket_request = websocket_upstream_request(request);
         let headers = self.request_headers_for_websocket_response(&websocket_request, context)?;
-        let mut websocket_create = CodexWebSocketConnection::responses_create_request(
+        let mut websocket_create = CodexWebSocketConnection::responses_create_request_for_path(
             &self.base_url,
+            self.protocol.responses_path(),
             &generate_key(),
             websocket_header_pairs(&headers),
             &websocket_request,
         )
         .map_err(CodexClientError::WebSocketEncode)?;
         websocket_create.connection.outbound_proxy = self.outbound_proxy.clone();
+        websocket_create.connection.connection_budget = self.connection_budget.clone();
         context.trace.cloned().unwrap_or_default().headers(
             "upstream.request.headers",
             serde_json::json!({"transport": "websocket", "phase": "prepared_opening"}),
@@ -280,7 +306,7 @@ impl CodexBackendClient {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }
-        let connection_profile = websocket_connection_profile(&headers);
+        let connection_profile = websocket_connection_profile(&headers, &self.middleware_headers);
         let pool_key =
             self.websocket_pool_key(request, context, pool_account_id, &connection_profile);
         let pool_log_context = pool_key.as_ref().map(WebSocketPoolLogContext::from_key);
@@ -463,7 +489,7 @@ impl CodexBackendClient {
                     set_cookie_headers: exchange.set_cookie_headers,
                     rate_limit_headers: exchange.rate_limit_headers,
                     rate_limit_updates: Some(exchange.rate_limit_updates),
-                    turn_state_update: Some(exchange.turn_state_update),
+                    response_metadata_updates: Some(exchange.response_metadata_updates),
                     websocket_pool_decision: exchange.pool_decision,
                     diagnostics: exchange.diagnostics,
                     response_metadata: exchange.response_metadata,
@@ -501,19 +527,24 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
         client_version: Option<&str>,
     ) -> CodexClientResult<CodexModelCatalogSnapshot> {
-        let endpoint = endpoint_url(&self.base_url, "codex/models");
+        let path = match self.protocol {
+            OpenAiUpstreamProtocol::Codex => "codex/models",
+            OpenAiUpstreamProtocol::ResponsesApi => "models",
+        };
         let profile = self.profile.snapshot();
         let headers = self.model_request_headers(&profile, context)?;
-        let response = self
+        let mut request = self
             .client
-            .get(endpoint)
-            .query(&[(
-                "client_version",
-                client_version.unwrap_or(profile.codex_version.as_str()),
-            )])
-            .headers(headers)
-            .send()
-            .await?;
+            .get(endpoint_url(&self.base_url, path))
+            .headers(headers);
+        let client_version = client_version.or_else(|| {
+            (self.protocol == OpenAiUpstreamProtocol::Codex)
+                .then_some(profile.codex_version.as_str())
+        });
+        if let Some(client_version) = client_version {
+            request = request.query(&[("client_version", client_version)]);
+        }
+        let response = request.send().await?;
         let status = response.status();
         let diagnostics = response_meta::diagnostics(Some(status.as_u16()), response.headers());
         let set_cookie_headers = response_meta::set_cookie_headers(response.headers());
@@ -540,7 +571,12 @@ impl CodexBackendClient {
                 send_phase: CodexUpstreamSendPhase::AfterPayload,
             });
         }
-        Ok(parse_codex_model_catalog(&body, etag.as_deref())?)
+        Ok(match self.protocol {
+            OpenAiUpstreamProtocol::Codex => parse_codex_model_catalog(&body, etag.as_deref())?,
+            OpenAiUpstreamProtocol::ResponsesApi => {
+                super::catalog::parse_api_model_catalog(&body, etag.as_deref())?
+            }
+        })
     }
 }
 
@@ -574,12 +610,11 @@ async fn await_websocket_delivery_boundary(
             }
             Some(Err(error)) => return Err(error),
             None => {
-                return Err(CodexWebSocketExchangeError::closed_before_terminal_on(
-                    exchange.websocket_connection_id,
-                    None,
-                    None,
-                    None,
-                ));
+                return Err(CodexWebSocketExchangeError::StreamEndedBeforeTerminal {
+                    reason: "stream_eof",
+                    timeout: None,
+                    last_event_type: None,
+                });
             }
         }
     }
@@ -612,15 +647,37 @@ async fn read_model_catalog_body(response: ReqwestResponse) -> CodexClientResult
     Ok(body)
 }
 
-fn websocket_connection_profile(headers: &HeaderMap) -> String {
-    ["originator", "user-agent", X_OPENAI_MEMGEN_REQUEST_HEADER]
-        .map(|name| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-        })
-        .join("\0")
+fn websocket_connection_profile(
+    headers: &HeaderMap,
+    middleware_headers: &[gateway_core::engine::middleware::MiddlewareHeader],
+) -> String {
+    let mut profile = [
+        "originator",
+        "user-agent",
+        "version",
+        X_OPENAI_MEMGEN_REQUEST_HEADER,
+    ]
+    .map(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    })
+    .join("\0");
+    if !middleware_headers.is_empty() {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        for header in middleware_headers {
+            digest.update(header.name().len().to_le_bytes());
+            digest.update(header.name().as_bytes());
+            digest.update(header.value().len().to_le_bytes());
+            digest.update(header.value());
+        }
+        profile.push('\0');
+        profile.push_str(&hex::encode(digest.finalize()));
+    }
+    profile
 }
 
 fn http_sse_stream(

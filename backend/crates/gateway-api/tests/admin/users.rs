@@ -27,6 +27,25 @@ async fn personal_key_creation_rejects_explicit_owner() {
     assert_eq!(response.0, StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn personal_key_creation_rejects_admin_profile_overrides() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("administrator");
+    let response = call(
+        &fixture,
+        "POST",
+        "/api/user/client-keys/create",
+        "administrator",
+        json!({
+            "name":"Personal", "groupIds":[], "maxConcurrency":0, "requestsPerMinute":0,
+            "dailyLimitUsd":"0", "weeklyLimitUsd":"0",
+            "providerRequestProfileOverrides":{"openai":{}}
+        }),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+}
+
 #[async_trait::async_trait]
 impl gateway_admin::ports::store::RequestUsageStore for TestRequestUsageStore {
     async fn request_usage(

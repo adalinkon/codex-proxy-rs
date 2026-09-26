@@ -1,20 +1,22 @@
 //! 账号管理路由与 HTTP handler 编排。
 
+use crate::auth::SessionState;
+
 use super::*;
 
 /// 构造统一账号管理路由。
 pub fn router<S>() -> Router<S>
 where
-    S: AdminSessionState + Clone + Send + Sync + 'static,
+    S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .merge(super::import_tasks::router::<S>())
         .route("/api/admin/accounts", get(list_accounts::<S>))
         .route("/api/admin/accounts/detail", get(account_detail::<S>))
         .route("/api/admin/accounts/export", get(export_accounts::<S>))
         .route("/api/admin/accounts/import", post(import_accounts::<S>))
         .route("/api/admin/accounts/refresh", post(refresh_account::<S>))
         .route("/api/admin/accounts/recover", post(recover_account::<S>))
-        .route("/api/admin/accounts/rotate", post(rotate_account::<S>))
         .route("/api/admin/accounts/update", post(update_account::<S>))
         .route("/api/admin/accounts/delete", post(delete_accounts::<S>))
         .route(
@@ -44,6 +46,10 @@ where
         )
         .route("/api/admin/accounts/models", get(account_models::<S>))
         .route(
+            "/api/admin/accounts/models/catalog",
+            get(account_model_catalog::<S>),
+        )
+        .route(
             "/api/admin/accounts/models/refresh",
             post(refresh_account_models::<S>),
         )
@@ -67,7 +73,7 @@ async fn batch_update_accounts<S>(
     AdminJson(request): AdminJson<BatchUpdateAccountsRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let command = request.into_command().map_err(map_wire_error)?;
     let result = state
@@ -88,7 +94,7 @@ async fn list_accounts<S>(
     AdminQuery(query): AdminQuery<ListQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let command = query.validate().map_err(map_wire_error)?;
     let page = command.page;
@@ -109,7 +115,7 @@ async fn account_detail<S>(
     AdminQuery(query): AdminQuery<AccountIdQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let result = state
@@ -118,8 +124,15 @@ where
         .quota(&account_id, false)
         .await
         .map_err(map_service_error)?;
-    let data = AccountQuotaData {
+    let configuration = state
+        .admin_services()
+        .accounts()
+        .account_configuration(&account_id)
+        .await
+        .map_err(map_service_error)?;
+    let data = AccountDetailData {
         account: account_view(result, Utc::now()),
+        credential_configuration: configuration.map(provider_document_value),
     };
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }
@@ -130,7 +143,7 @@ async fn export_accounts<S>(
     AdminQuery(query): AdminQuery<AccountExportQuery>,
 ) -> Result<Response, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let ids = query.into_ids().map_err(map_wire_error)?;
     let result = state
@@ -153,22 +166,19 @@ async fn import_accounts<S>(
     AdminJson(request): AdminJson<AccountImportRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => {
-            state
-                .admin_services()
-                .openai()
-                .import_document(command)
-                .await
-        }
-        AccountProvider::Xai => state.admin_services().xai().import_document(command).await,
-    }
-    .map_err(map_service_error)?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .import_document(command)
+        .await
+        .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
         AdminEnvelope::ok(AccountImportData::from_result(result)),
@@ -181,28 +191,19 @@ async fn start_account_authorization<S>(
     AdminJson(request): AdminJson<StartAccountAuthorizationRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => {
-            state
-                .admin_services()
-                .openai()
-                .start_authorization(command)
-                .await
-        }
-        AccountProvider::Xai => {
-            state
-                .admin_services()
-                .xai()
-                .start_authorization(command)
-                .await
-        }
-    }
-    .map_err(map_service_error)?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .start_authorization(command)
+        .await
+        .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
         AdminEnvelope::ok(AccountAuthorizationData::from(result)),
@@ -215,53 +216,19 @@ async fn complete_account_authorization<S>(
     AdminJson(request): AdminJson<CompleteAccountAuthorizationRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => {
-            state
-                .admin_services()
-                .openai()
-                .complete_authorization(command)
-                .await
-        }
-        AccountProvider::Xai => {
-            state
-                .admin_services()
-                .xai()
-                .complete_authorization(command)
-                .await
-        }
-    }
-    .map_err(map_service_error)?;
-    Ok(AdminResponse::new(
-        StatusCode::CREATED,
-        AdminEnvelope::ok(AccountMutationData::from(result)),
-    ))
-}
-
-async fn rotate_account<S>(
-    auth: AdminAuth,
-    State(state): State<S>,
-    AdminJson(request): AdminJson<RotateAccountRequest>,
-) -> Result<impl IntoResponse, AdminError>
-where
-    S: AdminSessionState + Send + Sync,
-{
-    let command = request
-        .into_command(auth.context().mutation_context())
-        .map_err(map_wire_error)?;
     let result = state
         .admin_services()
-        .openai()
-        .rotate(command)
+        .credentials()
+        .complete_authorization(&provider, command)
         .await
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
-        StatusCode::OK,
+        StatusCode::CREATED,
         AdminEnvelope::ok(AccountMutationData::from(result)),
     ))
 }
@@ -272,15 +239,41 @@ async fn update_account<S>(
     AdminJson(request): AdminJson<UpdateAccountRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
-    let command = request.into_command().map_err(map_wire_error)?;
-    let result = state
-        .admin_services()
-        .accounts()
-        .update(&auth.context().mutation_context(), command)
-        .await
-        .map_err(map_service_error)?;
+    let (command, connection) = request.into_command().map_err(map_wire_error)?;
+    let context = auth.context().mutation_context();
+    let result = if let Some(provider_material) = connection {
+        let provider = ProviderKind::new("openai").map_err(|_| AdminError::internal())?;
+        let account_id = ProviderAccountId::new(command.account_id.clone())
+            .map_err(|_| AdminError::internal())?;
+        let result = state
+            .admin_services()
+            .credentials()
+            .for_provider(&provider)
+            .map_err(map_service_error)?
+            .rotate(RotateCredential {
+                mutation: CredentialMutation {
+                    context,
+                    account_id,
+                },
+                settings: Some(command),
+                provider_material,
+            })
+            .await
+            .map_err(map_service_error)?;
+        AccountUpdateResult {
+            account_id: result.account_id,
+            config_revision: result.config_revision,
+        }
+    } else {
+        state
+            .admin_services()
+            .accounts()
+            .update(&context, command)
+            .await
+            .map_err(map_service_error)?
+    };
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(UpdatedAccountData::from(result)),
@@ -293,16 +286,19 @@ async fn delete_accounts<S>(
     AdminJson(request): AdminJson<AccountDeletionRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => state.admin_services().openai().delete(command).await,
-        AccountProvider::Xai => state.admin_services().xai().delete(command).await,
-    }
-    .map_err(map_service_error)?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .delete(command)
+        .await
+        .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(AccountDeletionData::from(result)),
@@ -315,7 +311,7 @@ async fn refresh_account<S>(
     AdminJson(request): AdminJson<AccountRefreshRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = request.into_command().map_err(map_wire_error)?;
     let result = state
@@ -334,7 +330,7 @@ async fn recover_account<S>(
     AdminJson(request): AdminJson<AccountActionRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = request.into_id().map_err(map_wire_error)?;
     let result = state
@@ -353,7 +349,7 @@ async fn account_quota<S>(
     AdminQuery(query): AdminQuery<AccountIdQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let result = state
@@ -374,7 +370,7 @@ async fn account_quota_forecast<S>(
     AdminQuery(query): AdminQuery<AccountIdQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let result = state
@@ -395,7 +391,7 @@ async fn account_personal_info<S>(
     AdminQuery(query): AdminQuery<AccountIdQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let result = state
@@ -416,7 +412,7 @@ async fn account_profile_avatar<S>(
     AdminQuery(query): AdminQuery<AccountProfileAvatarQuery>,
 ) -> Result<Response, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let avatar = state
@@ -479,7 +475,7 @@ async fn refresh_account_quota<S>(
     AdminJson(request): AdminJson<AccountActionRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = request.into_id().map_err(map_wire_error)?;
     let result = state
@@ -500,7 +496,7 @@ async fn account_reset_credits<S>(
     AdminQuery(query): AdminQuery<AccountIdQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let result = state
@@ -521,7 +517,7 @@ async fn consume_account_reset_credit<S>(
     AdminJson(request): AdminJson<AccountResetCreditConsumeRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let command = request.into_command().map_err(map_wire_error)?;
     let result = state
@@ -542,7 +538,7 @@ async fn account_models<S>(
     AdminQuery(query): AdminQuery<AccountIdQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
     let result = state
@@ -555,13 +551,32 @@ where
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }
 
+async fn account_model_catalog<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<AccountIdQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let account_id = query.into_id().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .accounts()
+        .model_catalog_document(&account_id)
+        .await
+        .map_err(map_service_error)?;
+    let data = AccountModelCatalogData::try_from(result).map_err(|_| AdminError::internal())?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
 async fn refresh_account_models<S>(
     _auth: AdminAuth,
     State(state): State<S>,
     AdminJson(request): AdminJson<AccountActionRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let account_id = request.into_id().map_err(map_wire_error)?;
     let result = state
@@ -580,7 +595,7 @@ async fn test_account_connection<S>(
     AdminQuery(query): AdminQuery<AccountTestQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let (account_id, upstream_model) = query.into_command().map_err(map_wire_error)?;
     let stream = state

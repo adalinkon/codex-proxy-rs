@@ -29,12 +29,13 @@ use crate::health::HealthStatus;
 use crate::openai::service::OpenAiService;
 
 pub mod admin;
+pub mod auth;
 mod health;
 pub mod openai;
+mod provider;
 
 /// API-owned HTTP 与静态资源配置。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     pub asset_directory: PathBuf,
     pub cors_allowed_origins: Vec<String>,
@@ -59,11 +60,16 @@ impl ApiConfig {
                 return Err(ApiConfigError::InvalidAssetDirectory);
             }
         }
-        if self.asset_directory.as_os_str().is_empty() {
-            return Err(ApiConfigError::InvalidAssetDirectory);
-        }
+        self.validate()?;
         if self.asset_directory.is_relative() {
             self.asset_directory = source_dir.join(&self.asset_directory);
+        }
+        Ok(())
+    }
+
+    fn validate(&mut self) -> Result<(), ApiConfigError> {
+        if self.asset_directory.as_os_str().is_empty() {
+            return Err(ApiConfigError::InvalidAssetDirectory);
         }
         if self.request_timeout_seconds == Some(0) {
             return Err(ApiConfigError::InvalidRequestTimeout);
@@ -121,9 +127,8 @@ pub fn initialize(
     worker_health: Arc<dyn WorkerHealthSource>,
     lifecycle: Arc<dyn ConnectionLifecycle>,
 ) -> Result<ApiBundle, ApiError> {
-    config
-        .resolve_and_validate(Path::new("."))
-        .map_err(ApiError::Config)?;
+    // 配置加载已解析环境变量与相对路径，初始化只校验，避免覆盖最终目录。
+    config.validate().map_err(ApiError::Config)?;
     let request_id_header = HeaderName::from_str(&config.request_id_header)
         .map_err(|_| ApiError::Config(ApiConfigError::InvalidRequestIdHeader))?;
     let state = ApiState {
@@ -135,8 +140,16 @@ pub fn initialize(
     let mut router = Router::new()
         .route("/healthz", get(health::healthz))
         .merge(openai::router::router())
+        .merge(provider::router())
         .merge(admin::router::<ApiState>())
-        .fallback_service(ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)));
+        .merge(admin::model_router())
+        .fallback_service(
+            Router::new()
+                .fallback_service(
+                    ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)),
+                )
+                .layer(axum::middleware::map_response(static_cache_control)),
+        );
     if !config.cors_allowed_origins.is_empty() {
         let origins = config
             .cors_allowed_origins
@@ -199,6 +212,14 @@ pub fn initialize(
     Ok(ApiBundle { router })
 }
 
+async fn static_cache_control(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
 /// API 初始化失败的脱敏分类。
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -225,7 +246,7 @@ impl ApiState {
     }
 }
 
-impl admin::AdminSessionState for ApiState {
+impl auth::SessionState for ApiState {
     fn admin_services(&self) -> &AdminServices {
         &self.admin
     }

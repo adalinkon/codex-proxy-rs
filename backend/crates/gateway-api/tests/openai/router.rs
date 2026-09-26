@@ -29,7 +29,11 @@ async fn browser_origin_controls_http_admin_sessions_without_configuration() {
             true,
         ),
     ] {
-        let app = api_router_with_origins(ModelsExecution::new(), Vec::new()).await;
+        let app = api_router_with_origins(ModelsExecution::new(), Vec::new())
+            .await
+            .layer(axum::Extension(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 41000)),
+            )));
         let request = |path: &str| {
             let mut builder = Request::post(path)
                 .header("content-type", "application/json")

@@ -44,7 +44,7 @@ use gateway_core::routing::{
     RuntimeSnapshot, UpstreamModelId,
 };
 use gateway_core::task::{WorkerContribution, WorkerKind, WorkerRunnable};
-use provider_openai::config::{CodexWireProfileConfig, OpenAiConfig};
+use provider_openai::config::OpenAiConfig;
 use provider_openai::credential::{CodexCredentialCodec, ImportCodexOAuthCredential};
 use provider_openai::transport::profile::APPCAST_POLL_INTERVAL;
 use secrecy::SecretString;
@@ -65,6 +65,58 @@ const COMPLETED_SESSION_SSE: &str = concat!(
 );
 
 #[tokio::test]
+async fn account_capabilities_distinguish_oauth_from_api_key_and_unknown_credentials() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let provider = bundle.admin_provider();
+    let id = ProviderAccountId::new("acct_capabilities").unwrap();
+    let oauth = provider.account_capabilities(&id, "oauth");
+    assert!(
+        oauth.quota
+            && oauth.quota_refresh
+            && oauth.profile
+            && oauth.subscription
+            && oauth.avatar
+            && oauth.reset_credits
+            && oauth.consume_reset_credit
+    );
+    for kind in ["api_key", "unknown"] {
+        assert_eq!(provider.account_capabilities(&id, kind), Default::default());
+    }
+}
+
+#[tokio::test]
+async fn custom_identity_preview_and_dashboard_share_the_exact_request_profile() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let provider = bundle.admin_provider();
+    let user_agent =
+        "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.156.1)";
+    let configuration = OpaqueProviderData::new(
+        json!({"mode":"custom", "userAgent":user_agent})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let preview = provider.preview_client_profile(&configuration).unwrap();
+    let dashboard = provider.configured_wire_profile(&configuration).unwrap();
+    assert_eq!(preview.expose_to_provider()["userAgent"], user_agent);
+    assert_eq!(dashboard.user_agent, user_agent);
+    assert_eq!(dashboard.product, "codex_exec");
+    assert_eq!(dashboard.version, "0.156.1");
+    assert!(dashboard.verified_at.is_none());
+    assert!(dashboard.release.is_none());
+    assert_ne!(
+        provider.dashboard_wire_profile().unwrap().user_agent,
+        user_agent
+    );
+}
+
+#[tokio::test]
 async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once() {
     let config = valid_config();
     let mut bundle = provider_openai::initialize(config.config.clone(), provider_ports())
@@ -74,7 +126,7 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    assert_eq!(contributions.len(), 5);
+    assert_eq!(contributions.len(), 8);
     assert!(
         contributions
             .iter()
@@ -102,7 +154,10 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     };
     assert_eq!(schedule.interval(), APPCAST_POLL_INTERVAL);
     for (owner, interval) in [
+        ("openai-cli-release", APPCAST_POLL_INTERVAL),
+        ("openai-platform-desktop-release", APPCAST_POLL_INTERVAL),
         ("openai", Duration::from_secs(30)),
+        ("openai-account-warmup", Duration::from_secs(30)),
         (
             "openai-model-catalog",
             config.config.quota_refresh_policy().interval(),
@@ -263,7 +318,7 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
         .expect("OpenAI payload")
         .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
         let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 initialized_provider_request(operation, account_id),
                 initialized_attempt_context(request_id, account_id),
@@ -288,13 +343,45 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
 }
 
 #[tokio::test]
+async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
+    use provider_openai::transport::{
+        OpenAiBillingUsage, openai_billing_breakdown, openai_billing_breakdown_with_override,
+    };
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let prices = bundle.admin_provider().pricing_catalog();
+    for model in ["gpt-4", "gpt-4o", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        let usage = OpenAiBillingUsage::new(100, 10, 20, 15);
+        let inherited = openai_billing_breakdown(model, usage, None).unwrap();
+        let copied =
+            openai_billing_breakdown_with_override(model, usage, None, Some(&prices[model]))
+                .unwrap();
+        assert_eq!(inherited.total_amount(), copied.total_amount(), "{model}");
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing() {
     let config = valid_config();
     let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
         .await
         .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
-    let profile = admin.dashboard_wire_profile().expect("wire profile");
+    let baseline = admin.dashboard_wire_profile().expect("official baseline");
+    assert_eq!(
+        baseline.release.as_ref().map(|release| release.status),
+        Some(DesktopReleaseStatus::Unchecked)
+    );
+    let selection = OpaqueProviderData::new(json!({
+        "client": "desktop", "platform": "macos", "versionMode": "fixed",
+        "codexVersion": "0.102.0", "desktopVersion": "1.2026.190", "desktopBuild": "19012345678",
+        "osVersion": "15.5.0", "arch": "arm64", "terminal": "xterm-256color"
+    }).as_object().unwrap().clone());
+    let profile = admin
+        .configured_wire_profile(&selection)
+        .expect("managed fixed profile");
     assert_eq!(profile.version, "0.102.0");
     assert_eq!(profile.build, None);
     assert_eq!(profile.target.os_type, "Mac OS");
@@ -311,10 +398,7 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             .map(|attribute| attribute.value.as_str()),
         Some("Codex Desktop; 1.2026.190")
     );
-    assert_eq!(
-        profile.release.as_ref().map(|release| release.status),
-        Some(DesktopReleaseStatus::Unchecked)
-    );
+    assert!(profile.release.is_none());
     let billing = admin
         .calculated_billing(&ProviderBillingInput {
             upstream_model_id: "gpt-4o".to_owned(),
@@ -352,6 +436,34 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
     assert_eq!(fast_billing.multiplier_percent, 170);
     assert_eq!(fast_billing.standard_amount.amount.as_str(), "2.5");
     assert_eq!(fast_billing.total_amount.amount.as_str(), "4.25");
+}
+
+#[tokio::test]
+async fn openai_legacy_billing_should_not_infer_long_context_flag() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .expect("OpenAI bundle");
+    let billing = bundle
+        .admin_provider()
+        .calculated_billing(&ProviderBillingInput {
+            upstream_model_id: "gpt-5.4".to_owned(),
+            service_tier: None,
+            input_tokens: Some(300_000),
+            output_tokens: Some(0),
+            cached_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            total: CurrencyCost {
+                currency: "USD".to_owned(),
+                amount: "1.5".parse().expect("stored total"),
+            },
+        })
+        .expect("legacy billing")
+        .expect("matching billing breakdown");
+
+    assert_eq!(billing.total_amount.amount.as_str(), "1.5");
+    assert_eq!(billing.input_price_per_million.amount.as_str(), "5");
+    assert!(!billing.long_context_billing_applied);
 }
 
 #[tokio::test]
@@ -656,6 +768,7 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
             &UpstreamModelId::new("gpt-5.4").expect("upstream model"),
             "Reply with exactly OK.",
         )
+        .await
         .expect("connection test operation");
     let Operation::Generate(request) = operation else {
         panic!("connection test must be a generate operation");
@@ -722,6 +835,54 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
 }
 
 #[tokio::test]
+async fn openai_admin_quota_refresh_updates_the_account_plan() {
+    let store = Arc::new(MemoryAccountStore::default());
+    let mut verified_account = profile("chatgpt-upgraded-plan");
+    verified_account.plan_type = Some("plus".to_owned());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_upgraded_plan".to_owned(),
+            name: "upgraded plan".to_owned(),
+            secret: secret("upgraded-plan-test-token"),
+            verified_account,
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_upgraded_plan").unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/api/codex/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_type": "pro", "rate_limit": {"allowed": true, "primary_window": {"used_percent": 1}}
+        })))
+        .expect(1).mount(&server).await;
+    let mut config = valid_config();
+    config.config.api.base_url = server.uri();
+    let bundle = provider_openai::initialize(
+        config.config,
+        provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    for refresh in [true, false] {
+        let quota = bundle
+            .admin_provider()
+            .quota(ProviderQuotaRequest {
+                account_id: account.id().clone(),
+                refresh,
+                rolling_usage: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(quota.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            store.account("acct_upgraded_plan").unwrap().plan_type(),
+            Some("pro")
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_omit_it() {
     let store = Arc::new(MemoryAccountStore::default());
     let mut verified_account = profile("chatgpt-free-plan");
@@ -740,6 +901,7 @@ async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_o
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
             account_id: account.id().clone(),
             expected_revision: account.revision(),
             quota: OpaqueProviderData::new(
@@ -853,6 +1015,7 @@ async fn openai_admin_provider_projects_official_codex_quota_and_independent_buc
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
             account_id: account.id().clone(),
             expected_revision: account.revision(),
             quota: OpaqueProviderData::new(raw.as_object().expect("quota object").clone()),
@@ -953,6 +1116,7 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
             account_id: account.id().clone(),
             expected_revision: account.revision(),
             quota: OpaqueProviderData::new(
@@ -1030,6 +1194,121 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
         .expect("project recovered quota");
 
     assert_eq!(recovered.windows[0].used_percent, Some(86.0));
+}
+
+#[tokio::test]
+async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution() {
+    for exhausted in [false, true] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let account_id = "acct_admin_expired_window";
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: account_id.to_owned(),
+                name: "admin expired window".to_owned(),
+                secret: secret("admin-expired-window-access"),
+                verified_account: profile("chatgpt-admin-expired-window"),
+                next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+                enabled: true,
+            })
+            .await;
+        let account = store.account(account_id).expect("stored account");
+        let past_reset_at = Utc::now().timestamp() - 60;
+        let observed_at = SystemTime::now() - Duration::from_secs(300);
+        let weekly_used = if exhausted { 100.0 } else { 74.0 };
+        let state = if exhausted {
+            QuotaState::exhausted(
+                QuotaEvidence::ProviderDenied,
+                observed_at,
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(past_reset_at as u64)),
+            )
+        } else {
+            QuotaState::allowed(observed_at)
+        };
+        store
+            .compare_and_swap_quota(QuotaObservation {
+                plan_type: None,
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                quota: OpaqueProviderData::new(
+                    json!({
+                        "rate_limit": {
+                            "allowed": !exhausted,
+                            "limit_reached": exhausted,
+                            "primary_window": {
+                                "used_percent": 15,
+                                "reset_at": past_reset_at + 18_000,
+                                "limit_window_seconds": 18_000,
+                            },
+                            "secondary_window": {
+                                "used_percent": weekly_used,
+                                "reset_at": past_reset_at,
+                                "limit_window_seconds": 604_800,
+                            }
+                        }
+                    })
+                    .as_object()
+                    .expect("quota object")
+                    .clone(),
+                ),
+                observed_at,
+                state,
+            })
+            .await
+            .expect("persist raw quota");
+
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .expect("OpenAI bundle");
+        let mut projected = bundle
+            .admin_provider()
+            .quota(ProviderQuotaRequest {
+                account_id: account.id().clone(),
+                refresh: false,
+                rolling_usage: None,
+            })
+            .await
+            .expect("project quota");
+        assert_eq!(projected.limit_reached, exhausted);
+        // 账号接口还会归一化耗尽展示；过期周窗口不能把触顶错误转移到短期窗口。
+        projected.apply_limit_reached_display();
+        let primary = projected
+            .windows
+            .iter()
+            .find(|w| w.window_seconds == Some(18_000))
+            .expect("primary");
+        let weekly = projected
+            .windows
+            .iter()
+            .find(|w| w.window_seconds == Some(604_800))
+            .expect("weekly");
+        assert_eq!(
+            (primary.used_percent, primary.limit_reached),
+            (Some(15.0), false)
+        );
+        assert_eq!(
+            (weekly.used_percent, weekly.limit_reached),
+            (Some(weekly_used), exhausted)
+        );
+        assert_eq!(
+            weekly.reset_at.map(|reset| reset.timestamp()),
+            Some(past_reset_at)
+        );
+        let raw = store
+            .get_quotas(std::slice::from_ref(account.id()))
+            .await
+            .expect("raw quota")
+            .pop()
+            .expect("observation");
+        assert_eq!(raw.observed_at, observed_at);
+        assert_eq!(
+            raw.quota.expose_to_provider()["rate_limit"]["secondary_window"]["used_percent"],
+            weekly_used
+        );
+    }
 }
 
 #[tokio::test]
@@ -1303,6 +1582,8 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        notes: None,
+        model_access: Default::default(),
         outbound_proxy: None,
         id: account.id().to_string(),
         provider_kind: account.provider().clone(),
@@ -1337,22 +1618,6 @@ struct TestOpenAiConfig {
 
 fn valid_config() -> TestOpenAiConfig {
     let mut config = OpenAiConfig::default();
-    config.wire_profile = CodexWireProfileConfig {
-        originator: "Codex Desktop".to_owned(),
-        codex_version: "0.102.0".to_owned(),
-        desktop_version: "1.2026.190".to_owned(),
-        desktop_build: "19012345678".to_owned(),
-        os_type: "Mac OS".to_owned(),
-        os_version: "15.5.0".to_owned(),
-        arch: "arm64".to_owned(),
-        terminal: "xterm-256color".to_owned(),
-        residency: None,
-        location: Default::default(),
-        verified_at: Utc
-            .with_ymd_and_hms(2026, 7, 19, 0, 0, 0)
-            .single()
-            .expect("valid test time"),
-    };
     let runtime = tempfile::tempdir().expect("test runtime directory");
     config
         .resolve_and_validate(&runtime.path().join("deploy"))
@@ -1377,6 +1642,7 @@ impl ProviderArtifactProfileCachePort for TestArtifactProfiles {
     fn read<'a>(
         &'a self,
         _provider_kind: &'a ProviderKind,
+        _artifact_key: &'a str,
     ) -> BoxFuture<'a, Result<Option<ProviderArtifactProfile>, ProviderStoreError>> {
         Box::pin(async { Ok(None) })
     }
@@ -1537,6 +1803,30 @@ impl ProviderCooldownPort for TestCooldown {
         _account_id: &'a ProviderAccountId,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
         Box::pin(async { Ok(false) })
+    }
+
+    fn record_capacity_failure<'a>(
+        &'a self,
+        _account_id: &'a ProviderAccountId,
+        _window: Duration,
+        _in_flight: u32,
+    ) -> BoxFuture<'a, Result<u32, ProviderStoreError>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn clear_after_success<'a>(
+        &'a self,
+        _account_id: &'a ProviderAccountId,
+        _through_revision: gateway_core::account::CredentialRevision,
+    ) -> BoxFuture<'a, Result<(), ProviderStoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn capacity_peak_in_flight<'a>(
+        &'a self,
+        _account_id: &'a ProviderAccountId,
+    ) -> BoxFuture<'a, Result<Option<u32>, ProviderStoreError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -1909,6 +2199,29 @@ mod errors {
         assert_eq!(store.account("acct_refresh_error").unwrap(), before);
     }
 
+    #[tokio::test]
+    async fn manual_token_refresh_prepares_to_preserve_concurrent_profile_changes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access-token", "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (bundle, store, _config) = refresh_fixture(&server, false, true).await;
+        let before = store.account("acct_refresh_error").unwrap();
+        let prepared = bundle
+            .admin_provider()
+            .prepare_refresh(PrepareCredentialRefresh {
+                account: account_record(&before),
+            })
+            .await
+            .unwrap();
+        assert!(prepared.facts().preserve_profile);
+    }
+
     async fn refresh_fixture(
         server: &MockServer,
         busy: bool,
@@ -1988,4 +2301,175 @@ mod errors {
             })
         }
     }
+}
+
+#[tokio::test]
+async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotating_address() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_api_key(
+            "acct_api_admin",
+            "https://first.example/v1".to_owned(),
+            provider_openai::credential::ResponsesTransport::Http,
+        )
+        .await;
+    let account = store.account("acct_api_admin").unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    let configuration = configuration.expose_to_provider().expose_to_provider();
+    assert_eq!(configuration.len(), 2);
+    assert_eq!(
+        configuration.get("base_url"),
+        Some(&json!("https://first.example/v1"))
+    );
+    assert!(!configuration.contains_key("api_key"));
+    let prepared = admin
+        .prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"base_url":"https://second.example/root", "transport":"prefer_websocket"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await
+        .unwrap();
+    let material = prepared
+        .facts()
+        .provider_material
+        .expose_to_provider()
+        .expose_to_provider();
+    assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
+    assert_eq!(
+        material.get("base_url"),
+        Some(&json!("https://second.example/root"))
+    );
+    assert!(!prepared.facts().has_refresh_token);
+    assert_eq!(prepared.facts().account_id, *account.id());
+    assert_eq!(
+        admin
+            .prepare_refresh(PrepareCredentialRefresh {
+                account: account_record(&account)
+            })
+            .await
+            .unwrap_err()
+            .kind(),
+        ProviderAdminErrorKind::Unsupported
+    );
+    assert_eq!(
+        admin.subscription(account.id()).await.unwrap_err().kind(),
+        ProviderAdminErrorKind::Unsupported
+    );
+    assert_eq!(
+        admin.reset_credits(account.id()).await.unwrap_err().kind(),
+        ProviderAdminErrorKind::Unsupported
+    );
+}
+
+#[tokio::test]
+async fn oauth_transport_settings_preserve_tokens_refresh_schedule_and_health() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_oauth_transport".to_owned(),
+            name: "OAuth transport".to_owned(),
+            secret: secret("test-oauth-transport"),
+            verified_account: profile("chatgpt-oauth-transport"),
+            next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_oauth_transport").unwrap();
+    let current = store.load_current_credential(account.id()).await.unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        configuration.expose_to_provider().expose_to_provider(),
+        json!({"transport":"prefer_websocket"}).as_object().unwrap()
+    );
+    for transport in ["http", "prefer_websocket"] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"transport":transport}).as_object().unwrap().clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let facts = prepared.facts();
+        let mut expected = current.credential.expose_to_provider().clone();
+        if transport == "http" {
+            expected.insert("transport".to_owned(), json!(transport));
+        }
+        assert_eq!(
+            facts
+                .provider_material
+                .expose_to_provider()
+                .expose_to_provider(),
+            &expected
+        );
+        assert_eq!(
+            facts.next_refresh_at,
+            account.next_refresh_at().map(DateTime::<Utc>::from)
+        );
+        assert_eq!(
+            facts.access_token_expires_at,
+            account.access_token_expires_at().map(DateTime::<Utc>::from)
+        );
+        assert_eq!(facts.has_refresh_token, account.has_refresh_token());
+        assert!(facts.preserve_profile && facts.preserve_credential_state);
+    }
+    for invalid in [
+        json!({"transport":"invalid"}),
+        json!({"transport":"http", "base_url":"https://other.example"}),
+        json!({"transport":"http", "api_key":"test-key"}),
+    ] {
+        let error = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    invalid.as_object().unwrap().clone(),
+                )),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ProviderAdminErrorKind::Invalid);
+    }
+    store.set_oauth_transport(
+        "acct_oauth_transport",
+        provider_openai::credential::ResponsesTransport::Http,
+    );
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        configuration.expose_to_provider().expose_to_provider(),
+        json!({"transport":"http"}).as_object().unwrap()
+    );
 }

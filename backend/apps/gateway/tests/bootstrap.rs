@@ -9,6 +9,54 @@ const REDIS_PASSWORD: &str = "222222222222222222222222222222222222222222222222";
 const ADMIN_PASSWORD: &str = "test-admin-password";
 const TOPOLOGY_CHILD_ENV: &str = "CPR_TEST_TOPOLOGY_CHILD";
 
+#[test]
+fn basic_cli_options_do_not_load_configuration_and_reject_unexpected_arguments() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("deploy")).unwrap();
+    fs::write(directory.path().join("deploy/config.yaml"), "invalid: [").unwrap();
+    for flag in ["--help", "-h", "help", "--version", "-V"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
+            .arg(flag)
+            .current_dir(directory.path())
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}");
+        assert!(!output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    for args in [
+        vec!["unknown"],
+        vec!["--help", "extra"],
+        vec!["serve", "extra"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
+            .args(args)
+            .current_dir(directory.path())
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("configuration"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_command_is_not_interpreted_as_serve() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("command must be UTF-8"));
+}
+
 #[tokio::test]
 async fn proxy_probe_should_use_provider_custom_ca_for_https_proxies() {
     use gateway_admin::ports::proxy::ProxyProbe;
@@ -85,7 +133,7 @@ async fn proxy_probe_should_use_provider_custom_ca_for_https_proxies() {
     });
     let probe = HttpProxyProbe::new("http://unresolvable.invalid/ip")
         .with_client_builder(provider_openai::build_reqwest_client_with_custom_ca);
-    let result = probe.test(&proxy).await;
+    let result = probe.test(&proxy, false).await;
     assert!(result.success, "{}", result.message);
     assert_eq!(result.exit_ip.unwrap().to_string(), "203.0.113.8");
     tokio::time::timeout(Duration::from_secs(5), server)
@@ -169,6 +217,50 @@ fn config_loader_should_resolve_paths_relative_to_config_file() {
 }
 
 #[test]
+fn config_loader_should_share_resolved_assets_with_system_update() {
+    const CHILD_ENV: &str = "CPR_TEST_UPDATE_ASSETS_CHILD";
+    let Ok(case) = std::env::var(CHILD_ENV) else {
+        // 使用子进程覆盖无环境变量、Docker 路径和相对路径，避免污染并行测试。
+        for (case, web_dist) in [
+            ("binary", None),
+            ("docker", Some("/app/web/dist")),
+            ("relative", Some("../custom/dist")),
+        ] {
+            let mut child = Command::new(std::env::current_exe().expect("test executable"));
+            child
+                .args([
+                    "--exact",
+                    "bootstrap::config_loader_should_share_resolved_assets_with_system_update",
+                ])
+                .env(CHILD_ENV, case)
+                .env_remove("CPR_WEB_DIST_DIR");
+            if let Some(web_dist) = web_dist {
+                child.env("CPR_WEB_DIST_DIR", web_dist);
+            }
+            let output = child.output().expect("isolated configuration test");
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let mut document = valid_config_document();
+    document["api"]["asset_directory"] = serde_json::json!("../web/dist");
+    let (config, directory) = parse_config(&document.to_string()).expect("binary configuration");
+    let assets = match case.as_str() {
+        "docker" => std::path::PathBuf::from("/app/web/dist"),
+        "relative" => directory.path().join("deploy/../custom/dist"),
+        _ => directory.path().join("deploy/../web/dist"),
+    };
+    let debug = format!("{config:?}");
+    assert!(debug.contains(&format!("asset_directory: {assets:?}")));
+    assert!(debug.contains(&format!("web_dist_dir: Some({assets:?})")));
+}
+
+#[test]
 fn config_loader_should_reject_missing_runtime_data_dir() {
     let config = valid_config().replace("  runtime_data_dir: '../.runtime/data'\n", "");
 
@@ -228,21 +320,128 @@ fn bootstrap_config_debug_should_redact_all_passwords() {
 }
 
 #[test]
-fn config_loader_should_reject_unknown_fields() {
-    assert_rejected(format!(
-        "{}\nunknown_terminal_field: true\n",
-        valid_config()
-    ));
+fn config_loader_should_ignore_unknown_fields_in_configuration_sections() {
+    let mut document = valid_config_document();
+    document["host"]["system_update"] = serde_json::json!({});
+    document["store"]["pool"] = serde_json::json!({});
+    for path in [
+        "",
+        "/host",
+        "/host/listen",
+        "/host/logging",
+        "/host/logging/file",
+        "/host/system_update",
+        "/store",
+        "/store/database",
+        "/store/redis",
+        "/store/pool",
+        "/admin",
+        "/api",
+        "/openai",
+    ] {
+        let mut extended = document.clone();
+        extended.pointer_mut(path).expect("configuration section")["unused_setting"] =
+            serde_json::json!({"nested": [true, null, "ignored"]});
+        parse_config(&extended.to_string())
+            .unwrap_or_else(|error| panic!("unknown field in {path}: {error}"));
+    }
 }
 
 #[test]
-fn config_loader_should_reject_removed_tls_section() {
-    assert_rejected(valid_config().replace("openai:\n", "openai:\n  tls: {}\n"));
+fn config_loader_should_ignore_removed_tls_and_fingerprint_sections() {
+    let mut document = valid_config_document();
+    document["openai"]["tls"] = serde_json::json!({});
+    document["openai"]["fingerprint"] = serde_json::json!({"browser": "removed"});
+    parse_config(&document.to_string()).expect("removed provider settings are ignored");
+}
+
+#[test]
+fn config_loader_should_reject_invalid_known_fields_alongside_unknown_fields() {
+    for port in [serde_json::json!(0), serde_json::json!("not-a-port")] {
+        let mut document = valid_config_document();
+        document["host"]["listen"]["unused_setting"] = serde_json::json!(true);
+        document["host"]["listen"]["port"] = port;
+        assert_rejected(document.to_string());
+    }
+}
+
+#[test]
+fn config_loader_should_report_startup_configuration_diagnostics() {
+    const CHILD_ENV: &str = "CPR_TEST_CONFIG_DIAGNOSTICS_CHILD";
+    const UNUSED_SECRET: &str = "unused-value-must-not-appear-in-diagnostics";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        gateway_host::load_config::<GatewayConfig>().expect("startup configuration");
+        return;
+    }
+    for case in ["normal", "unused", "missing"] {
+        let mut document = valid_config_document();
+        if case == "unused" {
+            document["openai"]["wire_profile"]["location"] = serde_json::json!(UNUSED_SECRET);
+        } else if case == "missing" {
+            document["host"]["listen"]
+                .as_object_mut()
+                .unwrap()
+                .remove("port");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("deploy")).unwrap();
+        fs::write(
+            directory.path().join("deploy/config.yaml"),
+            document.to_string(),
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bootstrap::config_loader_should_report_startup_configuration_diagnostics",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            case != "missing",
+            "{case}: {stderr}"
+        );
+        match case {
+            "unused" => assert!(
+                stderr.contains("openai.wire_profile") && stderr.contains("已忽略"),
+                "{stderr}"
+            ),
+            "missing" => assert!(stderr.contains("host.listen.port"), "{stderr}"),
+            _ => assert!(!stderr.contains("警告"), "{stderr}"),
+        }
+        assert!(!stderr.contains(UNUSED_SECRET), "{stderr}");
+        assert!(!stderr.contains("services"), "{stderr}");
+    }
 }
 
 #[test]
 fn config_loader_should_reject_missing_explicit_fields() {
     assert_rejected(valid_config().replace("  request_id_header: 'x-request-id'\n", ""));
+}
+
+#[test]
+fn config_loader_should_allow_missing_provider_configuration() {
+    let mut document = valid_config_document();
+    document.as_object_mut().unwrap().remove("openai");
+    document.as_object_mut().unwrap().remove("xai");
+    parse_config(&document.to_string()).expect("provider defaults require no YAML identity");
+}
+
+#[test]
+fn config_loader_should_ignore_removed_provider_identity_sections() {
+    let mut document = valid_config_document();
+    document["openai"]["wire_profile"] = serde_json::json!({"codex_version":"legacy-invalid"});
+    document["xai"] = serde_json::json!({"wire_profile": {"client_identifier": "legacy-client"}});
+    let (config, _directory) =
+        parse_config(&document.to_string()).expect("removed identities ignored");
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("legacy-invalid"));
+    assert!(!debug.contains("legacy-client"));
 }
 
 #[test]
@@ -279,19 +478,6 @@ fn config_loader_should_reject_admin_password_with_compose_interpolation() {
 }
 
 #[test]
-fn config_loader_should_reject_removed_fingerprint_section() {
-    assert_rejected(valid_config().replace(
-        "openai:\n",
-        "openai:\n  fingerprint:\n    browser: removed\n",
-    ));
-}
-
-#[test]
-fn config_loader_should_reject_invalid_codex_cli_version() {
-    assert_rejected(valid_config().replace("codex_version: '0.153.4'", "codex_version: 'latest'"));
-}
-
-#[test]
 fn config_loader_should_reject_disabled_all_log_outputs() {
     assert_rejected(
         valid_config()
@@ -306,41 +492,10 @@ fn config_loader_should_reject_zero_server_port() {
 }
 
 #[test]
-fn config_loader_should_reject_invalid_desktop_profile_fields() {
-    assert_rejected(valid_config().replace("desktop_build: '8109'", "desktop_build: 'build'"));
-}
-
-#[test]
-fn config_loader_should_accept_empty_and_custom_request_locations() {
-    let original = valid_config();
-    let omitted = original
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("location:"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_ne!(original, omitted);
-    parse_config(&omitted).expect("location passthrough when omitted");
-    let location_line = original
-        .lines()
-        .find(|line| line.trim_start().starts_with("location:"))
-        .expect("example location");
-    for empty in ["    location:", "    location: null", "    location: ~"] {
-        parse_config(&original.replace(location_line, empty)).expect("empty YAML location");
-    }
-    let custom = original.replace(
-        "location: { country: 'US', region: 'Ohio', city: 'Piketon', timezone: 'America/New_York' }",
-        "location: { country: 'NZ', region: 'Auckland', city: 'Auckland', timezone: 'Pacific/Auckland' }",
-    );
-    assert_ne!(original, custom);
-    parse_config(&custom).expect("custom location from YAML");
-}
-
-#[test]
-fn config_loader_should_reject_invalid_request_location_timezones() {
-    let original = valid_config();
-    let invalid = original.replace("timezone: 'America/New_York'", "timezone: 'Not/A_Timezone'");
-    assert_ne!(original, invalid);
-    assert_rejected(invalid);
+fn config_loader_should_validate_openai_residency() {
+    let mut document = valid_config_document();
+    document["openai"]["residency"] = serde_json::json!("invalid");
+    assert_rejected(document.to_string());
 }
 
 fn assert_rejected(config: String) {
@@ -363,6 +518,18 @@ fn valid_config() -> String {
             "default_password: ''",
             &format!("default_password: '{ADMIN_PASSWORD}'"),
         )
+}
+
+fn valid_config_document() -> serde_json::Value {
+    // 按字段修改样例，避免注释或排版变化让测试输入悄悄失效；JSON 仍可由 YAML 文件入口加载。
+    config::Config::builder()
+        .add_source(config::File::from_str(
+            &valid_config(),
+            config::FileFormat::Yaml,
+        ))
+        .build()
+        .and_then(config::Config::try_deserialize)
+        .expect("example config document")
 }
 
 fn parse_config(config: &str) -> Result<(GatewayConfig, tempfile::TempDir), String> {

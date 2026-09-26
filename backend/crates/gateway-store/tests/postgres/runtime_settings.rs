@@ -9,11 +9,18 @@ use super::TestDatabase;
 
 fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
+        request_profile_updates: BTreeMap::new(),
+        request_location_enabled: false,
+        request_location: Default::default(),
         admin_api_key: None,
         refresh_margin_seconds,
         refresh_concurrency: 2,
         max_concurrent_per_account: 3,
         request_interval_ms: 50,
+        max_waiting_per_key: 0,
+        max_waiting_per_account: 0,
+        concurrency_wait_timeout_seconds: 30,
+        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: "smart".to_owned(),
         model_mappings: BTreeMap::from([
             ("gpt-5.4".to_owned(), "gpt-5.5".to_owned()),
@@ -24,6 +31,16 @@ fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
         usage_retention_days: 31,
         ops_event_retention_days: 30,
         audit_retention_days: 90,
+        account_auto_freeze_enabled: true,
+        account_auto_freeze_threshold: 12,
+        account_auto_freeze_window_seconds: 600,
+        account_auto_freeze_duration_seconds: 7_200,
+        account_auto_freeze_probe_enabled: true,
+        account_auto_freeze_probe_model: None,
+        account_auto_freeze_adaptive_concurrency: true,
+        account_warmup_enabled: false,
+        account_warmup_schedule_time: "08:00".to_owned(),
+        account_warmup_model: None,
     }
 }
 
@@ -34,6 +51,91 @@ fn runtime_settings_keep_account_rotation_global() {
 }
 
 #[test]
+fn runtime_settings_require_model_when_warmup_is_enabled() {
+    let settings = RuntimeSettingsUpdate {
+        account_warmup_enabled: true,
+        ..settings_with_margin(3_600)
+    };
+    assert!(settings.validate().is_err());
+}
+
+#[tokio::test]
+async fn warmup_settings_round_trip_with_database_constraint() {
+    let Some(database) = TestDatabase::create("warmup_settings").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let mut update = settings_with_margin(3_600);
+    update.account_warmup_enabled = true;
+    update.account_warmup_schedule_time = "08:00,13:00".to_owned();
+    update.account_warmup_model = Some("test-model".to_owned());
+    repository
+        .update_runtime_settings(update)
+        .await
+        .expect("save warmup settings");
+
+    let settings = repository
+        .load_runtime_settings()
+        .await
+        .expect("load warmup settings");
+    assert!(settings.account_warmup_enabled);
+    assert_eq!(settings.account_warmup_schedule_time, "08:00,13:00");
+    assert_eq!(settings.account_warmup_model.as_deref(), Some("test-model"));
+
+    let error = sqlx::query("update runtime_settings set account_warmup_model = null where id = 1")
+        .execute(&database.pool)
+        .await
+        .expect_err("enabled warmup requires a model");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn unlimited_default_account_concurrency_round_trips_without_relaxing_other_limits() {
+    let Some(database) = TestDatabase::create("unlimited_default_concurrency").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let mut update = settings_with_margin(3_600);
+    update.max_concurrent_per_account = 0;
+    repository
+        .update_runtime_settings(update)
+        .await
+        .expect("persist unlimited default");
+    let settings = repository
+        .load_runtime_settings()
+        .await
+        .expect("read unlimited default");
+    assert_eq!(settings.max_concurrent_per_account, 0);
+    for statement in [
+        "update runtime_settings set max_concurrent_per_account = -1 where id = 1",
+        "update runtime_settings set refresh_concurrency = 0 where id = 1",
+        "update runtime_settings set refresh_margin_seconds = 0 where id = 1",
+        "update runtime_settings set request_interval_ms = -1 where id = 1",
+    ] {
+        let error = sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .expect_err("constraint must reject invalid setting");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514"),
+            "{statement}"
+        );
+    }
+    database.close().await;
+}
+
+#[test]
 fn runtime_settings_reject_invalid_model_mapping() {
     let settings = RuntimeSettingsUpdate {
         model_mappings: BTreeMap::from([("".to_owned(), "gpt-5.5".to_owned())]),
@@ -41,6 +143,30 @@ fn runtime_settings_reject_invalid_model_mapping() {
     };
 
     assert!(settings.validate().is_err());
+}
+
+#[test]
+fn runtime_settings_reject_out_of_range_auto_freeze() {
+    for update in [
+        RuntimeSettingsUpdate {
+            account_auto_freeze_threshold: 1,
+            ..settings_with_margin(3_600)
+        },
+        RuntimeSettingsUpdate {
+            account_auto_freeze_window_seconds: 59,
+            ..settings_with_margin(3_600)
+        },
+        RuntimeSettingsUpdate {
+            account_auto_freeze_duration_seconds: 299,
+            ..settings_with_margin(3_600)
+        },
+        RuntimeSettingsUpdate {
+            account_auto_freeze_probe_model: Some(" pad ".to_owned()),
+            ..settings_with_margin(3_600)
+        },
+    ] {
+        assert!(update.validate().is_err());
+    }
 }
 
 #[test]
@@ -188,4 +314,457 @@ async fn account_refresh_facts(pool: &sqlx::PgPool, account_id: &str) -> Account
 
 fn timestamp_micros(value: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp_micros(value.timestamp_micros()).expect("valid test timestamp")
+}
+
+#[tokio::test]
+async fn concurrency_queue_settings_round_trip_into_the_runtime_snapshot() {
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("queue_settings").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        (
+            before.max_waiting_per_key,
+            before.max_waiting_per_account,
+            before.concurrency_wait_timeout_seconds
+        ),
+        (0, 0, 30)
+    );
+    let mut update = settings_with_margin(3600);
+    update.max_waiting_per_key = 5;
+    update.max_waiting_per_account = 7;
+    update.concurrency_wait_timeout_seconds = 12;
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        (
+            settings.max_waiting_per_key,
+            settings.max_waiting_per_account,
+            settings.concurrency_wait_timeout_seconds
+        ),
+        (5, 7, 12)
+    );
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            snapshot.settings.max_waiting_per_key,
+            snapshot.settings.max_waiting_per_account,
+            snapshot.settings.concurrency_wait_timeout_seconds
+        ),
+        (5, 7, 12)
+    );
+    assert!(snapshot.config_revision > before.config_revision);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_location_defaults_and_updates_reach_the_runtime_snapshot() {
+    use gateway_core::account::RequestLocation;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("global_request_location").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(before.request_location, RequestLocation::default());
+    assert!(!before.request_location_enabled);
+    let mut update = settings_with_margin(3600);
+    update.request_location = serde_json::from_value(serde_json::json!({"country":"JP", "region":" Tokyo ", "city":" Tokyo ", "timezone":"Asia/Tokyo"})).unwrap();
+    update.request_location_enabled = true;
+    update.account_auto_freeze_threshold = 17;
+    update.account_auto_freeze_window_seconds = 900;
+    update.account_auto_freeze_duration_seconds = 3_600;
+    update.account_auto_freeze_probe_model = Some("gpt-5.5".to_owned());
+    update.account_auto_freeze_adaptive_concurrency = false;
+    let expected = update.request_location.clone().normalized().unwrap();
+    let mut disabled = update.clone();
+    disabled.request_location = expected.clone();
+    disabled.request_location_enabled = false;
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(settings.request_location, expected);
+    assert_eq!(snapshot.settings.request_location, expected);
+    assert!(settings.request_location_enabled);
+    assert!(snapshot.settings.request_location_enabled);
+    assert!(snapshot.config_revision > before.config_revision);
+    repository.update_runtime_settings(disabled).await.unwrap();
+    let disabled_settings = repository.load_runtime_settings().await.unwrap();
+    assert!(!disabled_settings.request_location_enabled);
+    assert_eq!(disabled_settings.request_location, expected);
+    let disabled_snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert!(!disabled_snapshot.settings.request_location_enabled);
+    assert_eq!(disabled_snapshot.settings.request_location, expected);
+    // 位置开关与自动冻结共用设置写入，切换位置不能覆盖冻结参数。
+    for saved in [&settings, &disabled_settings] {
+        assert!(saved.account_auto_freeze_enabled);
+        assert_eq!(saved.account_auto_freeze_threshold, 17);
+        assert_eq!(saved.account_auto_freeze_window_seconds, 900);
+        assert_eq!(saved.account_auto_freeze_duration_seconds, 3_600);
+        assert!(saved.account_auto_freeze_probe_enabled);
+        assert_eq!(
+            saved.account_auto_freeze_probe_model.as_deref(),
+            Some("gpt-5.5")
+        );
+        assert!(!saved.account_auto_freeze_adaptive_concurrency);
+    }
+    assert!(disabled_snapshot.config_revision > snapshot.config_revision);
+    for invalid in [
+        serde_json::json!(null),
+        serde_json::json!({}),
+        serde_json::json!({"country":"US", "region":"Ohio", "city":null, "timezone":"America/New_York"}),
+    ] {
+        assert!(
+            sqlx::query("update runtime_settings set request_location_json = $1 where id = 1")
+                .bind(sqlx::types::Json(invalid))
+                .execute(&database.pool)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .request_location,
+        expected
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn auto_freeze_defaults_off_and_explicit_opt_in_round_trips() {
+    let Some(database) = TestDatabase::create("freeze_opt_in").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    assert!(
+        !repository
+            .load_runtime_settings()
+            .await
+            .expect("default settings")
+            .account_auto_freeze_enabled
+    );
+    repository
+        .update_runtime_settings(settings_with_margin(3_600))
+        .await
+        .expect("explicit opt-in");
+    assert!(
+        repository
+            .load_runtime_settings()
+            .await
+            .expect("settings")
+            .account_auto_freeze_enabled
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn decompression_setting_should_persist_and_reach_snapshot_facts() {
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("decompression_settings").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        before.responses_max_decompressed_body_bytes,
+        64 * 1024 * 1024
+    );
+    let mut update = settings_with_margin(3600);
+    update.responses_max_decompressed_body_bytes = 128 * 1024 * 1024;
+    repository.update_runtime_settings(update).await.unwrap();
+    let reloaded = PgRuntimeSettingsRepository::new(database.pool.clone())
+        .load_runtime_settings()
+        .await
+        .unwrap();
+    assert_eq!(
+        reloaded.responses_max_decompressed_body_bytes,
+        128 * 1024 * 1024
+    );
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.settings.responses_max_decompressed_body_bytes,
+        reloaded.responses_max_decompressed_body_bytes
+    );
+    assert!(snapshot.config_revision > before.config_revision);
+    for invalid in [0, u64::MAX] {
+        let mut update = settings_with_margin(3600);
+        update.responses_max_decompressed_body_bytes = invalid;
+        assert!(repository.update_runtime_settings(update).await.is_err());
+        assert_eq!(
+            repository
+                .load_runtime_settings()
+                .await
+                .unwrap()
+                .config_revision,
+            reloaded.config_revision
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_profile_initialization_is_idempotent_and_old_updates_preserve_it() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profiles").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let provider = ProviderKind::new("openai").unwrap();
+    let document = |name| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":name})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let initial = document("imported");
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, initial.clone())
+            .await
+            .unwrap(),
+        initial
+    );
+    let revision = repository
+        .load_runtime_settings()
+        .await
+        .unwrap()
+        .config_revision;
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("ignored"))
+            .await
+            .unwrap(),
+        initial
+    );
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .config_revision,
+        revision
+    );
+    repository
+        .update_runtime_settings(settings_with_margin(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .request_profiles
+            .get(&provider),
+        Some(&initial)
+    );
+    let mut update = settings_with_margin(3600);
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("edited")));
+    repository.update_runtime_settings(update).await.unwrap();
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("old-yaml"))
+            .await
+            .unwrap(),
+        document("edited")
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_profile_deletion_is_explicit_and_preserves_other_profiles() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profile_deletion").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let kept = ProviderKind::new("provider.kept").unwrap();
+    let removed = ProviderKind::new("provider.removed").unwrap();
+    let profile = |marker: &str| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":marker})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    repository
+        .initialize_request_profile(&kept, profile("kept"))
+        .await
+        .unwrap();
+    repository
+        .initialize_request_profile(&removed, profile("removed"))
+        .await
+        .unwrap();
+
+    let mut update = settings_with_margin(3_600);
+    update.request_profile_updates.insert(removed.clone(), None);
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+
+    assert_eq!(
+        (
+            settings.request_profiles.get(&kept),
+            settings.request_profiles.get(&removed),
+        ),
+        (Some(&profile("kept")), None),
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn xai_profile_initialization_and_updates_preserve_other_providers() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("xai_profiles").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let document = |version: &str| {
+        OpaqueProviderData::new(
+            serde_json::json!({"clientVersion":version})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let provider = ProviderKind::new("xai").unwrap();
+    repository
+        .initialize_request_profile(&provider, document("initial"))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("ignored"))
+            .await
+            .unwrap(),
+        document("initial")
+    );
+    let mut update = settings_with_margin(3600);
+    update.request_profile_updates.insert(
+        ProviderKind::new("openai").unwrap(),
+        Some(document("openai")),
+    );
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("xai")));
+    repository.update_runtime_settings(update).await.unwrap();
+    let mut update = settings_with_margin(3600);
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("edited")));
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        settings
+            .request_profiles
+            .get(&ProviderKind::new("openai").unwrap()),
+        Some(&document("openai"))
+    );
+    assert_eq!(
+        settings.request_profiles.get(&provider),
+        Some(&document("edited"))
+    );
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("old-yaml"))
+            .await
+            .unwrap(),
+        document("edited")
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_profile_projection_is_revision_consistent_and_includes_key_overrides() {
+    use gateway_core::{
+        account::OpaqueProviderData,
+        provider_ports::{ProviderRuntimePolicyPort, ProviderStoreErrorKind},
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profile_projection").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let provider = ProviderKind::new("xai").unwrap();
+    let document = |marker: &str| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":marker})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let mut update = settings_with_margin(3600);
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("global")));
+    repository.update_runtime_settings(update).await.unwrap();
+    sqlx::query(
+        "insert into client_api_keys (
+           user_id, id, name, key, enabled, max_concurrency, requests_per_minute,
+           provider_request_profiles_json, created_at, updated_at
+         ) values ('test-owner', $1, $2, $3, true, 0, 0, $4::jsonb, now(), now())",
+    )
+    .bind("key_profile_projection")
+    .bind("profile projection")
+    .bind("synthetic-profile-projection-secret")
+    .bind(sqlx::types::Json(serde_json::json!({
+        "xai":{"marker":"key"}
+    })))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let revision = repository
+        .load_runtime_settings()
+        .await
+        .unwrap()
+        .config_revision;
+    let revision = gateway_core::routing::ConfigRevision::new(revision.get()).unwrap();
+    let profiles = repository
+        .load_request_profile_configurations(revision, &provider)
+        .await
+        .unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.contains(&document("global")));
+    assert!(profiles.contains(&document("key")));
+
+    repository
+        .update_runtime_settings(settings_with_margin(7200))
+        .await
+        .unwrap();
+    let error = repository
+        .load_request_profile_configurations(revision, &provider)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ProviderStoreErrorKind::Conflict);
+    database.close().await;
 }

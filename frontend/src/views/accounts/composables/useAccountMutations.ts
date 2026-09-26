@@ -1,20 +1,23 @@
 import type { Ref } from 'vue'
-import type { getAccounts } from '@/api'
+import type { AccountImportTask, getAccounts } from '@/api'
 import type { RequestOptions } from '@/api/request'
+import { toast } from '@codex-proxy/ui'
 import dayjs from 'dayjs'
-import { ref, watch } from 'vue'
+import { computed, ref, shallowReactive, watch } from 'vue'
 import {
+  batchUpdateAccounts,
   deleteAccounts,
   exportAccounts,
+  getAccountModelCatalog,
   recoverAccount,
   refreshAccount,
   refreshAccountQuota,
 } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useDownload } from '@/composables/useDownload'
 import { useIdSet } from '@/composables/useIdSet'
 import { errorMessage, withMinimumDuration } from '@/utils/async'
+import { isSupportedProvider } from '@/utils/providers'
 
 import { useAccountOnboarding } from './useAccountOnboarding'
 
@@ -23,6 +26,7 @@ type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 export function useAccountMutations(options: {
   accounts: Ref<AccountRow[]>
   selectedIds: Ref<Set<string>>
+  onImportTaskCreated: (task: AccountImportTask) => void
   reload: () => Promise<unknown>
   replaceAccount: (account: AccountRow) => Promise<boolean>
 }) {
@@ -30,23 +34,40 @@ export function useAccountMutations(options: {
   const { downloadJson } = useDownload()
   const onboarding = useAccountOnboarding({
     reload: loadAccounts,
+    onImportTaskCreated: options.onImportTaskCreated,
   })
-  const selectedAccountsById = new Map<string, AccountRow>()
+  const selectedAccountsById = shallowReactive(new Map<string, AccountRow>())
   const showDeleteModal = ref(false)
   const showSingleDeleteModal = ref(false)
   const pendingDeleteAccount = ref<AccountRow | null>(null)
   const recoveringAccounts = useIdSet<string>()
   const refreshingAccounts = useIdSet<string>()
   const refreshingQuotaAccounts = useIdSet<string>()
+  const downloadingCatalogAccounts = useIdSet<string>()
+  const togglingSchedulingAccounts = useIdSet<string>()
   const deletingAccountAction = useAsyncAction()
   const batchDeletingAction = useAsyncAction()
   const exportingAccountsAction = useAsyncAction()
   const recoveringAccountIds = recoveringAccounts.ids
   const refreshingAccountIds = refreshingAccounts.ids
   const refreshingQuotaAccountIds = refreshingQuotaAccounts.ids
+  const downloadingCatalogAccountIds = downloadingCatalogAccounts.ids
+  const togglingSchedulingAccountIds = togglingSchedulingAccounts.ids
   const deletingAccount = deletingAccountAction.loading
   const batchDeleting = batchDeletingAction.loading
   const exportingAccounts = exportingAccountsAction.loading
+  const exportDisabledReason = computed(() => {
+    if (options.selectedIds.value.size === 0)
+      return ''
+    for (const id of options.selectedIds.value) {
+      const account = selectedAccountsById.get(id)
+      if (!account)
+        return '所选账号数据已失效，请重新选择'
+      if (!isSupportedProvider(account.provider))
+        return '所选账号包含不支持导出的平台'
+    }
+    return ''
+  })
 
   watch(
     [options.accounts, options.selectedIds],
@@ -130,6 +151,10 @@ export function useAccountMutations(options: {
       toast.warning('请选择要导出的账号')
       return
     }
+    if (exportDisabledReason.value) {
+      toast.warning(exportDisabledReason.value)
+      return
+    }
 
     await exportingAccountsAction.run(
       async () => {
@@ -143,6 +168,19 @@ export function useAccountMutations(options: {
       },
       { errorText: '导出失败' },
     )
+  }
+
+  async function handleDownloadModelCatalog(account: AccountRow) {
+    await downloadingCatalogAccounts.run(account.id, async () => {
+      try {
+        const result = await getAccountModelCatalog({ accountId: account.id })
+        const plan = account.planTypeDisplay.trim().replace(/[^\p{L}\p{N}_-]/gu, '_') || 'unknown-plan'
+        const name = account.name.trim().replace(/[^\p{L}\p{N}_-]/gu, '_') || 'account'
+        await downloadJson(result.catalog, `cpr-model-catalog-${plan}-${name}.json`)
+        toast.success(`已下载模型目录，共 ${result.modelCount} 个模型`)
+      }
+      catch {}
+    })
   }
 
   async function handleRefresh(accountId: string) {
@@ -168,6 +206,17 @@ export function useAccountMutations(options: {
     })
   }
 
+  async function handleToggleScheduling(account: AccountRow) {
+    await togglingSchedulingAccounts.run(account.id, async () => {
+      try {
+        await batchUpdateAccounts({ accountIds: [account.id], enabled: !account.enabled })
+        await loadAccounts()
+        toast.success(account.enabled ? '调度已停用' : '调度已启用')
+      }
+      catch {}
+    })
+  }
+
   async function handleRefreshQuota(accountId: string) {
     await refreshingQuotaAccounts.run(accountId, async () => {
       try {
@@ -182,6 +231,21 @@ export function useAccountMutations(options: {
       }
       catch {}
     })
+  }
+
+  async function handleQuotaReset(accountId: string) {
+    if (!options.accounts.value.find(account => account.id === accountId)?.capabilities.quotaRefresh)
+      return
+    try {
+      const result = await refreshAccountQuota({ accountId }, { silent: true })
+      await options.replaceAccount(result.account)
+    }
+    catch (error: unknown) {
+      toast.warning(
+        `额度已重置，但最新额度加载失败：${errorMessage(error, '请手动刷新额度')}`,
+        { duration: 5000 },
+      )
+    }
   }
 
   async function handleRecover(accountId: string) {
@@ -245,15 +309,21 @@ export function useAccountMutations(options: {
     recoveringAccountIds,
     refreshingAccountIds,
     refreshingQuotaAccountIds,
+    downloadingCatalogAccountIds,
+    togglingSchedulingAccountIds,
     deletingAccount,
     batchDeleting,
     exportingAccounts,
+    exportDisabledReason,
     requestDeleteAccount,
     handleDelete,
     handleBatchDelete,
     handleExportAccounts,
+    handleDownloadModelCatalog,
     handleRecover,
     handleRefresh,
     handleRefreshQuota,
+    handleQuotaReset,
+    handleToggleScheduling,
   }
 }

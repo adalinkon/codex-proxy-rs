@@ -64,11 +64,12 @@ pub struct BatchUpdateAccountsRequest {
     pub outbound_proxy_id: Option<String>,
     pub outbound_proxy_url: Option<AccountProxyUpdate>,
     pub account_ids: Vec<String>,
-    pub enabled: bool,
-    #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub concurrency_limit: Option<u64>,
-    pub weight: u64,
-    pub group_ids: Vec<String>,
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_limit")]
+    pub concurrency_limit: Option<Option<u64>>,
+    pub weight: Option<u64>,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
+    pub group_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +92,12 @@ impl From<AccountsUpdateResult> for BatchUpdatedAccountsData {
     }
 }
 
+fn deserialize_optional_nullable_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u64>>, D::Error> {
+    Option::<u64>::deserialize(deserializer).map(Some)
+}
+
 impl BatchUpdateAccountsRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
         if self.account_ids.is_empty()
@@ -103,9 +110,23 @@ impl BatchUpdateAccountsRequest {
         {
             return Err(WireValidationError::new("accountIds"));
         }
-        validate_wire_group_ids(&self.group_ids)?;
-        parse_concurrency_limit(self.concurrency_limit)?;
-        parse_account_weight(self.weight)?;
+        if let Some(group_ids) = &self.group_ids {
+            validate_wire_group_ids(group_ids)?;
+        }
+        self.concurrency_limit
+            .map(parse_concurrency_limit)
+            .transpose()?;
+        self.weight.map(parse_account_weight).transpose()?;
+        if self.enabled.is_none()
+            && self.concurrency_limit.is_none()
+            && self.weight.is_none()
+            && self.group_ids.is_none()
+            && self.model_access.is_none()
+            && self.outbound_proxy_id.is_none()
+            && self.outbound_proxy_url.is_none()
+        {
+            return Err(WireValidationError::new("accountSettings"));
+        }
         Ok(())
     }
 
@@ -115,9 +136,17 @@ impl BatchUpdateAccountsRequest {
             outbound_proxy: proxy_selection(self.outbound_proxy_id, self.outbound_proxy_url)?,
             account_ids: self.account_ids,
             enabled: self.enabled,
-            concurrency_limit: parse_concurrency_limit(self.concurrency_limit)?,
-            weight: parse_account_weight(self.weight)?,
-            group_ids: validate_wire_group_ids(&self.group_ids)?,
+            concurrency_limit: self
+                .concurrency_limit
+                .map(parse_concurrency_limit)
+                .transpose()?,
+            weight: self.weight.map(parse_account_weight).transpose()?,
+            model_access: self.model_access,
+            group_ids: self
+                .group_ids
+                .as_deref()
+                .map(validate_wire_group_ids)
+                .transpose()?,
         })
     }
 }
@@ -133,7 +162,7 @@ impl ListQuery {
         if page_size == 0 || page_size > MAX_PAGE_SIZE {
             return Err(WireValidationError::new("pageSize"));
         }
-        let provider_kind = parse_provider(self.provider.as_deref().unwrap_or("all"))?;
+        let provider_kind = parse_provider(self.provider.as_deref().unwrap_or_default())?;
         let group_filter = match self.group_id.as_deref().map(str::trim) {
             None | Some("") => None,
             Some("ungrouped") => Some(AccountGroupFilter::Ungrouped),
@@ -184,7 +213,7 @@ impl ListQuery {
 
 fn parse_provider(value: &str) -> Result<Option<ProviderKind>, WireValidationError> {
     let value = value.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("all") {
+    if value.is_empty() {
         return Ok(None);
     }
     ProviderKind::new(value.to_owned())
@@ -237,9 +266,11 @@ pub struct AccountSummaryView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountView {
+    pub capabilities: AccountCapabilitiesView,
     pub outbound_proxy_endpoint: Option<String>,
     pub id: String,
     pub name: String,
+    pub notes: Option<String>,
     pub provider: String,
     pub groups: Vec<AccountGroupRefView>,
     pub resource_ref: String,
@@ -260,6 +291,7 @@ pub struct AccountView {
     pub enabled: bool,
     pub concurrency_limit: Option<u32>,
     pub weight: u16,
+    pub model_access: gateway_core::account::AccountModelAccess,
     pub access_token_expires_at: Option<String>,
     pub access_token_expires_at_display: Option<String>,
     pub refresh_token_expires_at: Option<String>,
@@ -270,6 +302,32 @@ pub struct AccountView {
     pub updated_at_display: String,
     pub quota: AccountQuotaView,
     pub usage: AccountUsageView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCapabilitiesView {
+    pub quota: bool,
+    pub quota_refresh: bool,
+    pub profile: bool,
+    pub subscription: bool,
+    pub avatar: bool,
+    pub reset_credits: bool,
+    pub consume_reset_credit: bool,
+}
+
+impl From<gateway_admin::model::accounts::ProviderAccountCapabilities> for AccountCapabilitiesView {
+    fn from(value: gateway_admin::model::accounts::ProviderAccountCapabilities) -> Self {
+        Self {
+            quota: value.quota,
+            quota_refresh: value.quota_refresh,
+            profile: value.profile,
+            subscription: value.subscription,
+            avatar: value.avatar,
+            reset_credits: value.reset_credits,
+            consume_reset_credit: value.consume_reset_credit,
+        }
+    }
 }
 
 /// 容量估算仅供管理端展示；金额不是订阅账单或可消费余额。
@@ -330,8 +388,10 @@ pub struct AccountGroupRefView {
 pub struct AccountQuotaView {
     pub refreshed_at_display: String,
     pub limit_reached: bool,
-    /// 429 临时限流（Redis 冷却）到期时间展示；非限流中为 `null`。
+    /// 冷却到期或可开始恢复探测的时间；非限流中为 `null`。
     pub rate_limited_until: Option<String>,
+    pub rate_limit_reason: Option<String>,
+    pub recovery_probe_required: bool,
     pub windows: Vec<AccountQuotaWindowView>,
 }
 
@@ -642,6 +702,37 @@ pub struct AccountModelsData {
     pub models: Vec<AccountModelView>,
 }
 
+/// 账号模型目录文件；`catalog` 直接作为 Codex `model_catalog_json` 的文件正文落盘。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountModelCatalogData {
+    pub model_count: usize,
+    pub observed_at: String,
+    pub catalog: Value,
+}
+
+/// Provider 未给出 Codex 原生目录正文；该结果不能作为客户端目录文件返回。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedModelCatalogDocument;
+
+impl TryFrom<ProviderModelCatalogDocument> for AccountModelCatalogData {
+    type Error = UnsupportedModelCatalogDocument;
+
+    /// 目录正文由 Provider 按官方 wire 组装；这里只解析一次用于 JSON 响应，不改写字段。
+    fn try_from(result: ProviderModelCatalogDocument) -> Result<Self, Self::Error> {
+        if result.document.protocol() != "codex" {
+            return Err(UnsupportedModelCatalogDocument);
+        }
+        let catalog = serde_json::from_slice(result.document.body())
+            .map_err(|_| UnsupportedModelCatalogDocument)?;
+        Ok(Self {
+            model_count: result.model_count,
+            observed_at: china_rfc3339(&result.observed_at),
+            catalog,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountRefreshData {
@@ -651,6 +742,14 @@ pub struct AccountRefreshData {
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountQuotaData {
     pub account: AccountView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDetailData {
+    pub account: AccountView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_configuration: Option<serde_json::Value>,
 }
 
 /// 个人资料、累计统计与订阅的统一响应。

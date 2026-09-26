@@ -1,3 +1,5 @@
+use crate::auth::SessionState;
+
 use axum::{
     Router,
     extract::State,
@@ -15,8 +17,7 @@ use gateway_admin::model::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse, AdminSessionState,
-    PageMeta,
+    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse, PageMeta,
     accounts::{AccountGroupRefView, AccountProxyUpdate},
 };
 
@@ -47,6 +48,9 @@ struct RemoveAccountRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateRequest {
+    #[serde(default)]
+    auto_location: bool,
+    location: Option<gateway_core::account::RequestLocation>,
     name: String,
     proxy_url: AccountProxyUpdate,
 }
@@ -54,10 +58,22 @@ struct CreateRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateRequest {
+    auto_location: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_location_update")]
+    location: Option<Option<gateway_core::account::RequestLocation>>,
     id: String,
     revision: u64,
     name: String,
     proxy_url: Option<AccountProxyUpdate>,
+}
+
+fn deserialize_location_update<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<gateway_core::account::RequestLocation>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,25 +85,42 @@ struct IdRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TestRequest {
+    id: String,
+    revision: u64,
+    #[serde(default)]
+    detect_location: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProbeRequest {
+    #[serde(default)]
+    detect_location: bool,
     proxy_url: AccountProxyUpdate,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxyTestView {
+    location: gateway_admin::model::proxies::ProxyLocationDetection,
     success: bool,
     latency_ms: u64,
     exit_ip: Option<String>,
+    exit_ipv4: Option<String>,
+    exit_ipv6: Option<String>,
     message: String,
 }
 
 impl From<ProxyTestResult> for ProxyTestView {
     fn from(result: ProxyTestResult) -> Self {
         Self {
+            location: result.location,
             success: result.success,
             latency_ms: result.latency_ms,
             exit_ip: result.exit_ip.map(|ip| ip.to_string()),
+            exit_ipv4: result.exit_ipv4.map(|ip| ip.to_string()),
+            exit_ipv6: result.exit_ipv6.map(|ip| ip.to_string()),
             message: result.message,
         }
     }
@@ -110,6 +143,9 @@ struct ProxyAccountView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxyView {
+    auto_location: bool,
+    detected_location: Option<gateway_admin::model::proxies::DetectedProxyLocation>,
+    location: Option<gateway_core::account::RequestLocation>,
     id: String,
     name: String,
     endpoint: String,
@@ -126,6 +162,9 @@ impl From<ProxyRecord> for ProxyView {
     fn from(record: ProxyRecord) -> Self {
         let endpoint = record.proxy.endpoint();
         Self {
+            auto_location: record.auto_location,
+            detected_location: record.detected_location,
+            location: record.location,
             id: record.id,
             name: record.name,
             has_authentication: record.proxy.expose_url() != endpoint,
@@ -170,7 +209,7 @@ impl From<ProxyMutation> for MutationView {
 
 pub fn router<S>() -> Router<S>
 where
-    S: AdminSessionState + Clone + Send + Sync + 'static,
+    S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/api/admin/proxies", get(list::<S>))
@@ -203,7 +242,7 @@ async fn list<S>(
     AdminQuery(query): AdminQuery<ListQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()
@@ -237,7 +276,7 @@ async fn list_accounts<S>(
     AdminQuery(query): AdminQuery<AccountsQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()
@@ -295,7 +334,7 @@ async fn create<S>(
     AdminJson(request): AdminJson<CreateRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let proxy = request
         .proxy_url
@@ -306,6 +345,9 @@ where
         .proxies()
         .create(
             NewProxy {
+                auto_location: request.auto_location,
+                test: None,
+                location: request.location,
                 name: request.name,
                 proxy,
             },
@@ -325,7 +367,7 @@ async fn remove_account<S>(
     AdminJson(request): AdminJson<RemoveAccountRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let revision = state
         .admin_services()
@@ -349,7 +391,7 @@ async fn update<S>(
     AdminJson(request): AdminJson<UpdateRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let proxy = request
         .proxy_url
@@ -364,6 +406,9 @@ where
         .proxies()
         .update(
             UpdateProxy {
+                auto_location: request.auto_location,
+                test: None,
+                location: request.location,
                 id: request.id,
                 revision: revision(request.revision)?,
                 name: request.name,
@@ -385,7 +430,7 @@ async fn delete<S>(
     AdminJson(request): AdminJson<IdRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()
@@ -409,7 +454,7 @@ async fn probe<S>(
     AdminJson(request): AdminJson<ProbeRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let proxy = request
         .proxy_url
@@ -418,7 +463,7 @@ where
     let result = state
         .admin_services()
         .proxies()
-        .probe(&proxy)
+        .probe(&proxy, request.detect_location)
         .await
         .map_err(map_error)?;
     Ok(AdminResponse::new(
@@ -430,10 +475,10 @@ where
 async fn test<S>(
     auth: AdminAuth,
     State(state): State<S>,
-    AdminJson(request): AdminJson<IdRequest>,
+    AdminJson(request): AdminJson<TestRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()
@@ -441,6 +486,7 @@ where
         .test(
             &request.id,
             revision(request.revision)?,
+            request.detect_location,
             &auth.context().mutation_context(),
         )
         .await

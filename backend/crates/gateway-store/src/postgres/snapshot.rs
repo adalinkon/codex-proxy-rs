@@ -20,10 +20,19 @@ use super::ClientApiKeySnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRuntimeSettings {
+    pub pricing: gateway_core::metering::PricingOverrides,
+    pub request_profiles:
+        BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
+    pub request_location_enabled: bool,
+    pub request_location: gateway_core::account::RequestLocation,
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u32,
     pub max_concurrent_per_account: u32,
     pub request_interval_ms: u64,
+    pub max_waiting_per_key: u32,
+    pub max_waiting_per_account: u32,
+    pub concurrency_wait_timeout_seconds: u32,
+    pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: String,
     pub model_mappings: BTreeMap<String, String>,
     pub min_codex_desktop_version: Option<String>,
@@ -43,6 +52,7 @@ pub struct RuntimeSnapshotData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAccountGroupData {
+    pub disable_fast: bool,
     pub id: AccountGroupId,
     pub name: String,
     pub enabled: bool,
@@ -52,6 +62,7 @@ pub struct SnapshotAccountGroupData {
 pub struct SnapshotProviderAccountData {
     pub id: String,
     pub provider_kind: String,
+    pub model_access: gateway_core::account::AccountModelAccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +158,20 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                 data.settings.model_mappings,
                 data.settings.min_codex_desktop_version,
                 data.settings.min_codex_cli_version,
+            )
+            .with_responses_max_decompressed_body_bytes(
+                data.settings.responses_max_decompressed_body_bytes,
+            )
+            .with_request_profiles(data.settings.request_profiles)
+            .with_pricing(data.settings.pricing)
+            .with_request_location(
+                data.settings.request_location,
+                data.settings.request_location_enabled,
+            )
+            .with_concurrency_queues(
+                data.settings.max_waiting_per_key,
+                data.settings.max_waiting_per_account,
+                data.settings.concurrency_wait_timeout_seconds,
             );
             let client_policies = data
                 .client_api_keys
@@ -159,19 +184,26 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                         key.limits,
                         key.user,
                     )
+                    .with_request_profiles(key.request_profiles)
                 })
                 .collect();
             let account_groups = data
                 .account_groups
                 .into_iter()
-                .map(|group| SnapshotAccountGroupFacts::new(group.id, group.name, group.enabled))
+                .map(|group| {
+                    SnapshotAccountGroupFacts::new(group.id, group.name, group.enabled)
+                        .with_disable_fast(group.disable_fast)
+                })
                 .collect();
             let provider_accounts = data
                 .provider_accounts
                 .into_iter()
                 .map(|account| {
                     ProviderAccountId::new(account.id)
-                        .map(|id| SnapshotProviderAccountFacts::new(id, account.provider_kind))
+                        .map(|id| {
+                            SnapshotProviderAccountFacts::new(id, account.provider_kind)
+                                .with_model_access(account.model_access)
+                        })
                         .map_err(|_| SnapshotStoreError::unavailable())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -214,28 +246,34 @@ fn core_revision(revision: Revision) -> Result<ConfigRevision, SnapshotStoreErro
     ConfigRevision::new(revision.get()).map_err(|_| SnapshotStoreError::unavailable())
 }
 
+#[derive(sqlx::FromRow)]
+struct SnapshotSettingsRow {
+    pricing_synced_json: sqlx::types::Json<gateway_core::metering::PricingOverrides>,
+    pricing_overrides_json: sqlx::types::Json<gateway_core::metering::PricingOverrides>,
+    config_revision: i64,
+    refresh_margin_seconds: i64,
+    refresh_concurrency: i64,
+    max_concurrent_per_account: i64,
+    request_interval_ms: i64,
+    rotation_strategy: String,
+    model_mappings_json: sqlx::types::Json<BTreeMap<String, String>>,
+    min_codex_desktop_version: Option<String>,
+    min_codex_cli_version: Option<String>,
+    max_waiting_per_key: i64,
+    max_waiting_per_account: i64,
+    concurrency_wait_timeout_seconds: i64,
+    request_location_json: sqlx::types::Json<gateway_core::account::RequestLocation>,
+    request_location_enabled: bool,
+    responses_max_decompressed_body_bytes: i64,
+    provider_request_profiles_json:
+        sqlx::types::Json<BTreeMap<String, serde_json::Map<String, serde_json::Value>>>,
+}
+
 async fn load_settings(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<(Revision, SnapshotRuntimeSettings)> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            String,
-            sqlx::types::Json<BTreeMap<String, String>>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "select config_revision, refresh_margin_seconds, refresh_concurrency,
-                max_concurrent_per_account, request_interval_ms, rotation_strategy,
-                model_mappings_json, min_codex_desktop_version,
-                min_codex_cli_version
-         from runtime_settings where id = 1",
+    let row = sqlx::query_as::<_, SnapshotSettingsRow>(
+        "select config_revision, refresh_margin_seconds, refresh_concurrency, max_concurrent_per_account, request_interval_ms, rotation_strategy, model_mappings_json, min_codex_desktop_version, min_codex_cli_version, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds, request_location_json, request_location_enabled, responses_max_decompressed_body_bytes, provider_request_profiles_json, pricing_overrides_json, pricing_synced_json from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
     .await
@@ -245,16 +283,33 @@ async fn load_settings(
         id: "1".to_owned(),
     })?;
     Ok((
-        revision_from_i64(row.0)?,
+        revision_from_i64(row.config_revision)?,
         SnapshotRuntimeSettings {
-            refresh_margin_seconds: to_u64(row.1)?,
-            refresh_concurrency: to_u32(row.2)?,
-            max_concurrent_per_account: to_u32(row.3)?,
-            request_interval_ms: to_u64(row.4)?,
-            rotation_strategy: row.5,
-            model_mappings: row.6.0,
-            min_codex_desktop_version: row.7,
-            min_codex_cli_version: row.8,
+            pricing: {
+                super::pricing::validate_pricing(&row.pricing_synced_json.0)?;
+                super::pricing::validate_pricing(&row.pricing_overrides_json.0)?;
+                gateway_core::metering::merge_pricing(
+                    row.pricing_synced_json.0,
+                    &row.pricing_overrides_json.0,
+                )
+            },
+            request_profiles: decode_request_profiles(row.provider_request_profiles_json.0)?,
+            responses_max_decompressed_body_bytes: to_u64(
+                row.responses_max_decompressed_body_bytes,
+            )?,
+            request_location_enabled: row.request_location_enabled,
+            request_location: row.request_location_json.0,
+            refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
+            refresh_concurrency: to_u32(row.refresh_concurrency)?,
+            max_concurrent_per_account: to_u32(row.max_concurrent_per_account)?,
+            request_interval_ms: to_u64(row.request_interval_ms)?,
+            rotation_strategy: row.rotation_strategy,
+            model_mappings: row.model_mappings_json.0,
+            min_codex_desktop_version: row.min_codex_desktop_version,
+            min_codex_cli_version: row.min_codex_cli_version,
+            max_waiting_per_key: to_u32(row.max_waiting_per_key)?,
+            max_waiting_per_account: to_u32(row.max_waiting_per_account)?,
+            concurrency_wait_timeout_seconds: to_u32(row.concurrency_wait_timeout_seconds)?,
         },
     ))
 }
@@ -262,11 +317,21 @@ async fn load_settings(
 async fn load_client_keys(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<Vec<ClientApiKeySnapshot>> {
-    let rows = sqlx::query_as::<_, (String, String, Vec<String>, i64, i64)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Vec<String>,
+            i64,
+            i64,
+            sqlx::types::Json<BTreeMap<String, serde_json::Map<String, serde_json::Value>>>,
+        ),
+    >(
         "select k.id, k.key,
                 coalesce(array_agg(kg.account_group_id order by kg.account_group_id)
                   filter (where kg.account_group_id is not null), '{}') as group_ids,
-                k.max_concurrency, k.requests_per_minute
+                k.max_concurrency, k.requests_per_minute, k.provider_request_profiles_json
          from client_api_keys k
          left join client_api_key_groups kg on kg.client_api_key_id = k.id
          where k.enabled
@@ -304,7 +369,10 @@ async fn load_client_keys(
             let user = owners
                 .remove(&row.0)
                 .ok_or_else(|| invalid("key owner missing"))?;
-            ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4, user)
+            let mut key =
+                ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4, user)?;
+            key.request_profiles = decode_request_profiles(row.5.0)?;
+            Ok(key)
         })
         .collect()
 }
@@ -312,15 +380,16 @@ async fn load_client_keys(
 async fn load_account_groups(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<Vec<SnapshotAccountGroupData>> {
-    let rows = sqlx::query_as::<_, (String, String, bool)>(
-        "select id, name, enabled from account_groups order by id",
+    let rows = sqlx::query_as::<_, (String, String, bool, bool)>(
+        "select id, name, enabled, disable_fast from account_groups order by id",
     )
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("load snapshot account groups"))?;
     rows.into_iter()
-        .map(|(id, name, enabled)| {
+        .map(|(id, name, enabled, disable_fast)| {
             Ok(SnapshotAccountGroupData {
+                disable_fast,
                 id: AccountGroupId::new(id).map_err(|_| invalid("invalid account group id"))?,
                 name,
                 enabled,
@@ -332,15 +401,26 @@ async fn load_account_groups(
 async fn load_provider_accounts(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<Vec<SnapshotProviderAccountData>> {
-    sqlx::query_as::<_, (String, String)>(
-        "select id, provider_kind from provider_accounts order by id",
-    )
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            sqlx::types::Json<gateway_core::account::AccountModelAccess>,
+        ),
+    >("select id, provider_kind, model_access_json from provider_accounts order by id")
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("load snapshot provider accounts"))
     .map(|rows| {
         rows.into_iter()
-            .map(|(id, provider_kind)| SnapshotProviderAccountData { id, provider_kind })
+            .map(
+                |(id, provider_kind, model_access)| SnapshotProviderAccountData {
+                    id,
+                    provider_kind,
+                    model_access: model_access.0,
+                },
+            )
             .collect()
     })
 }
@@ -383,4 +463,21 @@ fn invalid(message: &str) -> StoreError {
         entity: "runtime snapshot",
         message: message.to_owned(),
     }
+}
+
+fn decode_request_profiles(
+    profiles: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+) -> StoreResult<
+    BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
+> {
+    profiles
+        .into_iter()
+        .map(|(kind, document)| {
+            Ok((
+                gateway_core::routing::ProviderKind::new(kind)
+                    .map_err(|_| invalid("invalid request profile provider"))?,
+                gateway_core::account::OpaqueProviderData::new(document),
+            ))
+        })
+        .collect()
 }

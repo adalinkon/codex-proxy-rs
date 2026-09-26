@@ -5,7 +5,7 @@ APP_NAME="codex-proxy-rs"
 VERSION_FILE="release/version.yaml"
 NOTES_FILE="release/notes.md"
 TAG_PREFIX="v"
-SEMVER='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+SEMVER='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc|exp)\.[1-9][0-9]*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 SIGNATURE="Co-authored-by: Codex <noreply@openai.com>"
 
 usage() {
@@ -76,7 +76,7 @@ require_command git
 require_command ruby
 
 version="${1#v}"
-[[ "$version" =~ $SEMVER ]] || die "version must be semver, for example 0.1.4"
+[[ "$version" =~ $SEMVER ]] || die "version must be X.Y.Z or X.Y.Z-{alpha,beta,rc,exp}.N (N >= 1), optionally with +build metadata"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
 cd "$repo_root"
@@ -142,7 +142,7 @@ update_version_file "$version"
 
 git add -- "$VERSION_FILE" "$NOTES_FILE"
 git commit \
-  -m "chore(release): prepare $tag" \
+  -m "chore(release): $tag" \
   -m "$SIGNATURE"
 
 git tag -a "$tag" -m "$tag"

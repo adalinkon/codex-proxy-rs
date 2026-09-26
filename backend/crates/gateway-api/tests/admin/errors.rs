@@ -3,7 +3,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
 };
-use gateway_api::admin;
+use gateway_api::auth::SessionState;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -12,7 +12,9 @@ use super::{AdminTestFixture, AdminTestState};
 const SESSION_COOKIE: &str = "cpr_admin_session=valid-session";
 
 fn app(state: AdminTestState) -> Router {
-    admin::router::<AdminTestState>().with_state(state)
+    crate::openai::api_router_with_admin(state.admin_services().clone()).layer(axum::Extension(
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41000))),
+    ))
 }
 
 fn request(method: Method, uri: &str, body: Body) -> Request<Body> {
@@ -78,7 +80,9 @@ async fn invalid_login_json_data_should_not_echo_the_submitted_value() {
     let mut request = request(
         Method::POST,
         "/api/admin/auth/login",
-        Body::from(json!({ "password": submitted, "rememberMe": true }).to_string()),
+        Body::from(
+            json!({ "mode": "admin", "password": submitted, "rememberMe": true }).to_string(),
+        ),
     );
     request
         .headers_mut()
@@ -112,7 +116,7 @@ async fn login_without_json_content_type_should_keep_415_with_an_admin_envelope(
         .oneshot(request(
             Method::POST,
             "/api/admin/auth/login",
-            Body::from(json!({ "password": "secret" }).to_string()),
+            Body::from(json!({ "mode": "admin", "password": "secret" }).to_string()),
         ))
         .await
         .expect("missing JSON content type response");
@@ -463,12 +467,14 @@ mod provider {
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
             quota: QuotaState::unknown(),
-            rate_limited_until: None,
+            cooldown: None,
             last_error_reason: None,
             last_error_message: None,
         };
         AccountPageItem {
             account: AccountRecord {
+                notes: None,
+                model_access: Default::default(),
                 id: "acct_error_test".to_owned(),
                 provider_kind: ProviderKind::new(provider).unwrap(),
                 groups: Vec::new(),

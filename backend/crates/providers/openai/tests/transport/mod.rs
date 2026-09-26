@@ -49,7 +49,9 @@ mod account_proxy;
 mod canonical;
 mod catalog;
 mod client;
+mod connection;
 mod diagnostics;
+mod downstream;
 mod endpoints;
 mod headers;
 mod http_client;
@@ -122,6 +124,7 @@ where
 
 fn test_wire_profile() -> CodexWireProfileState {
     CodexWireProfileState::new(CodexWireProfile {
+        client_kind: provider_openai::transport::profile::selection::ClientKind::Desktop,
         originator: "codex_cli_rs".to_owned(),
         codex_version: "1.2.3".to_owned(),
         desktop_version: "1.2.3".to_owned(),
@@ -130,8 +133,8 @@ fn test_wire_profile() -> CodexWireProfileState {
         os_version: "6.8".to_owned(),
         arch: "x86_64".to_owned(),
         terminal: "transport-test".to_owned(),
+        exact_user_agent: None,
         residency: None,
-        location: Default::default(),
         verified_at: Utc::now(),
     })
 }
@@ -172,6 +175,7 @@ struct CollectedBackendResponse {
     rate_limit_headers: Vec<(String, String)>,
     websocket_pool_decision: Option<WebSocketPoolDecision>,
     response_metadata: CodexResponseMetadata,
+    reported_model: Option<String>,
     transport_metrics: CodexTransportMetrics,
     connection_local_continuation: bool,
 }
@@ -246,7 +250,7 @@ async fn collect_backend_response(
         set_cookie_headers,
         mut rate_limit_headers,
         rate_limit_updates,
-        turn_state_update,
+        response_metadata_updates,
         websocket_pool_decision,
         diagnostics: _,
         response_metadata,
@@ -268,8 +272,11 @@ async fn collect_backend_response(
             rate_limit_headers.extend(rate_limits_to_header_pairs(update));
         }
     }
-    if let Some(update) = turn_state_update {
-        turn_state = update.lock().await.clone().or(turn_state);
+    let mut reported_model = response_metadata.effective_model.clone();
+    if let Some(update) = response_metadata_updates {
+        let update = update.lock().await;
+        turn_state = update.turn_state.clone().or(turn_state);
+        reported_model = update.reported_model.clone().or(reported_model);
     }
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let usage = extract_sse_usage(&body).map_err(CodexClientError::InvalidSse)?;
@@ -282,6 +289,7 @@ async fn collect_backend_response(
         rate_limit_headers,
         websocket_pool_decision,
         response_metadata,
+        reported_model,
         transport_metrics,
         connection_local_continuation,
     })

@@ -67,7 +67,7 @@ impl<S: AdminSessionState + Send + Sync> FromRequestParts<S> for UserAuth {
             .await
             .map_err(map_admin_service_error)?
             .map(Self)
-            .ok_or_else(AdminError::admin_session_required)
+            .ok_or_else(AdminError::session_required)
     }
 }
 
@@ -510,6 +510,9 @@ async fn create_key<S: AdminSessionState + Send + Sync>(
         .map_err(super::client_keys::map_wire_error)?;
     if command.user_id.is_some() {
         return Err(AdminError::bad_request("个人 Key 不接受指定所属用户"));
+    }
+    if !command.request_profile_overrides.is_empty() {
+        return Err(AdminError::bad_request("个人 Key 的上游身份由管理员配置"));
     }
     let key = s
         .admin_services()

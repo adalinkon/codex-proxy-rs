@@ -21,8 +21,8 @@ pub use self::{
     },
     error::{CodexWebSocketCloseError, CodexWebSocketExchangeError, CodexWebSocketUpstreamError},
     exchange::{
-        CodexWebSocketRateLimitUpdates, CodexWebSocketSseStream, CodexWebSocketStreamingExchange,
-        CodexWebSocketTurnStateUpdate,
+        CodexWebSocketRateLimitUpdates, CodexWebSocketResponseMetadataUpdates,
+        CodexWebSocketSseStream, CodexWebSocketStreamingExchange,
     },
     handshake::responses_websocket_endpoint,
     model::{
@@ -41,5 +41,6 @@ pub(crate) use self::{
         execute_prepared_response_create_request_stream, post_send_ambiguous,
         prepare_response_create_request_with_pool,
     },
+    error::WEBSOCKET_CLOSE_MESSAGE_TOO_BIG,
     pool::DEFAULT_STREAM_IDLE_TIMEOUT,
 };

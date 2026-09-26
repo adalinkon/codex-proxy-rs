@@ -1,5 +1,7 @@
 //! Account group HTTP wire and fixed routes.
 
+use crate::auth::SessionState;
+
 use std::collections::BTreeMap;
 
 use axum::{
@@ -22,8 +24,8 @@ use gateway_core::routing::AccountGroupId;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse, AdminSessionState,
-    PageMeta, WireValidationError, wire::map_admin_service_error,
+    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse, PageMeta,
+    WireValidationError, wire::map_admin_service_error,
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 50;
@@ -70,6 +72,8 @@ impl ListAccountGroupsQuery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateAccountGroupRequest {
+    #[serde(default)]
+    disable_fast: bool,
     name: String,
     description: Option<String>,
     color: String,
@@ -78,6 +82,7 @@ struct CreateAccountGroupRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateAccountGroupRequest {
+    disable_fast: Option<bool>,
     id: String,
     name: String,
     description: Option<String>,
@@ -93,6 +98,7 @@ struct AccountGroupIdRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountGroupView {
+    disable_fast: bool,
     id: String,
     name: String,
     description: Option<String>,
@@ -120,7 +126,7 @@ struct AccountGroupAccountSummaryView {
 #[serde(rename_all = "camelCase")]
 struct AccountGroupCapacityView {
     used_slots: Option<u64>,
-    total_slots: u64,
+    total_slots: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +142,7 @@ impl From<AccountGroupRecord> for AccountGroupView {
             id: record.id.to_string(),
             name: record.name,
             description: record.description,
+            disable_fast: record.disable_fast,
             color: record.color.as_str().to_owned(),
             enabled: record.enabled,
             member_count: record.member_count,
@@ -221,7 +228,7 @@ impl From<AccountGroupMutation> for AccountGroupMutationData {
 /// Construct all fixed account-group management routes.
 pub fn router<S>() -> Router<S>
 where
-    S: AdminSessionState + Clone + Send + Sync + 'static,
+    S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/api/admin/account-groups", get(list::<S>))
@@ -238,7 +245,7 @@ async fn list<S>(
     AdminQuery(query): AdminQuery<ListAccountGroupsQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()
@@ -258,7 +265,7 @@ async fn create<S>(
     AdminJson(request): AdminJson<CreateAccountGroupRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     validate_group_fields(&request.name, request.description.as_deref())?;
     mutation_response(
@@ -271,6 +278,7 @@ where
                 CreateAccountGroup {
                     name: request.name,
                     description: request.description,
+                    disable_fast: request.disable_fast,
                     color: group_color(&request.color)?,
                 },
             )
@@ -284,7 +292,7 @@ async fn update<S>(
     AdminJson(request): AdminJson<UpdateAccountGroupRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     validate_group_fields(&request.name, request.description.as_deref())?;
     mutation_response(
@@ -298,6 +306,7 @@ where
                     id: group_id(request.id)?,
                     name: request.name,
                     description: request.description,
+                    disable_fast: request.disable_fast,
                     color: group_color(&request.color)?,
                 },
             )
@@ -311,7 +320,7 @@ async fn enable<S>(
     AdminJson(request): AdminJson<AccountGroupIdRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     set_enabled(auth, state, request, true).await
 }
@@ -322,7 +331,7 @@ async fn disable<S>(
     AdminJson(request): AdminJson<AccountGroupIdRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     set_enabled(auth, state, request, false).await
 }
@@ -334,7 +343,7 @@ async fn set_enabled<S>(
     enabled: bool,
 ) -> Result<AdminResponse<AdminEnvelope<AccountGroupMutationData>>, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     mutation_response(
         StatusCode::OK,
@@ -358,7 +367,7 @@ async fn delete<S>(
     AdminJson(request): AdminJson<AccountGroupIdRequest>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     mutation_response(
         StatusCode::OK,

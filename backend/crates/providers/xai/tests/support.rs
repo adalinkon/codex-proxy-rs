@@ -27,28 +27,25 @@ use provider_xai::{
     GrokCatalogCacheError, GrokCatalogScope, GrokCredentialAdmin, GrokCredentialCatalogCache,
     GrokCredentialCatalogService, GrokCredentialQuotaService, GrokCredentialRepository,
     GrokCredentialRepositoryError, GrokEndpointPolicy, GrokModelCatalogTransport, GrokOAuthSecret,
-    GrokPlanCatalog, GrokReqwestTransportBuildError, SecretValue, XaiConfig, XaiWireProfileState,
+    GrokPlanCatalog, GrokReqwestTransportBuildError, SecretValue, XaiWireProfile,
+    XaiWireProfileState,
 };
 use reqwest::Client;
 use reqwest::redirect::Policy;
 use url::{Host, Url};
 
-pub fn xai_config() -> XaiConfig {
-    serde_json::from_value(serde_json::json!({
-        "wire_profile": {
+pub fn xai_wire_profile() -> XaiWireProfileState {
+    XaiWireProfileState::new(
+        serde_json::from_value::<XaiWireProfile>(serde_json::json!({
             "client_identifier": "grok-shell",
             "client_version": "0.2.106",
             "client_mode": "headless",
             "target_os": "linux",
             "target_arch": "x86_64",
             "verified_at": "2026-07-21T00:00:00+08:00"
-        }
-    }))
-    .expect("valid xAI test config")
-}
-
-pub fn xai_wire_profile() -> XaiWireProfileState {
-    xai_config().wire_profile_state()
+        }))
+        .expect("valid test runtime profile"),
+    )
 }
 
 pub fn grok_catalog_service(
@@ -346,9 +343,10 @@ impl ProviderAccountStore for MemoryProviderAccountStore {
         if self.fail_provider_listing.load(Ordering::SeqCst) {
             return Err(invalid());
         }
+        // 与 Postgres 实现的调度列表语义一致：停用账号不进入常规候选。
         Ok(lock(&self.accounts)
             .values()
-            .filter(|stored| stored.account.provider() == provider)
+            .filter(|stored| stored.account.provider() == provider && stored.account.enabled())
             .map(|stored| stored.account.clone())
             .collect())
     }
@@ -407,6 +405,7 @@ impl ProviderAccountStore for MemoryProviderAccountStore {
             account_id,
             expected_revision,
             profile,
+            preserve_profile,
             credential,
             has_refresh_token,
             access_token_expires_at,
@@ -444,9 +443,21 @@ impl ProviderAccountStore for MemoryProviderAccountStore {
                 enabled: stored.account.enabled(),
                 has_refresh_token,
                 next_refresh_at,
-                name: profile.name,
-                email: profile.email,
-                plan_type: profile.plan_type,
+                name: if preserve_profile {
+                    stored.account.name().to_owned()
+                } else {
+                    profile.name
+                },
+                email: if preserve_profile {
+                    stored.account.email().map(str::to_owned)
+                } else {
+                    profile.email
+                },
+                plan_type: if preserve_profile {
+                    stored.account.plan_type().map(str::to_owned)
+                } else {
+                    profile.plan_type
+                },
             },
         );
         stored.credential = credential;
@@ -957,6 +968,30 @@ impl ProviderCooldownPort for MemoryCooldownPort {
             scoped.retain(|(id, _), _| id != account_id);
             Ok(account_removed || scoped_removed)
         })
+    }
+
+    fn record_capacity_failure<'a>(
+        &'a self,
+        _account_id: &'a ProviderAccountId,
+        _window: Duration,
+        _in_flight: u32,
+    ) -> futures::future::BoxFuture<'a, Result<u32, ProviderStoreError>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn clear_after_success<'a>(
+        &'a self,
+        _account_id: &'a ProviderAccountId,
+        _through_revision: gateway_core::account::CredentialRevision,
+    ) -> futures::future::BoxFuture<'a, Result<(), ProviderStoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn capacity_peak_in_flight<'a>(
+        &'a self,
+        _account_id: &'a ProviderAccountId,
+    ) -> futures::future::BoxFuture<'a, Result<Option<u32>, ProviderStoreError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 

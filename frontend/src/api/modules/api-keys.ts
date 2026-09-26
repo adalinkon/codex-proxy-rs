@@ -1,10 +1,15 @@
 import type { RequestOptions } from '../request'
 import type { AccountGroupRef } from './account-groups'
+import type { ClientProfileSelection, ProviderRequestProfile, ProviderRequestProfiles, XaiClientProfileSelection } from './client-profiles'
 import request from '../request'
 
 export type ApiKeyRoutingScope = 'groups' | 'inherit'
 
 export interface ApiKey {
+  providerRequestProfileOverrides: ProviderRequestProfiles
+  openaiClientProfileOverride: ClientProfileSelection | null
+  xaiClientProfileOverride: XaiClientProfileSelection | null
+
   id: string
   userId: string
   name: string
@@ -69,10 +74,12 @@ export interface ApiKeyWriteParam {
 
 interface ApiKeyUpdateParam extends ApiKeyWriteParam {
   id: string
+  providerRequestProfileOverrides: Record<string, ProviderRequestProfile | null>
 }
 
 interface ApiKeyCreateParam extends ApiKeyWriteParam {
   userId?: string
+  providerRequestProfileOverrides: ProviderRequestProfiles
   customKey?: string
 }
 

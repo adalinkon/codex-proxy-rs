@@ -144,6 +144,7 @@ impl AccountGroupService for DefaultAccountGroupService {
                         id,
                         name: command.name,
                         description: command.description,
+                        disable_fast: command.disable_fast,
                         color: command.color,
                     },
                     context,
@@ -192,11 +193,7 @@ fn project_group_runtime(
     let mut accounts_by_group = BTreeMap::<&str, Vec<&str>>::new();
     for member in members {
         let mut status = member.status.clone();
-        status.rate_limited_until = runtime
-            .rate_limited_until
-            .get(&member.account_id)
-            .copied()
-            .map(Into::into);
+        status.cooldown = runtime.cooldown.get(&member.account_id).copied();
         status_by_account
             .entry(member.account_id.as_str())
             .or_insert_with(|| resolve_account_status(&status, now).status);
@@ -234,8 +231,8 @@ fn project_group_runtime(
                     })
                 })
             },
-            total_slots: available_ids.iter().fold(0_u64, |sum, account_id| {
-                sum.saturating_add(slots_by_account.get(*account_id).copied().unwrap_or(0))
+            total_slots: available_ids.iter().try_fold(0_u64, |sum, account_id| {
+                Some(sum.saturating_add(slots_by_account.get(*account_id).copied().flatten()?))
             }),
         };
     }

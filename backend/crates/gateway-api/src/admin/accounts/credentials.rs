@@ -2,35 +2,38 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AccountProvider {
-    OpenAi,
-    Xai,
-}
-
-impl AccountProvider {
-    fn parse(value: &str) -> Result<Self, WireValidationError> {
-        match value.trim() {
-            "openai" => Ok(Self::OpenAi),
-            "xai" => Ok(Self::Xai),
-            _ => Err(WireValidationError::new("provider")),
-        }
+fn validate_account_notes(notes: Option<&str>) -> Result<(), WireValidationError> {
+    if notes.is_some_and(|notes| {
+        notes.chars().count() > 500
+            || notes
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    }) {
+        return Err(WireValidationError::new("notes"));
     }
+    Ok(())
 }
 
-/// 导入统一设置，复用编辑账号的调度和分组约束。
-#[derive(Debug, Clone, Deserialize)]
+fn parse_provider(value: &str) -> Result<ProviderKind, WireValidationError> {
+    ProviderKind::new(value.trim().to_owned()).map_err(|_| WireValidationError::new("provider"))
+}
+
+/// 导入统一设置，复用编辑账号的备注、调度和分组约束。
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountImportSettingsRequest {
+    pub notes: Option<String>,
     pub enabled: bool,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub concurrency_limit: Option<u64>,
     pub weight: u64,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
     pub group_ids: Vec<String>,
 }
 
 impl AccountImportSettingsRequest {
     fn validate(&self) -> Result<(), WireValidationError> {
+        validate_account_notes(self.notes.as_deref())?;
         parse_concurrency_limit(self.concurrency_limit)?;
         parse_account_weight(self.weight)?;
         validate_wire_group_ids(&self.group_ids)?;
@@ -41,16 +44,18 @@ impl AccountImportSettingsRequest {
         self,
     ) -> Result<gateway_admin::model::accounts::AccountImportSettings, WireValidationError> {
         Ok(gateway_admin::model::accounts::AccountImportSettings {
+            notes: self.notes,
             enabled: self.enabled,
             concurrency_limit: parse_concurrency_limit(self.concurrency_limit)?,
             weight: parse_account_weight(self.weight)?,
+            model_access: self.model_access,
             group_ids: validate_wire_group_ids(&self.group_ids)?,
         })
     }
 }
 
 /// Provider-owned 账号导入请求；公共 API 不解释 `data` 内部字段。
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountImportRequest {
     pub outbound_proxy_id: Option<String>,
@@ -67,7 +72,7 @@ impl AccountImportRequest {
         if let Some(settings) = &self.settings {
             settings.validate()?;
         }
-        AccountProvider::parse(&self.provider)?;
+        parse_provider(&self.provider)?;
         if !self.data.is_object()
             || serde_json::to_vec(&self.data)
                 .map_or(true, |encoded| encoded.len() > MAX_IMPORT_DATA_BYTES)
@@ -80,9 +85,9 @@ impl AccountImportRequest {
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, ImportCredentials), WireValidationError> {
+    ) -> Result<(ProviderKind, ImportCredentials), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         Ok((
             provider,
             ImportCredentials {
@@ -98,7 +103,7 @@ impl AccountImportRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartAccountAuthorizationRequest {
     pub outbound_proxy_id: Option<String>,
@@ -110,7 +115,7 @@ pub struct StartAccountAuthorizationRequest {
 
 impl StartAccountAuthorizationRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
-        AccountProvider::parse(&self.provider)?;
+        parse_provider(&self.provider)?;
         require_text(&self.name, MAX_NAME_BYTES, "name")?;
         if let Some(account_id) = self.account_id.as_deref() {
             require_account_id(account_id, "accountId")?;
@@ -121,9 +126,9 @@ impl StartAccountAuthorizationRequest {
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, StartAuthorization), WireValidationError> {
+    ) -> Result<(ProviderKind, StartAuthorization), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         let reauthorization = self
             .account_id
             .map(ProviderAccountId::new)
@@ -158,27 +163,17 @@ impl CompleteAccountAuthorizationRequest {
         if let Some(settings) = &self.settings {
             settings.validate()?;
         }
-        let provider = AccountProvider::parse(&self.provider)?;
-        match provider {
-            AccountProvider::OpenAi => {
-                if !URL_SAFE_NO_PAD
-                    .decode(&self.flow_id)
-                    .is_ok_and(|decoded| decoded.len() == 32)
-                {
-                    return Err(WireValidationError::new("flowId"));
-                }
-            }
-            AccountProvider::Xai => require_wire_id(&self.flow_id, "flowId")?,
-        }
+        let provider = parse_provider(&self.provider)?;
+        validate_authorization_flow(&provider, &self.flow_id)?;
         require_text(&self.callback_url, MAX_CALLBACK_URL_BYTES, "callbackUrl")
     }
 
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, CompleteAuthorization), WireValidationError> {
+    ) -> Result<(ProviderKind, CompleteAuthorization), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         Ok((
             provider,
             CompleteAuthorization {
@@ -194,41 +189,113 @@ impl CompleteAccountAuthorizationRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn validate_authorization_flow(
+    provider: &ProviderKind,
+    flow_id: &str,
+) -> Result<(), WireValidationError> {
+    if provider.as_str() == "openai" {
+        if !URL_SAFE_NO_PAD
+            .decode(flow_id)
+            .is_ok_and(|decoded| decoded.len() == 32)
+        {
+            return Err(WireValidationError::new("flowId"));
+        }
+        Ok(())
+    } else {
+        require_wire_id(flow_id, "flowId")
+    }
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateAccountRequest {
+    pub connection: Option<AccountConnectionUpdateRequest>,
     pub outbound_proxy_id: Option<String>,
     pub outbound_proxy_url: Option<super::wire::AccountProxyUpdate>,
     pub account_id: String,
+    pub notes: Option<String>,
     pub enabled: bool,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub concurrency_limit: Option<u64>,
     pub weight: u64,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
     pub group_ids: Vec<String>,
 }
 
 impl UpdateAccountRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
         require_account_id(&self.account_id, "accountId")?;
+        if let Some(connection) = &self.connection {
+            connection.validate()?;
+        }
+        validate_account_notes(self.notes.as_deref())?;
         parse_concurrency_limit(self.concurrency_limit)?;
         parse_account_weight(self.weight)?;
         validate_wire_group_ids(&self.group_ids)?;
         Ok(())
     }
 
-    pub(super) fn into_command(self) -> Result<UpdateAccount, WireValidationError> {
+    pub(super) fn into_command(
+        self,
+    ) -> Result<(UpdateAccount, Option<ProviderDocument>), WireValidationError> {
         self.validate()?;
-        Ok(UpdateAccount {
+        let connection = self
+            .connection
+            .map(AccountConnectionUpdateRequest::into_document);
+        let settings = UpdateAccount {
             outbound_proxy: super::wire::proxy_selection(
                 self.outbound_proxy_id,
                 self.outbound_proxy_url,
             )?,
             account_id: self.account_id,
+            notes: self.notes,
             enabled: self.enabled,
             concurrency_limit: parse_concurrency_limit(self.concurrency_limit)?,
             weight: parse_account_weight(self.weight)?,
+            model_access: self.model_access,
             group_ids: validate_wire_group_ids(&self.group_ids)?,
-        })
+        };
+        Ok((settings, connection))
+    }
+}
+
+/// 编辑 OpenAI 账号的连接设置；OAuth 仅接受传输方式。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountConnectionUpdateRequest {
+    pub base_url: Option<String>,
+    pub transport: String,
+    pub api_key: Option<String>,
+}
+
+impl AccountConnectionUpdateRequest {
+    fn validate(&self) -> Result<(), WireValidationError> {
+        if let Some(base_url) = &self.base_url {
+            require_text(base_url, 2048, "connection.baseUrl")?;
+        }
+        if !matches!(self.transport.as_str(), "http" | "prefer_websocket") {
+            return Err(WireValidationError::new("connection.transport"));
+        }
+        if self.api_key.as_ref().is_some_and(|key| {
+            key.is_empty()
+                || key.len() > 16 * 1024
+                || !key.bytes().all(|byte| byte.is_ascii_graphic())
+        }) {
+            return Err(WireValidationError::new("connection.apiKey"));
+        }
+        Ok(())
+    }
+
+    fn into_document(self) -> ProviderDocument {
+        let mut material =
+            Map::from_iter([("transport".to_owned(), Value::String(self.transport))]);
+        if let Some(base_url) = self.base_url {
+            material.insert("base_url".to_owned(), Value::String(base_url));
+        }
+        if let Some(key) = self.api_key {
+            material.insert("api_key".to_owned(), Value::String(key));
+        }
+        ProviderDocument::new(OpaqueProviderData::new(material))
     }
 }
 
@@ -257,7 +324,7 @@ pub struct AccountDeletionRequest {
 
 impl AccountDeletionRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
-        AccountProvider::parse(&self.provider)?;
+        parse_provider(&self.provider)?;
         if self.account_ids.is_empty() || self.account_ids.len() > MAX_ACCOUNT_DELETE_BATCH {
             return Err(WireValidationError::new("accountIds"));
         }
@@ -274,9 +341,9 @@ impl AccountDeletionRequest {
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, CredentialDeletion), WireValidationError> {
+    ) -> Result<(ProviderKind, CredentialDeletion), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         Ok((
             provider,
             CredentialDeletion {
@@ -289,55 +356,6 @@ impl AccountDeletionRequest {
                     .map_err(|_| WireValidationError::new("accountIds"))?,
             },
         ))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RotateAccountRequest {
-    pub provider: String,
-    pub account_id: String,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub id_token: Option<String>,
-}
-
-impl RotateAccountRequest {
-    pub fn validate(&self) -> Result<(), WireValidationError> {
-        if AccountProvider::parse(&self.provider)? != AccountProvider::OpenAi {
-            return Err(WireValidationError::new("provider"));
-        }
-        require_account_id(&self.account_id, "accountId")?;
-        validate_oauth_material(
-            &self.access_token,
-            self.refresh_token.as_deref(),
-            self.id_token.as_deref(),
-        )
-    }
-
-    pub(super) fn into_command(
-        self,
-        context: gateway_admin::model::MutationContext,
-    ) -> Result<RotateCredential, WireValidationError> {
-        self.validate()?;
-        let mut material = Map::new();
-        material.insert("access_token".to_owned(), Value::String(self.access_token));
-        material.insert(
-            "refresh_token".to_owned(),
-            self.refresh_token.map_or(Value::Null, Value::String),
-        );
-        material.insert(
-            "id_token".to_owned(),
-            self.id_token.map_or(Value::Null, Value::String),
-        );
-        Ok(RotateCredential {
-            mutation: CredentialMutation {
-                context,
-                account_id: ProviderAccountId::new(self.account_id)
-                    .map_err(|_| WireValidationError::new("accountId"))?,
-            },
-            provider_material: ProviderDocument::new(OpaqueProviderData::new(material)),
-        })
     }
 }
 
@@ -504,47 +522,6 @@ fn require_text(
         return Err(WireValidationError::new(field));
     }
     Ok(())
-}
-
-fn validate_oauth_material(
-    access_token: &str,
-    refresh_token: Option<&str>,
-    id_token: Option<&str>,
-) -> Result<(), WireValidationError> {
-    if access_token.len() > MAX_ACCESS_TOKEN_BYTES
-        || !valid_visible_ascii(access_token)
-        || !valid_compact_jwt_shape(access_token)
-    {
-        return Err(WireValidationError::new("accessToken"));
-    }
-    if refresh_token.is_some_and(|token| {
-        token.len() > MAX_REFRESH_TOKEN_BYTES
-            || !valid_visible_ascii(token)
-            || token == access_token
-    }) {
-        return Err(WireValidationError::new("refreshToken"));
-    }
-    if id_token.is_some_and(|token| {
-        token.len() > MAX_ID_TOKEN_BYTES
-            || !valid_visible_ascii(token)
-            || !valid_compact_jwt_shape(token)
-    }) {
-        return Err(WireValidationError::new("idToken"));
-    }
-    Ok(())
-}
-
-fn valid_compact_jwt_shape(value: &str) -> bool {
-    let mut segments = value.split('.');
-    matches!(
-        (segments.next(), segments.next(), segments.next(), segments.next()),
-        (Some(header), Some(payload), Some(signature), None)
-            if !header.is_empty() && !payload.is_empty() && !signature.is_empty()
-    )
-}
-
-fn valid_visible_ascii(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 pub(super) fn provider_document_value(document: ProviderDocument) -> Value {

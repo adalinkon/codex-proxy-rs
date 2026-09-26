@@ -107,7 +107,7 @@ where
     {
         Ok(Some(user)) if user.role == gateway_admin::model::users::UserRole::Admin => Ok(user.id),
         Ok(Some(_)) => Err(AdminError::administrator_required()),
-        Ok(None) => Err(AdminError::admin_session_required()),
+        Ok(None) => Err(AdminError::session_required()),
         Err(_) => Err(AdminError::internal()),
     }
 }

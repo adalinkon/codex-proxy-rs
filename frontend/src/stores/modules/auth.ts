@@ -53,14 +53,11 @@ export const useAuthStore = defineStore('auth', () => {
   async function logout() {
     try {
       await apiLogout({ silent: true })
+      invalidateSession()
+      return true
     }
     catch {
-      // 忽略登出错误
-    }
-    finally {
-      isAuthenticated.value = false
-      user.value = null
-      sessionChecked.value = true
+      return false
     }
   }
 

@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { RefreshCw, Search } from '@lucide/vue'
+import { BaseIconButton, BaseInput } from '@codex-proxy/ui'
 
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
+import { RefreshCw, Search } from '@lucide/vue'
 
 defineProps<{
   refreshing: boolean
@@ -27,7 +26,8 @@ const search = defineModel<string>('search', { required: true })
       </BaseInput>
     </div>
 
-    <div class="ml-auto flex shrink-0 items-center justify-end">
+    <div class="ml-auto flex shrink-0 items-center justify-end gap-2">
+      <slot name="actions" />
       <BaseIconButton
         variant="ghost"
         size="md"

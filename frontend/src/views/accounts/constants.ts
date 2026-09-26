@@ -1,5 +1,5 @@
 import type { AccountErrorReason, AccountStatus, getAccounts } from '@/api'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
+import { defineTableColumns } from '@codex-proxy/ui'
 import { formatProviderLabel } from '@/utils/providers'
 
 export type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
@@ -18,10 +18,11 @@ const quotaGroupOrder = new Map([
 ])
 
 export const accountColumns = defineTableColumns<AccountRow>([
-  { key: 'expander', kind: 'expander' },
-  { key: 'selection', kind: 'selection' },
+  { key: 'expander', kind: 'expander', hideable: false },
+  { key: 'selection', kind: 'selection', hideable: false },
   {
     key: 'identity',
+    hideable: false,
     label: '账号',
     kind: 'identity',
     size: '3xl',
@@ -54,7 +55,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
     format: value => optionalAccountCell(value),
     emptyText: '',
   },
-  { key: 'actions', label: '操作', kind: 'actions', size: 'lg' },
+  { key: 'actions', label: '操作', kind: 'actions', size: 'lg', hideable: false },
 ])
 
 export const statusLabels: Record<AccountStatus, string> = {

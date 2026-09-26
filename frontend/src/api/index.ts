@@ -3,6 +3,7 @@ export * from './modules/account-groups'
 
 // 账号管理
 export * from './modules/accounts'
+
 // API Keys 管理
 export * from './modules/api-keys'
 
@@ -15,6 +16,13 @@ export * from './modules/backups'
 // Dashboard 聚合
 export * from './modules/dashboard'
 
+// 插件管理
+export * from './modules/plugin-extensions'
+export * from './modules/plugins'
+
+// 模型定价
+export * from './modules/pricing'
+
 export * from './modules/proxies'
 
 // 设置管理
@@ -25,3 +33,5 @@ export * from './modules/system'
 
 // 使用记录
 export * from './modules/usage'
+
+export type { RequestLocation } from './types/request-location'

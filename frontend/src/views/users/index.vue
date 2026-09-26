@@ -1,26 +1,13 @@
 <script setup lang="ts">
+import type { BaseTableSort } from '@codex-proxy/ui'
 import type { UserPolicy, UserRecord } from '@/api/modules/users'
-import type { BaseTableSort } from '@/components/base/BaseTable/columns'
+import { BaseButton, BaseCard, BaseConfirmModal, BaseFormItem, BaseIconButton, BaseInput, BaseModal, BaseNumberInput, BasePageHeader, BaseSelect, BaseTable, BaseTablePagination, defineTableColumns, toast } from '@codex-proxy/ui'
 import { KeyRound, Pencil, Plus, Power, RefreshCw, RotateCcw, Search, Trash2 } from '@lucide/vue'
 import { useSessionStorage } from '@vueuse/core'
 import { computed, onMounted, ref, watch } from 'vue'
 import { deleteUser, getUsers, resetUserBudget, resetUserPassword, saveUser } from '@/api/modules/users'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseNumberInput from '@/components/base/BaseNumberInput.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
-import { toast } from '@/components/base/BaseToast'
 import BudgetCell from '@/components/BudgetCell.vue'
 import RequestLimitsCell from '@/components/RequestLimitsCell.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
@@ -28,8 +15,8 @@ import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useBudgetRollover } from '@/composables/useBudgetRollover'
 import { useRequestState } from '@/composables/useRequestState'
 import { useRequestUsage } from '@/composables/useRequestUsage'
-import { createOperationId } from '@/utils/uuid'
-import ApiKeyStatusBadge from '@/views/api-keys/components/ApiKeyStatusBadge.vue'
+import { generateRequestId } from '@/utils/uuid'
+import ApiKeyStatusBadge from '@/views/keys/components/ApiKeyStatusBadge.vue'
 
 const users = ref<UserRecord[]>([])
 const request = useRequestState()
@@ -141,7 +128,7 @@ async function submitBudgetReset() {
   const id = budgetResetUser.value.id
   await resetBudgetAction.run(async () => {
     // 未确认结果的操作跨弹窗和页面刷新复用标识，防止重试再次清零。
-    const operationId = Object.hasOwn(budgetResetOperations.value, id) ? budgetResetOperations.value[id] : createOperationId()
+    const operationId = Object.hasOwn(budgetResetOperations.value, id) ? budgetResetOperations.value[id] : generateRequestId()
     budgetResetOperations.value = { ...budgetResetOperations.value, [id]: operationId }
     await resetUserBudget(id, operationId)
     const remaining = { ...budgetResetOperations.value }

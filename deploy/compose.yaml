@@ -121,8 +121,7 @@ services:
       CPR_DATABASE_URL: postgres://codex_proxy@postgres:5432/codex_proxy
       CPR_REDIS_URL: redis://redis:6379/
       CPR_DEPLOYMENT_MODE: docker
-      CPR_UPDATE_REPOSITORY: zyycn/codex-proxy-rs
-      CPR_UPDATE_CHANNEL: stable
+      CPR_UPDATE_REPOSITORY: adalinkon/codex-proxy-rs
       CPR_GITHUB_API_BASE: https://api.github.com/repos
       CPR_UPDATE_EXE_PATH: /app/bin/codex-proxy-rs
       CPR_WEB_DIST_DIR: /app/web/dist

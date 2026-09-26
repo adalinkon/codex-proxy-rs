@@ -279,12 +279,36 @@ impl fmt::Debug for CodexCookie {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesTransport {
+    #[default]
+    Http,
+    PreferWebsocket,
+}
+
+impl ResponsesTransport {
+    pub(crate) const fn oauth_default() -> Self {
+        Self::PreferWebsocket
+    }
+
+    fn is_oauth_default(&self) -> bool {
+        *self == Self::oauth_default()
+    }
+}
+
 pub const CODEX_AUTHENTICATION_KIND_OAUTH: &str = "oauth";
 
 /// Codex OAuth 对 `provider_credentials_json` 的完整明文 schema。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexOAuthCredentialData {
+    // 默认值不扩展旧凭据 JSON，恢复 WS 优先后仍可由旧版本读取。
+    #[serde(
+        default = "ResponsesTransport::oauth_default",
+        skip_serializing_if = "ResponsesTransport::is_oauth_default"
+    )]
+    pub transport: ResponsesTransport,
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<CodexCredentialPrincipal>,
@@ -322,11 +346,12 @@ impl fmt::Debug for CodexOAuthCredentialData {
     }
 }
 
-/// OpenAI Provider 的规范化 OAuth 凭据形态。
+/// OpenAI Provider 的规范化凭据形态。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CodexCredentialData {
     OAuth(CodexOAuthCredentialData),
+    ApiKey(super::api_key::ApiKeyCredentialData),
 }
 
 impl CodexCredentialData {
@@ -334,6 +359,7 @@ impl CodexCredentialData {
     pub const fn authentication_kind(&self) -> &'static str {
         match self {
             Self::OAuth(_) => CODEX_AUTHENTICATION_KIND_OAUTH,
+            Self::ApiKey(_) => super::api_key::CODEX_AUTHENTICATION_KIND_API_KEY,
         }
     }
 
@@ -341,6 +367,7 @@ impl CodexCredentialData {
     pub fn installation_id(&self) -> &str {
         match self {
             Self::OAuth(data) => &data.installation_id,
+            Self::ApiKey(data) => &data.installation_id,
         }
     }
 
@@ -348,12 +375,14 @@ impl CodexCredentialData {
     pub fn cookies(&self) -> &[CodexCookie] {
         match self {
             Self::OAuth(data) => &data.cookies,
+            Self::ApiKey(_) => &[],
         }
     }
 
-    pub fn cookies_mut(&mut self) -> &mut Vec<CodexCookie> {
+    pub fn cookies_mut(&mut self) -> Option<&mut Vec<CodexCookie>> {
         match self {
-            Self::OAuth(data) => &mut data.cookies,
+            Self::OAuth(data) => Some(&mut data.cookies),
+            Self::ApiKey(_) => None,
         }
     }
 
@@ -361,12 +390,14 @@ impl CodexCredentialData {
     pub fn oauth(&self) -> Option<&CodexOAuthCredentialData> {
         match self {
             Self::OAuth(data) => Some(data),
+            Self::ApiKey(_) => None,
         }
     }
 
     pub fn oauth_mut(&mut self) -> Option<&mut CodexOAuthCredentialData> {
         match self {
             Self::OAuth(data) => Some(data),
+            Self::ApiKey(_) => None,
         }
     }
 
@@ -381,6 +412,7 @@ impl fmt::Debug for CodexCredentialData {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OAuth(data) => data.fmt(formatter),
+            Self::ApiKey(data) => data.fmt(formatter),
         }
     }
 }

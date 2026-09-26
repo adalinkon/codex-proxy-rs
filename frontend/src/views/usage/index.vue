@@ -1,14 +1,9 @@
 <script setup lang="ts">
+import { BaseCard, BaseIconButton, BasePageHeader, BaseSegmented, BaseSelect, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
+
 import { Eye } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
-
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import ProviderFilterSegmented from '@/components/ProviderFilterSegmented.vue'
+import ProviderFilter from '@/components/ProviderFilter.vue'
 import OpsErrorPanel from './components/OpsErrorPanel.vue'
 import UsageFilters from './components/UsageFilters.vue'
 import UsageInsightsGrid from './components/UsageInsightsGrid.vue'
@@ -25,6 +20,7 @@ const columns = computed(() => props.scope === 'user'
   ? usageRecordColumns.filter(column => !['username', 'accountEmail', 'actions'].includes(column.key))
   : usageRecordColumns)
 const recordView = shallowRef('success')
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(columns, props.scope === 'user' ? 'user-usage-records' : 'usage-records')
 const recordViewOptions = [
   { label: '成功记录', value: 'success' },
   { label: '错误排查', value: 'errors' },
@@ -69,10 +65,10 @@ watch(timeRange, () => {
     <BasePageHeader title="使用统计" description="查看请求用量、性能趋势与调用错误记录">
       <template #actions>
         <BaseSelect v-model="timeRange" :options="usageTimeRangeOptions" class="w-34" />
-        <ProviderFilterSegmented
+        <ProviderFilter
           v-model="providerQuery"
           :disabled="refreshingList"
-          class="w-31 shrink-0"
+          class="shrink-0"
         />
       </template>
     </BasePageHeader>
@@ -116,12 +112,21 @@ watch(timeRange, () => {
             :loading="loading"
             :refreshing="refreshingList"
             @refresh="refreshUsageRecords"
-          />
+          >
+            <template #actions>
+              <BaseTableColumnSettings
+                :options="columnOptions"
+                @change="setColumnVisible"
+                @reorder="setColumnOrder"
+                @reset="resetColumns"
+              />
+            </template>
+          </UsageFilters>
 
           <div class="flex min-h-0 min-w-0 flex-col">
             <UsageRecordsTable
               class="min-h-0 flex-1"
-              :columns="columns"
+              :columns="visibleColumns"
               :rows="records"
               :loading="loading"
               empty-text="暂无使用记录"

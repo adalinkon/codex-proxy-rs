@@ -176,6 +176,7 @@ impl GrokCredentialAdmin {
         )
         .with_refresh_schedule(true, None);
         Ok(NewProviderAccount {
+            model_access: Default::default(),
             account,
             credential: encode_secret(&input.secret, &input.account)?,
         })
@@ -276,6 +277,7 @@ impl GrokCredentialAdmin {
             }
             let mut exported = serde_json::json!({
                 "name": loaded.account.name(),
+                "modelAccess": loaded.account.model_access(),
                 "platform": "grok",
                 "type": "oauth",
                 "credentials": credentials,
@@ -336,6 +338,17 @@ impl GrokCredentialRepository {
     #[must_use]
     pub fn new(store: Arc<dyn ProviderAccountStore>) -> Self {
         Self { store }
+    }
+
+    /// 按 id 读取账号事实，不做 enabled 过滤；诊断选择用它回补停用账号候选。
+    pub(crate) async fn account_by_id(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderAccount>, GrokCredentialRepositoryError> {
+        self.store
+            .get_account(account_id)
+            .await
+            .map_err(map_store_error)
     }
 
     pub(crate) async fn list_refresh_candidates(
@@ -543,6 +556,7 @@ impl GrokCredentialRepository {
         let outcome = self
             .store
             .compare_and_swap_quota(QuotaObservation {
+                plan_type: None,
                 account_id,
                 expected_revision,
                 quota: OpaqueProviderData::new(document),

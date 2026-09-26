@@ -62,6 +62,53 @@ impl gateway_admin::ports::store::RequestUsageStore for AdminRequestUsageStoreAd
 
 #[async_trait::async_trait]
 impl SettingsStore for AdminSettingsStoreAdapter {
+    async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
+        self.control_plane
+            .load_pricing()
+            .await
+            .map_err(|error| admin_store_error("model pricing", error))
+    }
+
+    async fn sync_pricing(
+        &self,
+        changes: gateway_admin::model::pricing::PricingSyncChanges,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let audit = mutation_audit(
+            context,
+            "pricing.sync",
+            "model_pricing",
+            "models.dev",
+            vec!["synced".to_owned()],
+        );
+        let revision = self
+            .control_plane
+            .sync_pricing(changes, audit)
+            .await
+            .map_err(|error| admin_store_error("model pricing sync", error))?;
+        admin_revision(revision)
+    }
+
+    async fn update_pricing(
+        &self,
+        command: gateway_admin::model::pricing::UpdatePricing,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let audit = mutation_audit(
+            context,
+            "pricing.update",
+            "model_pricing",
+            &command.provider,
+            command.models.clone(),
+        );
+        let revision = self
+            .control_plane
+            .update_pricing(command, audit)
+            .await
+            .map_err(|error| admin_store_error("model pricing", error))?;
+        admin_revision(revision)
+    }
+
     async fn load_runtime_settings(&self) -> AdminStoreResult<AdminRuntimeSettings> {
         let snapshot = postgres::ControlPlaneRepository::load_control_plane(&self.control_plane)
             .await
@@ -86,11 +133,19 @@ impl SettingsStore for AdminSettingsStoreAdapter {
             .map_err(|error| admin_store_error("runtime settings", error))?;
         let replacement = postgres::ControlPlaneReplacement {
             settings: postgres::RuntimeSettingsUpdate {
+                request_profile_updates: command.request_profile_updates,
                 admin_api_key: current.settings.admin_api_key,
                 refresh_margin_seconds: command.refresh_margin_seconds,
                 refresh_concurrency: command.refresh_concurrency,
                 max_concurrent_per_account: command.max_concurrent_per_account,
+                request_location_enabled: command.request_location_enabled,
+                request_location: command.request_location,
                 request_interval_ms: command.request_interval_ms,
+                max_waiting_per_key: command.max_waiting_per_key,
+                max_waiting_per_account: command.max_waiting_per_account,
+                concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
+                responses_max_decompressed_body_bytes: command
+                    .responses_max_decompressed_body_bytes,
                 rotation_strategy: command.rotation_strategy.as_str().to_owned(),
                 model_mappings: store_model_mappings(command.model_mappings),
                 min_codex_desktop_version: command.min_codex_desktop_version,
@@ -98,6 +153,17 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 usage_retention_days: command.usage_retention_days,
                 ops_event_retention_days: command.ops_event_retention_days,
                 audit_retention_days: command.audit_retention_days,
+                account_auto_freeze_enabled: command.account_auto_freeze_enabled,
+                account_auto_freeze_threshold: command.account_auto_freeze_threshold,
+                account_auto_freeze_window_seconds: command.account_auto_freeze_window_seconds,
+                account_auto_freeze_duration_seconds: command.account_auto_freeze_duration_seconds,
+                account_auto_freeze_probe_enabled: command.account_auto_freeze_probe_enabled,
+                account_auto_freeze_probe_model: command.account_auto_freeze_probe_model,
+                account_auto_freeze_adaptive_concurrency: command
+                    .account_auto_freeze_adaptive_concurrency,
+                account_warmup_enabled: command.account_warmup_enabled,
+                account_warmup_schedule_time: command.account_warmup_schedule_time,
+                account_warmup_model: command.account_warmup_model,
             },
             audit: mutation_audit(
                 context,
@@ -105,15 +171,23 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 "runtime_settings",
                 "1",
                 vec![
+                    "provider_request_profiles_json".to_owned(),
+                    "request_location_enabled".to_owned(),
+                    "request_location_json".to_owned(),
                     "model_mappings_json".to_owned(),
                     "refresh_margin_seconds".to_owned(),
                     "refresh_concurrency".to_owned(),
                     "max_concurrent_per_account".to_owned(),
                     "request_interval_ms".to_owned(),
+                    "max_waiting_per_key".to_owned(),
+                    "max_waiting_per_account".to_owned(),
+                    "concurrency_wait_timeout_seconds".to_owned(),
+                    "responses_max_decompressed_body_bytes".to_owned(),
                     "rotation_strategy".to_owned(),
                     "min_codex_desktop_version".to_owned(),
                     "min_codex_cli_version".to_owned(),
                     "retention".to_owned(),
+                    "account_auto_freeze".to_owned(),
                 ],
             ),
         };
@@ -207,18 +281,35 @@ pub(crate) fn admin_runtime_settings(
         })
         .collect::<AdminStoreResult<ModelMappings>>()?;
     Ok(AdminRuntimeSettings {
+        request_profiles: settings.request_profiles,
         config_revision: admin_revision(settings.config_revision)?,
+        request_location_enabled: settings.request_location_enabled,
+        request_location: settings.request_location,
         model_mappings,
         refresh_margin_seconds: settings.refresh_margin_seconds,
         refresh_concurrency: settings.refresh_concurrency,
         max_concurrent_per_account: settings.max_concurrent_per_account,
         request_interval_ms: settings.request_interval_ms,
+        max_waiting_per_key: settings.max_waiting_per_key,
+        max_waiting_per_account: settings.max_waiting_per_account,
+        concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+        responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
         rotation_strategy,
         min_codex_desktop_version: settings.min_codex_desktop_version,
         min_codex_cli_version: settings.min_codex_cli_version,
         usage_retention_days: settings.usage_retention_days,
         ops_event_retention_days: settings.ops_event_retention_days,
         audit_retention_days: settings.audit_retention_days,
+        account_auto_freeze_enabled: settings.account_auto_freeze_enabled,
+        account_auto_freeze_threshold: settings.account_auto_freeze_threshold,
+        account_auto_freeze_window_seconds: settings.account_auto_freeze_window_seconds,
+        account_auto_freeze_duration_seconds: settings.account_auto_freeze_duration_seconds,
+        account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
+        account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
+        account_auto_freeze_adaptive_concurrency: settings.account_auto_freeze_adaptive_concurrency,
+        account_warmup_enabled: settings.account_warmup_enabled,
+        account_warmup_schedule_time: settings.account_warmup_schedule_time,
+        account_warmup_model: settings.account_warmup_model,
         updated_at: settings.updated_at,
     })
 }

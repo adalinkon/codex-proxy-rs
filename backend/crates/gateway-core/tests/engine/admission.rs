@@ -185,6 +185,15 @@ struct RecordingAdmissions {
 }
 
 impl ClientAdmissionPort for RecordingAdmissions {
+    fn abandon(
+        &self,
+        user_id: &str,
+        key: &gateway_core::policy::ClientApiKeyId,
+        request: &gateway_core::engine::ModelRequestId,
+    ) {
+        let _ = futures::FutureExt::now_or_never(self.release(user_id, key, request));
+    }
+
     fn admit(
         &self,
         _: ClientAdmissionRequest,

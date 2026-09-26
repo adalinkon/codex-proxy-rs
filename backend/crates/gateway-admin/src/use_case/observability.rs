@@ -192,29 +192,29 @@ impl DefaultObservabilityService {
             average(first_token_latency_sum_ms, first_token_latency_count);
         let trend = trend(TrendKind::Usage, observation.trend.clone())?;
         let health_timeline = health_timeline_at(&observation.trend, Utc::now());
-        let wire_profiles = self.providers.dashboard_wire_profiles();
+        let wire_profiles = self
+            .providers
+            .dashboard_wire_profiles(&settings.request_profiles);
         let max_concurrent_per_account = u64::from(settings.max_concurrent_per_account);
-        let total_slots = runtime_slots.as_ref().map_or_else(
-            || {
-                observation
-                    .provider_accounts
-                    .normal
-                    .saturating_mul(max_concurrent_per_account)
-            },
-            |slots| {
-                slots
-                    .inherited_accounts
-                    .saturating_mul(max_concurrent_per_account)
-                    .saturating_add(slots.overridden_slots)
-            },
-        );
+        let (inherited_accounts, overridden_slots) = runtime_slots
+            .as_ref()
+            .map_or((observation.provider_accounts.normal, 0), |slots| {
+                (slots.inherited_accounts, slots.overridden_slots)
+            });
+        let total_slots = (max_concurrent_per_account > 0 || inherited_accounts == 0).then(|| {
+            inherited_accounts
+                .saturating_mul(max_concurrent_per_account)
+                .saturating_add(overridden_slots)
+        });
         let used_slots = runtime_slots.and_then(|slots| slots.used_slots);
         Ok(DashboardResult {
             capacity: DashboardCapacity {
                 max_concurrent_per_account,
                 total_slots,
                 used_slots,
-                available_slots: used_slots.map(|used| total_slots.saturating_sub(used)),
+                available_slots: used_slots
+                    .zip(total_slots)
+                    .map(|(used, total)| total.saturating_sub(used)),
             },
             rotation_strategy: settings.rotation_strategy,
             observation,
@@ -342,21 +342,13 @@ impl ObservabilityService for DefaultObservabilityService {
         let total_requests = items.iter().fold(0_u64, |total, item| {
             total.saturating_add(item.request_count)
         });
-        let mut items = items
+        let items = items
             .into_iter()
             .map(|item| {
                 let error_rate = rate_or_zero(item.failure_count, item.request_count);
                 let non_completion_rate =
                     rate_or_zero(item.non_completion_count, item.request_count);
                 let retry_rate = rate_or_zero(item.retry_count, item.request_count);
-                let impact_score = diagnostic_impact_score(
-                    item.request_count,
-                    total_requests,
-                    error_rate,
-                    non_completion_rate,
-                    retry_rate,
-                    item.first_token_p95_ms,
-                );
                 DiagnosticsItem {
                     key: item.key,
                     name: item.name,
@@ -372,19 +364,12 @@ impl ObservabilityService for DefaultObservabilityService {
                     non_completion_rate,
                     retry_count: item.retry_count,
                     retry_rate,
-                    impact_score,
                     estimated_cost: usd_cost(&item.costs),
                     attempt_count: item.attempt_count,
                     total_tokens: item.total_tokens,
                 }
             })
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| {
-            right
-                .impact_score
-                .total_cmp(&left.impact_score)
-                .then_with(|| right.request_count.cmp(&left.request_count))
-        });
         Ok(DiagnosticsResult { dimension, items })
     }
 
@@ -612,7 +597,7 @@ async fn recover_standard_costs(
     mut facts: UsageCalculatedBillingStream<'_>,
 ) -> Result<UsageCostScenarios, AdminError> {
     let mut scenarios = UsageCostScenarios::default();
-    while let Some(fact) = facts
+    while let Some(mut fact) = facts
         .try_next()
         .await
         .map_err(|error| map_store_error(error, "usage billing facts"))?
@@ -629,7 +614,14 @@ async fn recover_standard_costs(
             cache_write_tokens: fact.cache_write_tokens,
             total: fact.total.clone(),
         };
-        let breakdown = match providers.calculated_billing(&provider_kind, &input) {
+        let breakdown = match fact
+            .breakdown
+            .take()
+            .filter(|b| b.total_amount == input.total)
+            .map_or_else(
+                || providers.calculated_billing(&provider_kind, &input),
+                |b| Ok(Some(b)),
+            ) {
             Ok(breakdown) => breakdown,
             Err(error) if error.kind() == ProviderAdminErrorKind::Unsupported => continue,
             Err(error) => return Err(map_provider_error(error, "usage billing")),
@@ -658,8 +650,15 @@ fn no_cache_cost(
     fact: &UsageCalculatedBillingFact,
     breakdown: &crate::model::observability::CalculatedBillingBreakdown,
 ) -> Option<DecimalAmount> {
-    let input_tokens = fact.input_tokens?;
-    let cached_tokens = fact.cached_tokens.unwrap_or_default().min(input_tokens);
+    let image = breakdown.image.as_ref();
+    let input_tokens = fact
+        .input_tokens?
+        .checked_sub(image.map_or(0, |i| i.input_tokens))?;
+    let cached_tokens = fact
+        .cached_tokens
+        .unwrap_or_default()
+        .checked_sub(image.map_or(0, |i| i.cached_tokens))?
+        .min(input_tokens);
     let cache_write_tokens = fact
         .cache_write_tokens
         .unwrap_or_default()
@@ -669,11 +668,20 @@ fn no_cache_cost(
         .scaled()
         .checked_mul(u128::from(cached_tokens.saturating_add(cache_write_tokens)))?
         .checked_div(1_000_000)?;
-    let total = decimal(&breakdown.total_amount.amount)?
+    let mut total = decimal(&breakdown.total_amount.amount)?
         .scaled()
         .checked_sub(decimal(&breakdown.cache_read_amount.amount)?.scaled())?
         .checked_sub(decimal(&breakdown.cache_write_amount.amount)?.scaled())?
         .checked_add(replaced_input_amount)?;
+    if let Some(image) = image {
+        let image_no_cache = decimal(&image.input_price_per_million.amount)?
+            .scaled()
+            .checked_mul(u128::from(image.cached_tokens))?
+            .checked_div(1_000_000)?;
+        total = total
+            .checked_sub(decimal(&image.cache_read_amount.amount)?.scaled())?
+            .checked_add(image_no_cache)?;
+    }
     DecimalAmount::from_str(
         &gateway_core::metering::Decimal::from_scaled(total)
             .ok()?
@@ -699,25 +707,6 @@ fn amount_difference(
 
 fn decimal(value: &DecimalAmount) -> Option<gateway_core::metering::Decimal> {
     value.as_str().parse().ok()
-}
-
-fn diagnostic_impact_score(
-    request_count: u64,
-    total_requests: u64,
-    error_rate: f64,
-    non_completion_rate: f64,
-    retry_rate: f64,
-    first_token_p95_ms: Option<u64>,
-) -> f64 {
-    let request_share = rate_or_zero(request_count, total_requests);
-    let slow_score = first_token_p95_ms
-        .map_or(0.0, |value| value as f64 / 30_000.0)
-        .min(1.0);
-    error_rate * 0.35
-        + non_completion_rate * 0.25
-        + retry_rate.min(1.0) * 0.20
-        + request_share * 0.10
-        + slow_score * 0.10
 }
 
 fn usd_cost(costs: &[CurrencyCost]) -> Option<DecimalAmount> {
@@ -852,7 +841,10 @@ impl DefaultObservabilityService {
 
 /// 按指定时刻计算中国自然日的 96 个 15 分钟健康桶。
 #[must_use]
-fn health_timeline_at(records: &[RequestMetricPoint], now: DateTime<Utc>) -> HealthTimeline {
+pub(super) fn health_timeline_at(
+    records: &[RequestMetricPoint],
+    now: DateTime<Utc>,
+) -> HealthTimeline {
     let current_slot = quarter_hour_start(now);
     let start = china_day_start(now);
     let mut buckets = (0..HEALTH_TIMELINE_SLOTS)

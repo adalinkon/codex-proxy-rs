@@ -33,6 +33,8 @@ export interface AccountQuota {
   limitReached: boolean
   // 429 临时限流（Redis 冷却）到期时间；非限流中为 null。
   rateLimitedUntil: string | null
+  rateLimitReason: 'upstream_rate_limit' | 'capacity_freeze' | null
+  recoveryProbeRequired: boolean
   windows: AccountQuotaWindow[]
 }
 
@@ -111,10 +113,17 @@ export interface AccountUsage {
   models: AccountModelUsage[]
 }
 
+export interface AccountModelAccess {
+  mode: 'all' | 'allowlist' | 'denylist'
+  models: string[]
+}
+
 export interface Account {
+  capabilities: AccountCapabilities
   outboundProxyEndpoint: string | null
   id: string
   name: string
+  notes: string | null
   provider: string
   resourceRef: string
   email: string | null
@@ -131,6 +140,7 @@ export interface Account {
   enabled: boolean
   concurrencyLimit: number | null
   weight: number
+  modelAccess: AccountModelAccess
   accessTokenExpiresAt: string | null
   accessTokenExpiresAtDisplay: string | null
   refreshTokenExpiresAt: string | null
@@ -142,6 +152,16 @@ export interface Account {
   quota: AccountQuota
   usage: AccountUsage
   groups: AccountGroupRef[]
+}
+
+export interface AccountCapabilities {
+  quota: boolean
+  quotaRefresh: boolean
+  profile: boolean
+  subscription: boolean
+  avatar: boolean
+  resetCredits: boolean
+  consumeResetCredit: boolean
 }
 
 export interface AccountQuotaForecast {
@@ -289,9 +309,39 @@ export interface AccountModelsResponse {
   models: Array<{ id: string, label: string }>
 }
 
+export interface AccountModelCatalogResponse {
+  modelCount: number
+  observedAt: string
+  /** Codex `model_catalog_json` 的文件正文，原样落盘即可被客户端加载。 */
+  catalog: unknown
+}
+
 export interface AccountImportResponse {
   importedCount: number
   accountIds: string[]
+}
+
+export type ImportItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'skipped'
+
+export interface AccountImportTask {
+  taskId: string
+  createdAt: string
+  finishedAt: string | null
+  stopRequested: boolean
+  total: number
+  counts: Record<ImportItemStatus, number> & { importedAccounts: number }
+}
+
+export interface AccountImportTaskItem {
+  index: number
+  provider: string
+  status: ImportItemStatus
+  accountIds: string[]
+  message: string | null
+}
+
+export interface AccountImportTaskDetail extends AccountImportTask {
+  items: AccountImportTaskItem[]
 }
 
 export interface AccountOAuthCompleteResponse {
@@ -341,12 +391,15 @@ interface AccountResetCreditConsumeParam extends AccountIdParam {
 }
 
 interface AccountUpdateParam {
+  connection?: { baseUrl?: string, transport: ApiKeyConfiguration['transport'], apiKey?: string }
   outboundProxyUrl?: string
   outboundProxyId?: string
   accountId: string
+  notes?: string
   enabled: boolean
   concurrencyLimit: number | null
   weight: number
+  modelAccess?: AccountModelAccess
   groupIds: string[]
 }
 
@@ -354,10 +407,11 @@ interface AccountBatchUpdateParam {
   outboundProxyUrl?: string
   outboundProxyId?: string
   accountIds: string[]
-  enabled: boolean
-  concurrencyLimit: number | null
-  weight: number
-  groupIds: string[]
+  enabled?: boolean
+  concurrencyLimit?: number | null
+  weight?: number
+  modelAccess?: AccountModelAccess
+  groupIds?: string[]
 }
 
 interface AccountDeleteParams {
@@ -365,10 +419,12 @@ interface AccountDeleteParams {
   accountIds: string[]
 }
 
-interface AccountImportSettings {
+export interface AccountImportSettings {
+  notes?: string
   enabled: boolean
   concurrencyLimit: number | null
   weight: number
+  modelAccess?: AccountModelAccess
   groupIds: string[]
 }
 
@@ -377,6 +433,15 @@ interface AccountImportParam {
   settings?: AccountImportSettings
   provider: string
   data: unknown
+}
+
+interface AccountImportTaskIdParam {
+  taskId: string
+}
+
+interface CreateAccountImportTaskParam {
+  submissionId: string
+  items: AccountImportParam[]
 }
 
 interface AccountOAuthStartParam {
@@ -501,6 +566,15 @@ export function getAccountModels(data: AccountIdParam, options: RequestOptions =
   })
 }
 
+export function getAccountModelCatalog(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<AccountModelCatalogResponse>({
+    url: '/api/admin/accounts/models/catalog',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
 export function refreshAccountModels(data: AccountIdParam, options: RequestOptions = {}) {
   return request<AccountModelsResponse>({
     url: '/api/admin/accounts/models/refresh',
@@ -514,8 +588,41 @@ export function importAccounts(data: AccountImportParam, options: RequestOptions
   return request<AccountImportResponse>({
     url: '/api/admin/accounts/import',
     method: 'POST',
-    data,
+    ...providerInputBody(data),
     ...options,
+  })
+}
+
+export function createAccountImportTask(data: CreateAccountImportTaskParam) {
+  return request<AccountImportTask>({
+    url: '/api/admin/accounts/import-tasks',
+    method: 'POST',
+    ...providerInputBody(data),
+  })
+}
+
+export function getAccountImportTasks(options: RequestOptions = {}) {
+  return request<{ items: AccountImportTask[] }>({
+    url: '/api/admin/accounts/import-tasks',
+    method: 'GET',
+    ...options,
+  })
+}
+
+export function getAccountImportTask(data: AccountImportTaskIdParam, options: RequestOptions = {}) {
+  return request<AccountImportTaskDetail>({
+    url: '/api/admin/accounts/import-tasks/detail',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function stopAccountImportTask(data: AccountImportTaskIdParam) {
+  return request<AccountImportTaskDetail>({
+    url: '/api/admin/accounts/import-tasks/stop',
+    method: 'POST',
+    data,
   })
 }
 
@@ -544,18 +651,39 @@ export function deleteAccounts(data: AccountDeleteParams, options: RequestOption
   })
 }
 
-export function startAccountOAuth(data: AccountOAuthStartParam) {
+export function startAccountOAuth(data: AccountOAuthStartParam, options: RequestOptions = {}) {
   return request<AccountOAuthStartResponse>({
     url: '/api/admin/accounts/oauth/start',
     method: 'POST',
-    data,
+    ...providerInputBody(data),
+    ...options,
   })
 }
 
-export function completeAccountOAuth(data: AccountOAuthCompleteParam) {
+function providerInputBody(data: object) {
+  // Provider 文档是不透明 JSON，先编码，避免 HTTP 客户端合并配置时过滤特殊字段名。
+  return { headers: { 'Content-Type': 'application/json' }, data: JSON.stringify(data) }
+}
+
+export function completeAccountOAuth(data: AccountOAuthCompleteParam, options: RequestOptions = {}) {
   return request<AccountOAuthCompleteResponse>({
     url: '/api/admin/accounts/oauth/complete',
     method: 'POST',
     data,
+    ...options,
+  })
+}
+
+export interface ApiKeyConfiguration {
+  base_url: string
+  transport: 'http' | 'prefer_websocket'
+}
+
+export function getAccountDetail(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<{ account: Account, credentialConfiguration?: Record<string, unknown> }>({
+    url: '/api/admin/accounts/detail',
+    method: 'GET',
+    params: data,
+    ...options,
   })
 }

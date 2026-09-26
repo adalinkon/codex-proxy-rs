@@ -2,14 +2,14 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::concurrency::ConcurrencyQueuePolicy;
 use crate::identity::ProviderKind;
 
-use super::{AccountStatus, ProviderAccount, ProviderAccountId};
+use super::{AccountConcurrency, AccountStatus, ProviderAccount, ProviderAccountId};
 
 /// `runtime_settings.rotation_strategy` 的稳定值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,22 +47,38 @@ impl RotationStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountSelectionPolicy {
     strategy: RotationStrategy,
-    max_concurrent_per_account: NonZeroU32,
+    max_concurrent_per_account: AccountConcurrency,
     request_interval: Duration,
+    queue_policy: ConcurrencyQueuePolicy,
 }
 
 impl AccountSelectionPolicy {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         strategy: RotationStrategy,
-        max_concurrent_per_account: NonZeroU32,
+        max_concurrent_per_account: impl Into<AccountConcurrency>,
         request_interval: Duration,
     ) -> Self {
         Self {
             strategy,
-            max_concurrent_per_account,
+            max_concurrent_per_account: max_concurrent_per_account.into(),
             request_interval,
+            queue_policy: ConcurrencyQueuePolicy {
+                max_waiting: 0,
+                timeout: Duration::ZERO,
+            },
         }
+    }
+
+    #[must_use]
+    pub const fn with_queue(mut self, policy: ConcurrencyQueuePolicy) -> Self {
+        self.queue_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn queue_policy(self) -> ConcurrencyQueuePolicy {
+        self.queue_policy
     }
 
     #[must_use]
@@ -71,7 +87,7 @@ impl AccountSelectionPolicy {
     }
 
     #[must_use]
-    pub const fn max_concurrent_per_account(self) -> NonZeroU32 {
+    pub const fn max_concurrent_per_account(self) -> AccountConcurrency {
         self.max_concurrent_per_account
     }
 
@@ -89,12 +105,13 @@ pub struct AccountRuntimeSignals {
     pub quota_reset_at: Option<SystemTime>,
     /// Provider 归一化的剩余额度基点：0 耗尽，10_000 全部可用。
     pub quota_remaining_rank: Option<u64>,
-    pub rate_limited_until: Option<SystemTime>,
+    pub cooldown: Option<super::AccountCooldown>,
     pub failure_rate_basis_points: Option<u16>,
     pub first_output_latency_ms: Option<u64>,
 }
 
 const ACCOUNT_FEEDBACK_EWMA_ALPHA: f64 = 0.2;
+const ACCOUNT_CAPACITY_FAILURE_EWMA_ALPHA: f64 = 0.4;
 const ACCOUNT_FAILURE_RATE_HALF_LIFE: Duration = Duration::from_secs(15 * 60);
 const EMPTY_FEEDBACK_SAMPLE: u64 = f64::NAN.to_bits();
 
@@ -103,6 +120,7 @@ const EMPTY_FEEDBACK_SAMPLE: u64 = f64::NAN.to_bits();
 pub enum AccountAttemptFeedback {
     Succeeded { first_output_ms: Option<u64> },
     Failed { first_output_ms: Option<u64> },
+    CapacityRejected { first_output_ms: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -133,13 +151,12 @@ impl DecayingAccountFailureRate {
             * 0.5_f64.powf(elapsed.as_secs_f64() / ACCOUNT_FAILURE_RATE_HALF_LIFE.as_secs_f64())
     }
 
-    fn report_at(&mut self, sample: f64, now: Instant) {
+    fn report_at(&mut self, sample: f64, alpha: f64, now: Instant) {
         let now = self
             .updated_at
             .map_or(now, |updated_at| updated_at.max(now));
         let decayed = self.value_at(now);
-        self.value =
-            ACCOUNT_FEEDBACK_EWMA_ALPHA * sample + (1.0 - ACCOUNT_FEEDBACK_EWMA_ALPHA) * decayed;
+        self.value = alpha * sample + (1.0 - alpha) * decayed;
         self.updated_at = Some(now);
     }
 }
@@ -156,14 +173,21 @@ impl Default for AccountFeedback {
 
 impl AccountFeedback {
     fn report_at(&self, feedback: AccountAttemptFeedback, now: Instant) {
-        let (failure, first_output_ms) = match feedback {
-            AccountAttemptFeedback::Succeeded { first_output_ms } => (0.0, first_output_ms),
-            AccountAttemptFeedback::Failed { first_output_ms } => (1.0, first_output_ms),
+        let (failure, alpha, first_output_ms) = match feedback {
+            AccountAttemptFeedback::Succeeded { first_output_ms } => {
+                (0.0, ACCOUNT_FEEDBACK_EWMA_ALPHA, first_output_ms)
+            }
+            AccountAttemptFeedback::Failed { first_output_ms } => {
+                (1.0, ACCOUNT_FEEDBACK_EWMA_ALPHA, first_output_ms)
+            }
+            AccountAttemptFeedback::CapacityRejected { first_output_ms } => {
+                (1.0, ACCOUNT_CAPACITY_FAILURE_EWMA_ALPHA, first_output_ms)
+            }
         };
         self.failure_rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .report_at(failure, now);
+            .report_at(failure, alpha, now);
         if let Some(first_output_ms) = first_output_ms.filter(|value| *value > 0) {
             update_feedback_ewma(&self.first_output_ms, first_output_ms as f64);
         }
@@ -299,8 +323,8 @@ impl AccountRuntimeSignals {
     }
 
     #[must_use]
-    pub const fn with_rate_limit(mut self, rate_limited_until: Option<SystemTime>) -> Self {
-        self.rate_limited_until = rate_limited_until;
+    pub const fn with_rate_limit(mut self, cooldown: Option<super::AccountCooldown>) -> Self {
+        self.cooldown = cooldown;
         self
     }
 
@@ -430,6 +454,7 @@ pub enum AccountSchedulingBlocker {
 pub enum PreferredAccountSelection {
     NotRequested,
     Hit,
+    OverriddenByPolicy,
     Missing,
     Blocked(AccountSchedulingBlocker),
 }
@@ -458,6 +483,52 @@ impl<'a> AccountSelection<'a> {
 pub struct AccountSelector;
 
 impl AccountSelector {
+    /// 返回调度策略可见的全部合格候选；权重层授权由调用策略的宿主适配器裁剪。
+    #[must_use]
+    pub(crate) fn policy_candidates<'a>(
+        &self,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+    ) -> Vec<&'a AccountCandidate> {
+        candidates
+            .iter()
+            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .collect()
+    }
+
+    /// 对插件返回的 ID 再执行同一资格判断，并保留原有亲和遥测结果。
+    #[must_use]
+    pub(crate) fn select_policy_candidate<'a>(
+        &self,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+        account_id: &ProviderAccountId,
+    ) -> Option<AccountSelection<'a>> {
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.account.id() == account_id)?;
+        if self.scheduling_blocker(candidate, context).is_some() {
+            return None;
+        }
+        let highest_weight = candidates
+            .iter()
+            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .map(|candidate| candidate.account.weight())
+            .max()?;
+        let (preferred, _) = self.preferred_decision(candidates, context, highest_weight);
+        let preferred = if preferred == PreferredAccountSelection::Hit
+            && context.preferred_account.as_ref() != Some(account_id)
+        {
+            PreferredAccountSelection::OverriddenByPolicy
+        } else {
+            preferred
+        };
+        Some(AccountSelection {
+            candidate,
+            preferred,
+        })
+    }
+
     /// 汇总与本次调度约束一致的并发容量，供请求级观测使用。
     #[must_use]
     pub fn capacity_snapshot(
@@ -477,18 +548,19 @@ impl AccountSelector {
                     )
                 )
             })
-            .fold((0_u64, 0_u64), |(used, total), candidate| {
+            .try_fold((0_u64, 0_u64), |(used, total), candidate| {
                 let capacity = u64::from(
                     candidate
                         .account
                         .effective_concurrency(context.policy.max_concurrent_per_account())
+                        .limit()?
                         .get(),
                 );
-                (
+                Some((
                     used.saturating_add(u64::from(candidate.signals.in_flight)),
                     total.saturating_add(capacity),
-                )
-            });
+                ))
+            })?;
         (total_slots > 0).then_some(AccountCapacitySnapshot {
             used_slots: used_slots.min(total_slots),
             total_slots,
@@ -513,30 +585,14 @@ impl AccountSelector {
             .iter()
             .map(|candidate| candidate.account.weight())
             .max()?;
-        let preferred = if let Some(preferred) = context.preferred_account.as_ref() {
-            match candidates
-                .iter()
-                .find(|candidate| candidate.account.id() == preferred)
-            {
-                Some(candidate) => match self.scheduling_blocker(candidate, context) {
-                    Some(blocker) => PreferredAccountSelection::Blocked(blocker),
-                    None if !context.preferred_account_overrides_weight
-                        && candidate.account.weight() < highest_weight =>
-                    {
-                        PreferredAccountSelection::Blocked(AccountSchedulingBlocker::LowerWeight)
-                    }
-                    None => {
-                        return Some(AccountSelection {
-                            candidate,
-                            preferred: PreferredAccountSelection::Hit,
-                        });
-                    }
-                },
-                None => PreferredAccountSelection::Missing,
-            }
-        } else {
-            PreferredAccountSelection::NotRequested
-        };
+        let (preferred, preferred_candidate) =
+            self.preferred_decision(candidates, context, highest_weight);
+        if let Some(candidate) = preferred_candidate {
+            return Some(AccountSelection {
+                candidate,
+                preferred: PreferredAccountSelection::Hit,
+            });
+        }
         eligible.retain(|candidate| candidate.account.weight() == highest_weight);
 
         let candidate = match context.policy.strategy() {
@@ -590,6 +646,67 @@ impl AccountSelector {
         })
     }
 
+    fn preferred_decision<'a>(
+        &self,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+        highest_weight: super::AccountWeight,
+    ) -> (PreferredAccountSelection, Option<&'a AccountCandidate>) {
+        let Some(preferred) = context.preferred_account.as_ref() else {
+            return (PreferredAccountSelection::NotRequested, None);
+        };
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.account.id() == preferred)
+        else {
+            return (PreferredAccountSelection::Missing, None);
+        };
+        match self.scheduling_blocker(candidate, context) {
+            Some(blocker) => (PreferredAccountSelection::Blocked(blocker), None),
+            None if !context.preferred_account_overrides_weight
+                && candidate.account.weight() < highest_weight =>
+            {
+                (
+                    PreferredAccountSelection::Blocked(AccountSchedulingBlocker::LowerWeight),
+                    None,
+                )
+            }
+            None => (PreferredAccountSelection::Hit, Some(candidate)),
+        }
+    }
+
+    /// 只有本地并发/调度间隔可等待；账号权限、失效、额度与上游冷却仍立即排除。
+    #[must_use]
+    pub fn wait_candidates(
+        &self,
+        candidates: &[AccountCandidate],
+        context: &AccountSelectionContext,
+    ) -> Vec<ProviderAccountId> {
+        let mut candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    self.scheduling_blocker(candidate, context),
+                    None | Some(
+                        AccountSchedulingBlocker::ConcurrencyLimit
+                            | AccountSchedulingBlocker::RequestInterval
+                    )
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| {
+            (
+                context.preferred_account.as_ref() != Some(candidate.account.id()),
+                Reverse(candidate.account.weight()),
+                candidate.account.id().clone(),
+            )
+        });
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.account.id().clone())
+            .collect()
+    }
+
     pub(crate) fn scheduling_blocker(
         &self,
         candidate: &AccountCandidate,
@@ -605,7 +722,7 @@ impl AccountSelector {
         if !context.eligibility.bypasses_local_eligibility() {
             let status = candidate
                 .account
-                .status_projection(context.now, candidate.signals.rate_limited_until)
+                .status_projection(context.now, candidate.signals.cooldown)
                 .status;
             if status != AccountStatus::Normal {
                 return Some(AccountSchedulingBlocker::LocalAvailability);
@@ -614,11 +731,11 @@ impl AccountSelector {
         if context.excluded_accounts.contains(candidate.account.id()) {
             return Some(AccountSchedulingBlocker::Excluded);
         }
-        if candidate.signals.in_flight
-            >= candidate
-                .account
-                .effective_concurrency(context.policy.max_concurrent_per_account())
-                .get()
+        if candidate
+            .account
+            .effective_concurrency(context.policy.max_concurrent_per_account())
+            .limit()
+            .is_some_and(|limit| candidate.signals.in_flight >= limit.get())
         {
             return Some(AccountSchedulingBlocker::ConcurrencyLimit);
         }
@@ -647,19 +764,22 @@ pub(crate) const SMART_SCORE_TOLERANCE: f64 = 0.05;
 // 首输出 10 秒时延迟得分减半；固定尺度不随其他候选账号变化。
 const SMART_LATENCY_HALF_SCORE_MS: f64 = 10_000.0;
 
-fn capacity_utilization(candidate: &AccountCandidate, default_concurrency: NonZeroU32) -> f64 {
-    f64::from(candidate.signals.in_flight)
-        / f64::from(
-            candidate
-                .account
-                .effective_concurrency(default_concurrency)
-                .get(),
-        )
+fn capacity_utilization(
+    candidate: &AccountCandidate,
+    default_concurrency: AccountConcurrency,
+) -> f64 {
+    candidate
+        .account
+        .effective_concurrency(default_concurrency)
+        .limit()
+        .map_or(0.0, |limit| {
+            f64::from(candidate.signals.in_flight) / f64::from(limit.get())
+        })
 }
 
 fn select_smart_candidate<'a>(
     candidates: &[&'a AccountCandidate],
-    default_concurrency: NonZeroU32,
+    default_concurrency: AccountConcurrency,
     cursor: u64,
 ) -> Option<&'a AccountCandidate> {
     let mut ranked = candidates
@@ -677,7 +797,10 @@ fn select_smart_candidate<'a>(
     Some(ranked[index].0)
 }
 
-pub(crate) fn smart_score(candidate: &AccountCandidate, default_concurrency: NonZeroU32) -> f64 {
+pub(crate) fn smart_score(
+    candidate: &AccountCandidate,
+    default_concurrency: AccountConcurrency,
+) -> f64 {
     let load = 1.0 - capacity_utilization(candidate, default_concurrency).clamp(0.0, 1.0);
     let quota = candidate
         .signals

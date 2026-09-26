@@ -22,6 +22,8 @@ mod health;
 mod migrations;
 mod observability;
 mod ops_events;
+mod plugins;
+mod pricing;
 mod provider_accounts;
 mod proxies;
 mod query_budget;
@@ -60,6 +62,10 @@ pub(super) fn admin_account_store(pool: &PgPool) -> PgAdminAccountStore {
 impl TestDatabase {
     pub(super) async fn create(label: &str) -> Option<Self> {
         Self::create_at(label, i64::MAX).await
+    }
+
+    pub(super) async fn create_through(label: &str, version: i64) -> Option<Self> {
+        Self::create_at(label, version).await
     }
 
     pub(super) async fn create_at(label: &str, version: i64) -> Option<Self> {
@@ -247,6 +253,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "account_groups",
             "admin_audit_events",
             "admin_users",
+            "authorization_receipts",
             "backup_records",
             "backup_settings",
             "client_api_key_groups",
@@ -257,6 +264,16 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "model_requests",
             "ops_events",
             "outbound_proxies",
+            "plugin_artifact_credentials",
+            "plugin_artifact_platforms",
+            "plugin_artifacts",
+            "plugin_instance_secrets",
+            "plugin_instances",
+            "plugin_source_credentials",
+            "plugin_state_generations",
+            "plugin_state_records",
+            "plugin_update_sources",
+            "plugin_version_configurations",
             "provider_accounts",
             "runtime_settings",
             "user_account_groups",

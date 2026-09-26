@@ -1,3 +1,4 @@
+mod plugins;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -41,10 +42,10 @@ use gateway_admin::{
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
             CredentialImportCommit, CredentialImportResult, CredentialMutationResult,
-            CredentialRotationCommit, PendingAuthorizationMutation, PrepareCredentialImport,
-            PrepareCredentialRefresh, PrepareCredentialRotation, PreparedAuthorizationCommit,
-            PreparedCredentialImport, PreparedCredentialRotation, ProviderExport,
-            ProviderExportCredentialInput, ProviderModels, ProviderQuota,
+            CredentialRotationCommit, PrepareCredentialImport, PrepareCredentialRefresh,
+            PrepareCredentialRotation, PreparedAuthorizationCommit, PreparedCredentialImport,
+            PreparedCredentialRotation, ProviderExport, ProviderExportCredentialInput,
+            ProviderModels, ProviderQuota,
         },
         settings::{
             AdminApiKey, AdminApiKeyMutation, ModelMappings, ReplaceRuntimeSettings,
@@ -66,10 +67,13 @@ use gateway_admin::{
         },
     },
 };
-use gateway_api::admin::AdminSessionState;
+use gateway_api::auth::SessionState;
 use gateway_core::{
     account::{AccountStatusFacts, CredentialState, ProviderAccountId, QuotaState},
-    engine::probe::{AccountProbe, AccountProbeError, AccountProbeRequest, AccountProbeResult},
+    engine::{
+        execution::{ClientAuthenticationError, ClientKeyVerifier},
+        probe::{AccountProbe, AccountProbeError, AccountProbeRequest, AccountProbeResult},
+    },
     policy::{ClientApiKeyId, RateLimits},
     routing::{ConfigRevision, ProviderKind, PublicModelId, UpstreamModelId},
     runtime::SnapshotControl,
@@ -89,6 +93,10 @@ mod wire;
 
 pub(super) struct AdminTestFixture {
     pub services: AdminServices,
+    plugin_ports: Arc<plugins::TestPluginPorts>,
+    published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle,
+    pub client_key: Arc<Mutex<Option<ClientKeyRecord>>>,
+    pub observations: Arc<Mutex<MemoryObservations>>,
     pub auth: Arc<MemoryAuthStore>,
     pub settings: Arc<MemorySettingsStore>,
     pub usage_records: Arc<Mutex<Vec<UsageListRecord>>>,
@@ -108,10 +116,26 @@ impl AdminTestFixture {
     }
 
     pub async fn with_system(system: Arc<dyn SystemOperations>) -> Self {
+        Self::with_dependencies(system, None).await
+    }
+
+    pub async fn with_key_verifier(
+        verifier: Arc<dyn ClientKeyVerifier>,
+        system: Arc<dyn SystemOperations>,
+    ) -> Self {
+        Self::with_dependencies(system, Some(verifier)).await
+    }
+
+    async fn with_dependencies(
+        system: Arc<dyn SystemOperations>,
+        verifier: Option<Arc<dyn ClientKeyVerifier>>,
+    ) -> Self {
         let api_key = Arc::new(Mutex::new(None));
         let auth = Arc::new(MemoryAuthStore::new(api_key.clone()));
         let settings = Arc::new(MemorySettingsStore::new(api_key));
-        let client_keys = Arc::new(MemoryClientKeyStore);
+        let client_key = Arc::new(Mutex::new(None));
+        let client_keys = Arc::new(MemoryClientKeyStore(client_key.clone()));
+        let observations = Arc::new(Mutex::new(MemoryObservations::default()));
         let account_groups = Arc::new(MemoryAccountGroupStore::new());
         let usage_records = Arc::new(Mutex::new(Vec::new()));
         let usage_filters = Arc::new(Mutex::new(Vec::new()));
@@ -124,6 +148,7 @@ impl AdminTestFixture {
         let account = Arc::new(Mutex::new(None));
         let unused = Arc::new(UnusedStore {
             usage_filters: Arc::clone(&usage_filters),
+            observations: observations.clone(),
             usage_records: Arc::clone(&usage_records),
             usage_detail: Arc::clone(&usage_detail),
             diagnostics: Arc::clone(&diagnostics),
@@ -132,6 +157,8 @@ impl AdminTestFixture {
             dashboard_summary_range: Arc::clone(&dashboard_summary_range),
             account: Arc::clone(&account),
         });
+        let plugin_ports = Arc::new(plugins::TestPluginPorts::default());
+        let published_snapshot = gateway_core::runtime::RuntimeSnapshotHandle::default();
         let stores = AdminStorePorts::new(
             AdminAccountStorePorts::new(
                 unused.clone(),
@@ -144,6 +171,8 @@ impl AdminTestFixture {
             unused,
             settings.clone(),
             gateway_admin::ports::backup::BackupStorePorts::disabled(),
+            plugin_ports.clone(),
+            plugin_ports.clone(),
         )
         .with_request_usage(Arc::new(users::TestRequestUsageStore));
         let providers: Vec<Arc<dyn ProviderAdmin>> = vec![
@@ -157,16 +186,31 @@ impl AdminTestFixture {
                 default_password: InitialAdminPassword::new("strong-admin-password"),
             },
             stores,
-            providers,
-            Arc::new(NoopSnapshot),
-            (Arc::new(NoopProbe), Arc::new(proxies::SuccessfulProbe)),
-            Arc::new(StaticClientDistribution),
-            system,
+            gateway_admin::AdminRuntimePorts {
+                plugin_preparation: plugin_ports.clone(),
+                plugin_management: plugin_ports.clone(),
+                published_snapshot: published_snapshot.clone(),
+                plugin_inspector: plugin_ports.clone(),
+                plugin_distribution: plugin_ports.clone(),
+                pricing_source: Arc::new(StaticPricingSource),
+                providers: gateway_admin::ports::provider::ProviderAdminRegistry::new(providers)
+                    .unwrap(),
+                snapshot: Arc::new(NoopSnapshot),
+                account_probe: Arc::new(NoopProbe),
+                proxy_probe: Arc::new(proxies::SuccessfulProbe),
+                client_distribution: Arc::new(StaticClientDistribution),
+                system,
+                client_key_verifier: verifier.unwrap_or_else(|| Arc::new(UnusedClientKeyVerifier)),
+            },
         )
         .await
         .expect("initialize test admin services");
         Self {
             services: bundle.services(),
+            plugin_ports,
+            published_snapshot,
+            client_key,
+            observations,
             auth,
             settings,
             usage_records,
@@ -213,7 +257,7 @@ impl ClientDistributionResolver for StaticClientDistribution {
 #[derive(Clone)]
 pub(super) struct AdminTestState(AdminServices);
 
-impl AdminSessionState for AdminTestState {
+impl SessionState for AdminTestState {
     fn admin_services(&self) -> &AdminServices {
         &self.0
     }
@@ -434,14 +478,31 @@ impl AuthStore for MemoryAuthStore {
 }
 
 pub(super) struct MemorySettingsStore {
+    pricing: Mutex<gateway_admin::model::pricing::StoredPricing>,
     settings: Mutex<RuntimeSettings>,
     api_key: Arc<Mutex<Option<AdminApiKey>>>,
+}
+
+struct StaticPricingSource;
+#[async_trait]
+impl gateway_admin::ports::pricing::PricingSource for StaticPricingSource {
+    async fn fetch(
+        &self,
+    ) -> Result<gateway_admin::model::pricing::PricingSyncPreview, gateway_admin::model::AdminError>
+    {
+        Ok(gateway_admin::model::pricing::PricingSyncPreview {
+            prices: serde_json::from_value(serde_json::json!({"openai":{"gpt-5.4":{
+                "multiplierBps":10000,"bands":{"standard":{"input":"2.5","output":"15","cacheRead":"0.25","cacheWrite":"0"}}
+            }}})).expect("prices"), skipped: vec![],
+        })
+    }
 }
 
 impl MemorySettingsStore {
     fn new(api_key: Arc<Mutex<Option<AdminApiKey>>>) -> Self {
         Self {
             settings: Mutex::new(test_runtime_settings()),
+            pricing: Mutex::default(),
             api_key,
         }
     }
@@ -453,6 +514,70 @@ impl MemorySettingsStore {
 
 #[async_trait]
 impl SettingsStore for MemorySettingsStore {
+    async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
+        Ok(self.pricing.lock().expect("pricing").clone())
+    }
+    async fn sync_pricing(
+        &self,
+        changes: gateway_admin::model::pricing::PricingSyncChanges,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let mut pricing = self.pricing.lock().expect("pricing");
+        for (provider, models) in changes {
+            let stored = pricing.synced.entry(provider).or_default();
+            for (model, price) in models {
+                if let Some(price) = price {
+                    stored.insert(model, price);
+                } else {
+                    stored.remove(&model);
+                }
+            }
+        }
+        pricing.synced.retain(|_, models| !models.is_empty());
+        pricing.synced_at = Some(Utc::now());
+        let mut settings = self.settings.lock().expect("settings");
+        settings.config_revision = next_revision(settings.config_revision);
+        Ok(settings.config_revision)
+    }
+    async fn update_pricing(
+        &self,
+        command: gateway_admin::model::pricing::UpdatePricing,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        use gateway_admin::model::pricing::PricingChange;
+        let mut pricing = self.pricing.lock().expect("pricing");
+        let gateway_admin::model::pricing::StoredPricing {
+            overrides, synced, ..
+        } = &mut *pricing;
+        let models = overrides.entry(command.provider.clone()).or_default();
+        let source = synced.entry(command.provider).or_default();
+        for model in command.models {
+            match &command.change {
+                PricingChange::Reset => {
+                    models.remove(&model);
+                }
+                PricingChange::Delete => {
+                    models.remove(&model);
+                    source.remove(&model);
+                }
+                PricingChange::Replace(p) => {
+                    models.insert(model, p.clone());
+                }
+                PricingChange::Multiplier(bps) => {
+                    models
+                        .entry(model)
+                        .or_insert_with(|| gateway_core::metering::ModelPriceOverride {
+                            multiplier_bps: 10_000,
+                            bands: Default::default(),
+                        })
+                        .multiplier_bps = *bps;
+                }
+            }
+        }
+        let mut settings = self.settings.lock().expect("settings");
+        settings.config_revision = next_revision(settings.config_revision);
+        Ok(settings.config_revision)
+    }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(self.settings.lock().expect("settings").clone())
     }
@@ -467,19 +592,44 @@ impl SettingsStore for MemorySettingsStore {
         _: &MutationContext,
     ) -> AdminStoreResult<RuntimeSettings> {
         let mut settings = self.settings.lock().expect("settings");
+        let mut request_profiles = settings.request_profiles.clone();
+        for (provider, profile) in command.request_profile_updates {
+            if let Some(profile) = profile {
+                request_profiles.insert(provider, profile);
+            } else {
+                request_profiles.remove(&provider);
+            }
+        }
         let updated = RuntimeSettings {
+            request_profiles,
+            request_location_enabled: command.request_location_enabled,
+            request_location: command.request_location,
             config_revision: next_revision(settings.config_revision),
             model_mappings: command.model_mappings,
             refresh_margin_seconds: command.refresh_margin_seconds,
             refresh_concurrency: command.refresh_concurrency,
             max_concurrent_per_account: command.max_concurrent_per_account,
             request_interval_ms: command.request_interval_ms,
+            max_waiting_per_key: command.max_waiting_per_key,
+            max_waiting_per_account: command.max_waiting_per_account,
+            concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
+            responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
             rotation_strategy: command.rotation_strategy,
             min_codex_desktop_version: command.min_codex_desktop_version,
             min_codex_cli_version: command.min_codex_cli_version,
             usage_retention_days: command.usage_retention_days,
             ops_event_retention_days: command.ops_event_retention_days,
             audit_retention_days: command.audit_retention_days,
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
             updated_at: Utc::now(),
         };
         *settings = updated.clone();
@@ -512,7 +662,17 @@ impl SettingsStore for MemorySettingsStore {
     }
 }
 
-pub(super) struct MemoryClientKeyStore;
+pub(super) struct MemoryClientKeyStore(Arc<Mutex<Option<ClientKeyRecord>>>);
+
+#[derive(Default)]
+pub(super) struct MemoryObservations {
+    pub summary: Option<UsageOverview>,
+    pub trend: Option<Vec<RequestMetricPoint>>,
+    pub summaries: Vec<(TimeRange, UsageFilter)>,
+    pub trends: Vec<(TimeRange, UsageFilter)>,
+    pub records: Vec<UsageQuery>,
+    pub errors: Vec<OpsErrorQuery>,
+}
 
 pub(super) const PRIMARY_GROUP_ID: &str = "grp_11111111111111111111111111111111";
 pub(super) const SECONDARY_GROUP_ID: &str = "grp_22222222222222222222222222222222";
@@ -535,6 +695,7 @@ impl MemoryAccountGroupStore {
             (
                 primary_id.clone(),
                 AccountGroupRecord {
+                    disable_fast: false,
                     id: primary_id,
                     name: "Alpha routing".to_owned(),
                     description: Some("Primary traffic".to_owned()),
@@ -556,6 +717,7 @@ impl MemoryAccountGroupStore {
             (
                 secondary_id.clone(),
                 AccountGroupRecord {
+                    disable_fast: false,
                     id: secondary_id,
                     name: "Beta routing".to_owned(),
                     description: None,
@@ -640,11 +802,11 @@ impl AccountGroupStore for MemoryAccountGroupStore {
                     credential_state: CredentialState::Ready,
                     access_token_expires_at: None,
                     quota: QuotaState::default(),
-                    rate_limited_until: None,
+                    cooldown: None,
                     last_error_reason: None,
                     last_error_message: None,
                 },
-                total_slots: 1,
+                total_slots: Some(1),
             },
             AccountGroupMemberFact {
                 group_id: group_id(PRIMARY_GROUP_ID),
@@ -654,11 +816,11 @@ impl AccountGroupStore for MemoryAccountGroupStore {
                     credential_state: CredentialState::Ready,
                     access_token_expires_at: None,
                     quota: QuotaState::default(),
-                    rate_limited_until: None,
+                    cooldown: None,
                     last_error_reason: None,
                     last_error_message: None,
                 },
-                total_slots: 1,
+                total_slots: Some(1),
             },
         ])
     }
@@ -671,6 +833,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut state = self.state.lock().expect("account groups");
         let now = Utc::now();
         let record = AccountGroupRecord {
+            disable_fast: command.disable_fast,
             id: command.id.clone(),
             name: command.name,
             description: command.description,
@@ -702,6 +865,9 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         record.name = command.name;
         record.description = command.description;
         record.color = command.color;
+        if let Some(disable_fast) = command.disable_fast {
+            record.disable_fast = disable_fast;
+        }
         record.updated_at = Utc::now();
         mutation(&mut state, command.id, true)
     }
@@ -760,6 +926,18 @@ impl ClientKeyStore for MemoryClientKeyStore {
     ) -> AdminStoreResult<Revision> {
         unreachable!()
     }
+    async fn get_client_key(
+        &self,
+        id: &ClientApiKeyId,
+    ) -> AdminStoreResult<Option<ClientKeyRecord>> {
+        Ok(self
+            .0
+            .lock()
+            .expect("client key")
+            .clone()
+            .filter(|key| &key.id == id))
+    }
+
     async fn list_client_keys(&self, _: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage> {
         Ok(ClientKeyPage {
             config_revision: Revision::new(1).expect("revision"),
@@ -773,10 +951,15 @@ impl ClientKeyStore for MemoryClientKeyStore {
         &self,
         id: &ClientApiKeyId,
     ) -> AdminStoreResult<Option<ClientKeySecret>> {
+        if let Some(record) = self.0.lock().expect("client key").clone() {
+            return Ok((record.id == *id)
+                .then(|| ClientKeySecret::new(record, format!("sk_{}", "a".repeat(43)))));
+        }
         let now = Utc::now();
         Ok(Some(ClientKeySecret::new(
             ClientKeyRecord {
                 user_id: "admin_1".to_owned(),
+                request_profile_overrides: Default::default(),
                 budget: Default::default(),
                 id: id.clone(),
                 name: "revealed".to_owned(),
@@ -829,6 +1012,7 @@ impl ClientKeyStore for MemoryClientKeyStore {
 
 struct UnusedStore {
     usage_filters: Arc<Mutex<Vec<UsageFilter>>>,
+    observations: Arc<Mutex<MemoryObservations>>,
     usage_records: Arc<Mutex<Vec<UsageListRecord>>>,
     usage_detail: Arc<Mutex<Option<UsageDetail>>>,
     diagnostics: Arc<Mutex<Vec<DiagnosticObservation>>>,
@@ -838,8 +1022,23 @@ struct UnusedStore {
     account: Arc<Mutex<Option<AccountPageItem>>>,
 }
 
+struct UnusedClientKeyVerifier;
+
+impl ClientKeyVerifier for UnusedClientKeyVerifier {
+    fn verify_client_key(&self, _: &str) -> Result<ClientApiKeyId, ClientAuthenticationError> {
+        Err(ClientAuthenticationError::InvalidKey)
+    }
+}
+
 #[async_trait]
 impl AccountStore for UnusedStore {
+    async fn list_plugin_accounts(
+        &self,
+        _: gateway_admin::model::provider_credentials::PluginAccountListQuery,
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::PluginAccountPage> {
+        Err(unavailable("plugin account list"))
+    }
+
     async fn list_accounts(
         &self,
         _: AccountListQuery,
@@ -889,12 +1088,26 @@ impl AccountStore for UnusedStore {
         Err(unavailable("credential"))
     }
 
+    async fn credential_details_by_id(
+        &self,
+        _: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<CredentialDetails>> {
+        Err(unavailable("plugin credential"))
+    }
+
     async fn load_credentials_for_export(
         &self,
         _: &ProviderKind,
         _: &[ProviderAccountId],
     ) -> AdminStoreResult<Vec<ProviderExportCredentialInput>> {
         Err(unavailable("credential export"))
+    }
+
+    async fn load_credential_for_plugin(
+        &self,
+        _: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<ProviderExportCredentialInput>> {
+        Err(unavailable("plugin credential export"))
     }
 
     async fn commit_credential_import(
@@ -905,11 +1118,21 @@ impl AccountStore for UnusedStore {
         Err(unavailable("credential import"))
     }
 
+    async fn authorization_receipt(
+        &self,
+        _: &gateway_admin::model::provider_credentials::AuthorizationReceiptKey,
+    ) -> AdminStoreResult<
+        Option<gateway_admin::model::provider_credentials::CredentialMutationResult>,
+    > {
+        Ok(None)
+    }
+
     async fn commit_authorization(
         &self,
         _: AuthorizationCommit,
         _: &MutationContext,
-    ) -> AdminStoreResult<CredentialMutationResult> {
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::AuthorizationCommitResult>
+    {
         Err(unavailable("authorization"))
     }
 
@@ -935,6 +1158,15 @@ impl AccountStore for UnusedStore {
         _: &MutationContext,
     ) -> AdminStoreResult<AccountUpdateResult> {
         Err(unavailable("account enabled"))
+    }
+
+    async fn lower_concurrency_limit(
+        &self,
+        _: &gateway_core::account::ProviderAccountId,
+        _: gateway_core::account::AccountConcurrencyLimit,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Option<gateway_admin::model::accounts::AccountUpdateResult>> {
+        Ok(None)
     }
 
     async fn recover_account(
@@ -974,16 +1206,38 @@ impl AccountStore for UnusedStore {
 impl AccountRuntimeStore for UnusedStore {
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot> {
         Ok(AccountRuntimeSnapshot {
-            rate_limited_until: BTreeMap::new(),
+            cooldown: BTreeMap::new(),
             in_flight: Some(BTreeMap::new()),
         })
     }
 
     async fn account_runtime(&self, _: &[String]) -> AdminStoreResult<AccountRuntimeSnapshot> {
         Ok(AccountRuntimeSnapshot {
-            rate_limited_until: BTreeMap::new(),
+            cooldown: BTreeMap::new(),
             in_flight: Some(BTreeMap::new()),
         })
+    }
+
+    async fn active_freezes(
+        &self,
+    ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn capacity_peaks(
+        &self,
+        _account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, u32>> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn finish_freeze(
+        &self,
+        _account_id: &str,
+        _expected: &gateway_admin::model::accounts::AccountFreeze,
+        _postpone_until: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
+        Ok(false)
     }
 }
 
@@ -1011,11 +1265,13 @@ impl ObservabilityStore for UnusedStore {
 
     async fn usage_trend(
         &self,
-        _: TimeRange,
+        range: TimeRange,
         filter: UsageFilter,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
-        self.usage_filters.lock().unwrap().push(filter);
-        Err(unavailable("usage trend"))
+        self.usage_filters.lock().unwrap().push(filter.clone());
+        let mut data = self.observations.lock().expect("observations");
+        data.trends.push((range, filter));
+        data.trend.clone().ok_or_else(|| unavailable("usage trend"))
     }
 
     fn usage_calculated_billing_facts(
@@ -1034,6 +1290,11 @@ impl ObservabilityStore for UnusedStore {
             .lock()
             .unwrap()
             .push(query.filter.clone());
+        self.observations
+            .lock()
+            .expect("observations")
+            .records
+            .push(query.clone());
         let items = self.usage_records.lock().expect("usage records").clone();
         Ok(UsagePage {
             current_page: query.current_page,
@@ -1053,11 +1314,16 @@ impl ObservabilityStore for UnusedStore {
 
     async fn usage_summary(
         &self,
-        _: TimeRange,
+        range: TimeRange,
         filter: UsageFilter,
     ) -> AdminStoreResult<UsageOverview> {
-        self.usage_filters.lock().unwrap().push(filter);
-        Err(unavailable("usage summary"))
+        self.usage_filters.lock().unwrap().push(filter.clone());
+        let mut data = self.observations.lock().expect("observations");
+        data.summaries.push((range, filter));
+        data.summary
+            .clone()
+            .map(|summary| UsageOverview { range, ..summary })
+            .ok_or_else(|| unavailable("usage summary"))
     }
 
     async fn usage_diagnostics(
@@ -1071,6 +1337,11 @@ impl ObservabilityStore for UnusedStore {
     }
 
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage> {
+        self.observations
+            .lock()
+            .expect("observations")
+            .errors
+            .push(query.clone());
         let items = self.ops_errors.lock().expect("ops errors").clone();
         Ok(OpsErrorPage {
             current_page: query.current_page,
@@ -1097,13 +1368,22 @@ impl UnusedProvider {
 
 #[async_trait]
 impl ProviderAdmin for UnusedProvider {
+    fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
+        serde_json::from_value(serde_json::json!({
+            "builtin-model": {
+                "multiplierBps": 10000,
+                "bands": {"standard": {"input": "1", "output": "2", "cacheRead": "0", "cacheWrite": "1"}}
+            }
+        })).unwrap()
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
     }
 
     async fn account_unavailable(&self, _: &ProviderAccountId) {}
 
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         _: &gateway_core::routing::UpstreamModelId,
         _: &str,
@@ -1141,7 +1421,7 @@ impl ProviderAdmin for UnusedProvider {
 
     async fn start_authorization(
         &self,
-        _: PendingAuthorizationMutation,
+        _: gateway_admin::model::provider_credentials::PendingAuthorizationMutation,
     ) -> Result<AuthorizationStarted, ProviderAdminError> {
         Err(unsupported_provider())
     }
@@ -1209,6 +1489,7 @@ impl AccountProbe for NoopProbe {
     fn probe(
         &self,
         _: AccountProbeRequest,
+        _: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
         Box::pin(async { panic!("unused account probe") })
     }
@@ -1222,7 +1503,11 @@ impl SystemOperations for UnusedSystem {
         Err(unavailable_system())
     }
 
-    async fn update_detail(&self, _: bool) -> Result<SystemUpdateDetail, SystemOperationError> {
+    async fn update_detail(
+        &self,
+        _: bool,
+        _: Option<gateway_admin::model::system::SystemUpdateChannel>,
+    ) -> Result<SystemUpdateDetail, SystemOperationError> {
         Err(unavailable_system())
     }
 
@@ -1233,6 +1518,8 @@ impl SystemOperations for UnusedSystem {
     async fn perform_update(
         &self,
         _: Option<String>,
+        _: Option<gateway_admin::model::system::SystemUpdateChannel>,
+        _: Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
     ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Err(unavailable_system())
     }
@@ -1241,7 +1528,10 @@ impl SystemOperations for UnusedSystem {
         Err(unavailable_system())
     }
 
-    async fn rollback(&self) -> Result<SystemOperationAccepted, SystemOperationError> {
+    async fn rollback(
+        &self,
+        _: Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Err(unavailable_system())
     }
 
@@ -1262,18 +1552,35 @@ fn test_runtime_settings() -> RuntimeSettings {
         ),
     ]);
     RuntimeSettings {
+        request_profiles: Default::default(),
+        request_location_enabled: false,
+        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: mappings,
         refresh_margin_seconds: 3_600,
         refresh_concurrency: 2,
         max_concurrent_per_account: 3,
         request_interval_ms: 50,
+        max_waiting_per_key: 0,
+        max_waiting_per_account: 0,
+        concurrency_wait_timeout_seconds: 30,
+        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::Smart,
         min_codex_desktop_version: None,
         min_codex_cli_version: None,
         usage_retention_days: 31,
         ops_event_retention_days: 30,
         audit_retention_days: 90,
+        account_auto_freeze_enabled: true,
+        account_auto_freeze_threshold: 12,
+        account_auto_freeze_window_seconds: 600,
+        account_auto_freeze_duration_seconds: 7_200,
+        account_auto_freeze_probe_enabled: true,
+        account_auto_freeze_probe_model: None,
+        account_auto_freeze_adaptive_concurrency: true,
+        account_warmup_enabled: false,
+        account_warmup_schedule_time: "08:00".to_owned(),
+        account_warmup_model: None,
         updated_at: Utc::now(),
     }
 }
@@ -1297,7 +1604,7 @@ fn group_color(value: &str) -> AccountGroupColor {
 fn capacity(used_slots: Option<u64>, total_slots: u64) -> AccountGroupCapacity {
     AccountGroupCapacity {
         used_slots,
-        total_slots,
+        total_slots: Some(total_slots),
     }
 }
 

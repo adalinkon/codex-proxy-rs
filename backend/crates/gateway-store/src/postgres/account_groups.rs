@@ -164,13 +164,13 @@ impl AccountGroupStore for PgAccountGroupRepository {
             .map(|group_id| group_id.as_str().to_owned())
             .collect::<Vec<_>>();
         let rows = sqlx::query(
-            "select membership.account_group_id,
-                    account.id, account.provider_kind, account.name, account.email,
+            "select proxy.auto_location, proxy.detected_location_json, proxy.location_country, proxy.location_region, proxy.location_city, proxy.location_timezone, membership.account_group_id,
+                    account.id, account.provider_kind, account.name, account.notes, account.email,
                     account.upstream_user_id, account.upstream_account_id, account.plan_type,
                     account.authentication_kind, account.credential_revision, account.outbound_proxy_url,
                     account.has_refresh_token, account.access_token_expires_at,
                     account.next_refresh_at, account.enabled, account.concurrency_limit,
-                    account.weight, account.credential_state, account.quota_access_state,
+                    account.weight, account.model_access_json, account.credential_state, account.quota_access_state,
                     account.quota_evidence, account.quota_access_observed_at,
                     account.quota_reset_at, account.last_error_reason,
                     account.last_error_message, account.credential_observed_at,
@@ -178,6 +178,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
                     settings.max_concurrent_per_account
                from account_group_accounts membership
                join provider_accounts account on account.id = membership.provider_account_id
+               left join outbound_proxies proxy on proxy.id = account.outbound_proxy_id
                cross join runtime_settings settings
               where settings.id = 1
                 and membership.account_group_id = any($1::text[])
@@ -208,13 +209,14 @@ impl AccountGroupStore for PgAccountGroupRepository {
                         credential_state: account.credential_state,
                         access_token_expires_at: account.access_token_expires_at.map(Into::into),
                         quota: account.quota,
-                        rate_limited_until: None,
+                        cooldown: None,
                         last_error_reason: account.last_error_reason,
                         last_error_message: account.last_error_message,
                     },
-                    total_slots: account
-                        .concurrency_limit
-                        .map_or(default_slots, |limit| u64::from(limit.get())),
+                    total_slots: account.concurrency_limit.map_or_else(
+                        || (default_slots > 0).then_some(default_slots),
+                        |limit| Some(u64::from(limit.get())),
+                    ),
                 })
             })
             .collect::<StoreResult<Vec<_>>>()
@@ -233,20 +235,25 @@ impl AccountGroupStore for PgAccountGroupRepository {
             "create",
             "account_group",
             id.as_str(),
-            vec!["name".to_owned(), "description".to_owned()],
+            vec![
+                "name".to_owned(),
+                "description".to_owned(),
+                "disable_fast".to_owned(),
+            ],
         );
         let revision = self
             .mutate(audit, |transaction| {
                 Box::pin(async move {
                     sqlx::query(
                         "insert into account_groups
-                         (id, name, description, color, enabled, created_at, updated_at)
-                         values ($1, $2, $3, $4, true, now(), now())",
+                         (id, name, description, color, disable_fast, enabled, created_at, updated_at)
+                         values ($1, $2, $3, $4, $5, true, now(), now())",
                     )
                     .bind(command.id.as_str())
                     .bind(command.name)
                     .bind(command.description)
                     .bind(command.color.as_str())
+                    .bind(command.disable_fast)
                     .execute(&mut **transaction)
                     .await
                     .map_err(|error| map_group_write_error(error, command.id.as_str()))?;
@@ -273,20 +280,25 @@ impl AccountGroupStore for PgAccountGroupRepository {
             "update",
             "account_group",
             id.as_str(),
-            vec!["name".to_owned(), "description".to_owned()],
+            vec![
+                "name".to_owned(),
+                "description".to_owned(),
+                "disable_fast".to_owned(),
+            ],
         );
         let revision = self
             .mutate(audit, |transaction| {
                 Box::pin(async move {
                     let result = sqlx::query(
                         "update account_groups
-                 set name = $2, description = $3, color = $4, updated_at = now()
+                 set name = $2, description = $3, color = $4, disable_fast = coalesce($5, disable_fast), updated_at = now()
                  where id = $1",
                     )
                     .bind(command.id.as_str())
                     .bind(command.name)
                     .bind(command.description)
                     .bind(command.color.as_str())
+                    .bind(command.disable_fast)
                     .execute(&mut **transaction)
                     .await
                     .map_err(|error| map_group_write_error(error, command.id.as_str()))?;
@@ -387,7 +399,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
 
 fn group_select() -> QueryBuilder<Postgres> {
     QueryBuilder::new(
-        "select g.id, g.name, g.description, g.color, g.enabled, g.created_at, g.updated_at,
+        "select g.id, g.name, g.description, g.color, g.enabled, g.disable_fast, g.created_at, g.updated_at,
                 coalesce(members.member_count, 0)::bigint as member_count,
                 coalesce(keys.client_key_count, 0)::bigint as client_key_count,
                 coalesce(members.provider_counts, '{}'::jsonb) as provider_counts
@@ -464,6 +476,9 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
     let provider_counts = serde_json::from_value::<BTreeMap<String, u64>>(provider_counts)
         .map_err(|_| invalid("invalid provider counts"))?;
     Ok(AccountGroupRecord {
+        disable_fast: row
+            .try_get("disable_fast")
+            .map_err(|_| invalid("invalid disable_fast"))?,
         id: AccountGroupId::new(
             row.try_get::<String, _>("id")
                 .map_err(|_| invalid("invalid id"))?,
@@ -492,7 +507,7 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
         },
         capacity: AccountGroupCapacity {
             used_slots: None,
-            total_slots: 0,
+            total_slots: Some(0),
         },
         usage: AccountGroupUsage {
             today_usd: DecimalAmount::from_str("0").map_err(|_| invalid("invalid zero cost"))?,
@@ -516,6 +531,8 @@ async fn group_costs(
         return Ok(BTreeMap::new());
     }
     let completed_usage = completed_usage_fact_predicate("mr");
+    // 用量按实际完成请求的账号统计：账号属于多个分组时计入每个所属分组，
+    // 不再按 Client Key 绑定分组快照归属，避免多分组 Key 的费用重复出现在未承接请求的分组上。
     let statement = format!(
         "with requested_groups(group_id) as (
            select unnest($1::text[])
@@ -528,8 +545,10 @@ async fn group_costs(
                 coalesce(sum(mr.cost_amount), 0)::text as retained_total_usd
          from requested_groups
          cross join runtime_settings settings
+         left join account_group_accounts membership
+           on membership.account_group_id = requested_groups.group_id
          left join model_requests mr
-           on mr.routing_group_refs @> array[requested_groups.group_id]::text[]
+           on mr.provider_account_ref = membership.provider_account_id
           and mr.started_at >= now() - make_interval(days => settings.usage_retention_days::int)
           and {completed_usage}
           and mr.cost_currency = 'USD'

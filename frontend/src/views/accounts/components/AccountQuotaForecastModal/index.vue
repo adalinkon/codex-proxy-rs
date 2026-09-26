@@ -1,14 +1,10 @@
 <script setup lang="ts">
 import type { AccountRow } from '../../constants'
 import type { Account } from '@/api'
-import { ChartNoAxesCombined, Info, RefreshCw } from '@lucide/vue'
-import { useNow } from '@vueuse/core'
+import { BaseButton, BaseEmpty, BaseIconButton, BaseModal, BasePopover, BaseSegmented } from '@codex-proxy/ui'
+import { ChartNoAxesCombined, CircleAlert, RefreshCw } from '@lucide/vue'
+import { useIntervalFn, useNow } from '@vueuse/core'
 import { computed, ref, toRef, useId, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountQuotaForecast } from '../../composables/useAccountQuotaForecast'
 import AccountIdentityCell from '../AccountIdentityCell.vue'
@@ -26,15 +22,21 @@ const { report, loading, refreshing, error, load, refresh } = useAccountQuotaFor
   open,
   account => emit('accountUpdated', account),
 )
-const { now, pause, resume } = useNow({ interval: 30_000, controls: true })
-const options = [
+const { now, pause, resume } = useNow({
+  controls: true,
+  scheduler: callback => useIntervalFn(callback, 30_000),
+})
+const options = computed(() => report.value?.forecasts.map(item => ({
+  label: item.extrapolated ? `${item.targetDays}天折算` : item.source?.label ?? (item.period === 'weekly' ? '周额度' : '月额度'),
+  value: item.period,
+})) ?? [
   { label: '周额度', value: 'weekly' },
   { label: '月额度', value: 'monthly' },
-]
+])
 const forecast = computed(() => report.value?.forecasts.find(item => item.period === period.value))
 const unavailableReason = computed(() => {
   if (forecast.value?.source && new Date(forecast.value.source.resetAt) <= now.value)
-    return '额度窗口已过期，请刷新账号额度后重试。'
+    return '额度窗口已过期，请刷新账号额度后重试'
   return forecast.value?.unavailableReason ?? null
 })
 
@@ -63,7 +65,7 @@ function handleExplanationKeydown(event: KeyboardEvent) {
   <BaseModal
     v-model="open"
     title="额度预测"
-    description="按当前用量结构，估算完整周期的容量"
+    description="按本周期估算，重置后重新累计"
     size="md"
     tone="info"
   >
@@ -71,9 +73,9 @@ function handleExplanationKeydown(event: KeyboardEvent) {
       <ChartNoAxesCombined class="size-5 text-cp-primary-text" :stroke-width="1.75" />
     </template>
 
-    <div class="grid gap-4">
+    <div class="grid grid-cols-1 gap-4">
       <div class="flex flex-wrap items-center justify-between gap-4">
-        <AccountIdentityCell :account="account" show-plan title-mode="email">
+        <AccountIdentityCell :account="account" show-plan title-mode="email" class="max-w-full">
           <template #meta>
             <ProviderIconGroup :provider="account.provider" size="sm" />
           </template>
@@ -84,7 +86,7 @@ function handleExplanationKeydown(event: KeyboardEvent) {
       <div aria-live="polite" :aria-busy="loading || refreshing">
         <ForecastSkeleton v-if="loading || refreshing" />
         <div v-else-if="error && !report" class="grid rounded-cp-card bg-cp-fill-tertiary/70 [html[data-theme=light]_&]:bg-cp-fill-quaternary/70">
-          <BaseEmpty title="预测加载失败" description="暂时无法取得预测数据，请重新加载。" surface="none" class="min-h-80 content-center">
+          <BaseEmpty title="预测加载失败" description="暂时无法取得预测数据，请重新加载" surface="none" class="min-h-80 content-center">
             <template #action>
               <BaseButton variant="secondary" @click="load">
                 重新加载
@@ -105,34 +107,35 @@ function handleExplanationKeydown(event: KeyboardEvent) {
       <div class="mr-auto flex min-w-0 items-center gap-2">
         <BasePopover v-model="explanationOpen" trigger="hover-click" placement="top-start" :hover-delay="240">
           <template #trigger>
-            <BaseButton
+            <BaseIconButton
+              label="预测说明"
               variant="ghost"
               size="sm"
               :aria-expanded="explanationOpen"
               :aria-describedby="explanationOpen ? explanationId : undefined"
               @keydown="handleExplanationKeydown"
             >
-              <template #icon>
-                <Info class="size-3.5" />
-              </template>
-              预测说明
-            </BaseButton>
+              <CircleAlert class="size-3.5" aria-hidden="true" />
+            </BaseIconButton>
           </template>
           <section :id="explanationId" role="tooltip" class="grid w-96 max-w-[calc(100vw-2rem)] gap-3 p-4 text-cp-xs leading-relaxed text-cp-text-secondary">
             <h4 class="m-0 font-heavy text-cp-text">
               仅供参考
             </h4>
             <p class="m-0">
-              根据已记录用量估算，漏记或失败请求的消耗可能使结果偏低；结果会随使用的模型和方式变化，并非官方承诺额度。
-            </p>
-            <p v-if="forecast?.lowSample" class="m-0">
-              目前数据还较少，结果可能有较大波动。
-            </p>
-            <p v-if="forecast?.extrapolated" class="m-0">
-              本页预测为折算值，剩余量仍按{{ forecast.source?.label ?? '当前周期' }}计算。
+              本周期预计总量为已记录用量加预计剩余，剩余量按本周期内近期用量估算
             </p>
             <p class="m-0">
-              剩余量以数据更新时间为准；等价费用不是实际账单或账户余额。
+              缺失的用量或费用可能使结果偏低，结果会随使用的模型和方式变化，并非官方承诺额度
+            </p>
+            <p v-if="forecast?.lowSample" class="m-0">
+              目前数据还较少，结果可能有较大波动
+            </p>
+            <p v-if="forecast?.extrapolated" class="m-0">
+              本页预测为折算值，剩余量仍按{{ forecast.source?.label ?? '当前周期' }}计算
+            </p>
+            <p class="m-0">
+              剩余量以数据更新时间为准，等价费用不是实际账单或账户余额
             </p>
           </section>
         </BasePopover>

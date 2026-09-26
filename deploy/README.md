@@ -4,22 +4,27 @@
 本文补充客户端配置、权限、备份和升级；部署命令从安装目录 `codex-proxy-rs/` 执行，
 其中 `deploy/` 存放 Compose 文件和配置，`.runtime/` 存放持久化数据。
 
-需要维护的配置文件：
+配置按职责保存，不都在 YAML 中：
 
-- `config.yaml`：应用行为与真实凭据，由 `config.example.yaml` 复制得到并被 Git 忽略。
-- `compose.yaml`：镜像、容器网络、端口、目录映射、健康检查和资源限制。
+| 位置 | 内容 | 修改方式 |
+| --- | --- | --- |
+| `deploy/config.yaml` | 监听、数据库/Redis 连接、部署凭据与日志等启动配置 | 从模板创建，已有部署合并修改，不覆盖原文件 |
+| `deploy/compose.yaml` | 镜像、容器网络、端口、挂载与资源限制 | 调整 Compose 并重建受影响容器 |
+| PostgreSQL | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
+| 浏览器本地 | 主题和界面偏好 | 当前浏览器的主题设置 |
 
-项目不使用 `.env` 配置文件。Compose 环境变量用于容器地址、镜像选择和构建发布；
-应用设置与凭据保存在 `config.yaml` 中。已有部署不要重新复制模板覆盖配置。
+项目不使用 `.env` 配置文件。Compose 环境变量用于容器地址、镜像选择和构建发布。
+配置加载会忽略未知或已移除的字段，并在启动控制台提示字段名；不输出对应值。缺少必填字段时会指出缺项并停止启动，
+已知字段的类型和取值仍需合法；可选字段省略时使用默认值。
 
 ## 用户管理与升级
 
-上游已发布迁移 `0006_custom_client_keys.sql`，用户功能使用后续编号 `0007` 至 `0009`。
+上游使用四位迁移编号；用户功能使用十二位日期编号，完整清单与规则见 [数据库迁移](../backend/migrations/README.md)。
 曾运行未发布开发版本 `0006_users.sql`、`0007_user_deletion.sql`、`0008_continuous_budget_periods.sql`
 的数据库不能直接升级到此编号序列。仅含测试数据的开发环境可另建空库；需要保留数据时应先备份并单独
 制定迁移方案，不能修改 `_sqlx_migrations` 的 checksum 绕过启动校验。
 
-`0009_continuous_budget_periods.sql` 将用户和 Key 的日／周金额窗口改为连续周期：日窗口仍按北京时间零点，
+`202609130003_continuous_budget_periods.sql` 将用户和 Key 的日／周金额窗口改为连续周期：日窗口仍按北京时间零点，
 周窗口从各自创建当天零点起每七天推进。迁移校验旧窗口累计值与费用事件一致后，按新周期重建当前已用；
 历史账本和限额保留，但周期边界调整可能改变当前周已用。缺少费用事件或累计值不一致时迁移事务失败，
 应恢复完整账本再升级，不能删除迁移记录或将已用直接置零绕过。升级前按下文流程备份数据库，停止旧实例后升级。
@@ -28,7 +33,7 @@
 历史请求、费用及会话保留。网络重试使用同一操作 ID，不会重复清零。备份恢复需保留用户的 `budget_reset_at`
 和 `user_budget_reset_operations` 去重结果；重建用户累计时也需排除清零前完成的费用。
 
-用户功能通过新增迁移 `0007_users.sql` 自动升级，既有迁移保持不变。首次升级会保留管理员密码、所有
+用户功能通过新增迁移 `202609130001_users.sql` 自动升级，既有迁移保持不变。首次升级会保留管理员密码、所有
 Key、原 Key 限额和已用金额，并将旧 Key 归属已有管理员（存在多个历史管理员时取最早创建者）。管理员
 用户级限额默认不限，原 Key 级限制继续生效；用户共享账本从已有费用事件回填，原 Key 窗口不被重置。
 按下文既有备份与升级流程操作；升级后的数据库不应交给不识别用户归属的旧二进制写入。
@@ -42,22 +47,53 @@ Key、原 Key 限额和已用金额，并将旧 Key 归属已有管理员（存�
 失效，但不自动撤销 Key；需要同时阻止 API 调用时停用用户或相关 Key。至少保留一个启用的管理员。
 不开放自助注册，不提供套餐、订阅和支付流程。
 
-用户列表的删除操作通过新增迁移 `0008_user_deletion.sql` 支持。删除后用户及所属 Key 不再可用，已有
+用户列表的删除操作通过新增迁移 `202609130002_user_deletion.sql` 支持。删除后用户及所属 Key 不再可用，已有
 会话失效；历史费用和请求归属保留，用户名不允许重新注册。最后一个启用的管理员不能删除。
 
 额度按已取得的 USD 费用记录，不预扣未来费用；并发中的请求可能超额，缺失费用按零累计。结算失败
 在进程内暂存，并在该用户下次请求前重试；重启可能丢失尚未成功持久化的费用。详细边界见
 [用户与额度接口](../docs/api.md#用户与个人面板)。
 
-## 准备
+## 部署结构
 
-按快速开始下载部署文件后，从安装目录执行：
+```mermaid
+flowchart LR
+  Client[客户端 / 管理浏览器] -->|HTTPS| Proxy[反向代理]
+  Proxy -->|HTTP / SSE / WebSocket| App[网关：单副本]
+  App --> PG[(PostgreSQL)]
+  App --> Redis[(Redis)]
+  App --> Upstream[上游服务]
+  App -. 数据库备份 .-> Backup[S3 / R2]
+```
+
+网关端口默认只绑定本机；数据库和 Redis 不对公网开放。插件以网关同一系统身份运行，不能作为不可信代码沙箱。
+
+## 手动安装
+
+本节适用于 Linux amd64/arm64，需准备 Docker Engine、Docker Compose Plugin、curl 和 OpenSSL，
+并确保当前用户能访问 Docker、可通过 `sudo` 或 root 设置目录权限。一键安装入口见
+[快速开始](../README.md#一键安装)，脚本会自动完成本节准备和服务启动。
+
+下载同一正式 Release 的部署文件并设置目录权限：
 
 ```bash
+mkdir -p codex-proxy-rs/deploy && cd codex-proxy-rs
+
+# 只解析一次最新正式版本，确保两个文件来自同一 Release。
+CPR_RELEASE_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/adalinkon/codex-proxy-rs/releases/latest)"
+CPR_RELEASE_TAG="${CPR_RELEASE_URL##*/}"
+curl -fsSL "https://github.com/adalinkon/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/compose.yaml" \
+  -o deploy/compose.yaml
+curl -fsSL "https://github.com/adalinkon/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/config.example.yaml" \
+  -o deploy/config.example.yaml
+
 install -d -m 0750 .runtime/postgres .runtime/redis
 sudo install -d -m 0770 -o "$(id -u)" -g 10001 .runtime/data .runtime/logs
 sudo install -m 0640 -o "$(id -u)" -g 10001 deploy/config.example.yaml deploy/config.yaml
 ```
+
+也可将 `CPR_RELEASE_TAG` 设置为指定的发布标签。Release 附带的 `compose.yaml` 默认使用该版本镜像，
+配置模板和部署文件均包含在 `checksums.txt` 中；不要混用 `main` 分支模板与已发布镜像。
 
 为 PostgreSQL 与 Redis 分别生成一个密码：
 
@@ -73,24 +109,13 @@ openssl rand -hex 24
 
 另行设置 `admin.default_password`。它至少需要 12 个字符，不能是常见弱口令，也不能包含 `$`。
 
+
 PostgreSQL 与 Redis 密码必须是 48 位十六进制字符。Compose 通过 `config.yaml` 的凭据桥接区
 引用同一密码；三个值都不需要额外导出为环境变量，数据库和 Redis 密码也不能嵌入连接 URL。
 
 Linux 上应用容器以 `10001:10001` 运行。上述命令将应用数据和日志目录设为 `0770`，
 配置设为 `0640`，均由当前用户持有、容器组 `10001` 访问。
 `config.yaml` 通过 Compose `configs` 只读挂载，普通 Compose 保留宿主机文件的 UID/GID 和 mode。
-
-模板中的 `openai` / `xai` 只保留请求画像启动基线。OpenAI 的上游地址、WebSocket 池、额度刷新
-与 OAuth 设置，以及 xAI 的 OAuth、额度和模型目录策略，均由各自 Provider 使用代码内默认值管理；
-模板不重复列出这些默认项。运行后，Provider 检查官方版本并更新运行时请求画像，
-不回写 `config.yaml`；检查失败时继续使用上一份有效画像。版本检查不等于重新核验 TLS。
-
-`openai.wire_profile.location` 可选覆盖请求地区。省略、留空（`location:`）或设为 `null` 时，
-透传客户端原有的 Web Search `user_location`、环境日期和时区；客户端未提供的字段也不会补写。
-模板显式填写 `US / Ohio / Piketon / America/New_York`，需要透传时清空或删除该配置项。
-自定义时完整填写 `country`（两位大写国家代码）、`region`、`city` 和 `timezone`（IANA 时区）；修改后重启生效。
-它统一 Responses 的 Web Search 地区与带环境标记的日期、时区，不修改普通聊天内容或 epoch 时间戳，
-也不替代 `residency` 约束或随官方版本检查变化。
 
 ## 启动
 
@@ -112,12 +137,51 @@ curl -i http://127.0.0.1:8080/healthz
 不要把未脱敏的 `docker compose config` 或 `docker inspect` 输出上传到工单；它们会包含
 PostgreSQL/Redis 启动密码。日常校验使用 `config --quiet`。
 
+### 启动后的运行设置
+
+在管理端修改以下设置，保存后对新请求生效，重启不会覆盖已保存的选择：
+
+| 设置 | 入口与边界 |
+| --- | --- |
+| 上游客户端身份 | “系统设置 → 上游配置 → 客户端身份”；Key 可按 Provider 覆盖，支持自动或固定版本 |
+| 全局请求位置 | “系统设置 → 上游配置 → 请求位置覆盖”；默认关闭，不从 YAML 导入 |
+| 代理位置 | “代理管理”；优先于全局位置，全局关闭时仍可独立生效 |
+
+位置覆盖只影响 OpenAI 请求中受支持的位置、日期与时区信息，不改变真实出口 IP、epoch 时间戳或系统时区。
+`openai.residency` 是独立的部署约束。身份与位置字段见 [运行设置 API](../docs/api.md#8-运行设置)。
+后台账号操作使用 Provider 自己的官方画像；发布资料刷新不改写用户选择或 `config.yaml`。
+
+### 插件命令行
+
+使用与网关相同的工作目录和 `deploy/config.yaml`，读取制品已接受且当前已启用的插件实例：
+
+```bash
+codex-proxy-rs plugin --help
+codex-proxy-rs plugin <实例ID> <命令> --help
+codex-proxy-rs plugin <实例ID> <命令> --参数 值
+```
+
+不带子命令或使用 `serve` 时启动网关；插件命令不监听 HTTP、不启动后台任务，也不恢复或清理正在运行的
+网关准入状态。顶层 `--help/--version` 不读取配置。插件帮助只读数据库，不执行迁移、登录或账号保存，
+因此需要先由正常部署完成数据库初始化。宿主诊断保留在配置的文件日志中，stdout/stderr 专用于命令结果。
+
+参数支持 `--名称=值` 或 `--名称 值`；布尔参数可直接写 `--名称`，关闭时写 `--名称=false`。
+duration 使用 `500ms`、`1m30s` 等带单位形式。参数可能进入 shell 历史和系统进程列表，不能因为插件声明
+了敏感参数就认为命令行是安全的密钥输入通道；真实凭据优先使用对应插件提供的受控登录或导入入口。
+
+成功命令原样返回插件退出码与输出。命令受总期限约束，`Ctrl-C` 或终止信号会取消调用并回收插件进程。
+若命令产生账号，只有成功结果才按顺序通过 Admin 保存；调用受制品访问域、`command_line` 阶段和当前资源事实约束，
+模型执行 Key 由具体调用选择，不在实例中预绑定。
+部分保存后失败或取消不会自动重放，先核对账号和审计记录，再决定是否重新执行。
+
+独立仓库 `codex-proxy-plugins` 的 `examples/request-workbench` 提供不访问真实上游的综合示例。
+
 ## 公网访问
 
 Compose 默认只绑定 `127.0.0.1`。从其他设备访问时，在应用前配置反向代理，
 不要把 PostgreSQL 或 Redis 暴露到公网。
 
-同源管理端支持 HTTP 和 HTTPS 登录。反向代理应原样保留浏览器的 `Origin`，
+同源登录页的管理员与普通用户登录都支持 HTTP 和 HTTPS 登录。反向代理应原样保留浏览器的 `Origin`，
 不要清除它或改写 Cookie 的 `Secure` 属性；HTTPS 反代可以使用 HTTP 回源。
 HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 会话 Cookie 合同见 [管理接口鉴权](../docs/api.md#管理接口)。
@@ -145,6 +209,8 @@ SSE 注释保活用于防止传输链路空闲断开，不会重置 Codex 等待
 
 在管理端创建客户端密钥，打开「使用密钥」，按操作系统复制 `config.toml` 和 `auth.json`，
 或通过 CCSwitch 导入。已有文件先备份，合并后完全退出并重启 Codex。
+CCSwitch 导入同时配置当前 Key 的日／周额度查询，当前 Provider 默认每 30 分钟刷新。
+查询地址和凭据随导入生成，在 CCSwitch 中修改 Provider 的地址或 Key 后，需重新导入以同步用量查询。
 
 Linux/macOS 默认目录为 `~/.codex/`，Windows 为 `%USERPROFILE%\.codex\`；
 设置过 `CODEX_HOME` 时以该目录为准。Provider 设置应写入用户配置，不要只写到项目目录。
@@ -183,6 +249,10 @@ goals = true
 不要重复添加 `[features]` 或 Provider 表。更换模型时也要检查其支持的推理强度。
 密钥以明文保存，文件仅供本人读取，不要提交到 Git。
 
+需要指定完整模型目录时，在账号的模型列表中导出所选 Codex 模型，并在 `config.toml` 顶层设置
+`model_catalog_json = "/absolute/path/to/cpr-model-catalog.json"`。导出文件不含账号凭据；
+它是一次目录快照，调整选择或上游模型能力变化后需重新导出。
+
 ### auth.json
 
 ```json
@@ -191,8 +261,8 @@ goals = true
 }
 ```
 
-这份文件可以保留，用于兼容已有客户端和 CCSwitch。新配置从 `experimental_bearer_token`
-读取代理密钥，不会因为仅含 API Key 的 `auth.json` 存在而关闭生图。
+使用 `auth.json` 读取密钥的客户端或 CCSwitch 可保留这份文件。上述 Provider 配置从
+`experimental_bearer_token` 读取代理密钥，可与仅含 API Key 的 `auth.json` 共存。
 真实 OpenAI OAuth 账号文件用于管理端账号导入，不要当作代理配置分发给客户端。
 
 ### 生图和 WebSocket
@@ -202,14 +272,15 @@ goals = true
 需要支持该能力的客户端、支持图片输入的对话模型，以及有生图权限和额度的 OpenAI 账号。
 代理不会增加上游权限，xAI 账号不能承接这些 Images 请求。
 
-本项目已用 Codex CLI 0.153.4 验证过原生生图，这不是最低支持版本声明。
 生图不要求开启 WebSocket。要启用客户端 WebSocket，把当前 Provider 的
 `supports_websockets` 改为 `true`，并检查反向代理是否允许 Upgrade。
 
 客户端到代理、代理到上游是两段独立连接。客户端关闭 WebSocket 后，
 服务端仍可能用 WebSocket 访问上游；客户端开关不控制服务端连接池和 HTTP 回退策略。
+OpenAI OAuth 账号的上游传输方式默认 WS；固定为 SSE 的账号不承接必须依赖 WS 的预热及连接内续接。
+仅使用这类账号时，客户端保持 `supports_websockets = false`，避免先尝试 WS 再回退。
 
-### 旧版配置
+### 客户端配置兼容
 
 仅含代理密钥的 `auth.json` 配合 `requires_openai_auth = true` 仍可用于已有请求，
 但 API Key 登录本身不会启用原生生图。需要生图时换用上述 Provider 配置。
@@ -233,7 +304,8 @@ goals = true
   先备份并区分本地真实账号文件与代理密钥文件，不要直接删除全部登录状态。
 - 已调用生图但失败：查看服务端账号的凭据、权限、额度和请求错误，不能只凭文本对话成功判断。
 - `401`：检查代理密钥是否正确、是否启用；Actor 标记不能代替密钥。
-- `426`：客户端低于管理员设置的最低版本，或版本无法识别，需要更新客户端。
+- `426`：检查客户端版本及反向代理是否保留版本头，低于管理员设置的最低版本时需要更新客户端。
+  手机远程控制的版本识别范围见 [版本门禁规则](../docs/api.md#1-鉴权与公共约定)。
 - 地址包含 `5173/dev/v1`：这是开发代理地址，依赖 Vite 服务。日常使用改成后端或 HTTPS 地址；
   验证 WebSocket 时直接连接后端，当前 Vite 代理未显式开启 WebSocket 转发。
 
@@ -266,6 +338,12 @@ cargo run -p codex-proxy-rs
 覆盖为容器内部服务名，并把前端静态目录指向容器内构建产物。PG/Redis 集成测试所需的
 `CPR_TEST_DATABASE_URL` / `CPR_TEST_REDIS_URL` 约定见
 [迁移文档](../backend/migrations/README.md)。
+
+管理端的依赖准备与 UI 源码联调见 [贡献与验证](../CONTRIBUTING.md#验证)。另开终端从仓库根目录启动前端：
+
+```bash
+pnpm --dir frontend dev
+```
 
 ## 持久化与备份
 
@@ -301,7 +379,7 @@ OpenAI 主动额度重置卡及其消费结果由上游持有，不写入 Postgr
 文件名统一为 `codex-proxy-rs-<类别>.YYYY-MM-DD[.N].log[.gz]`，类别分别为
 `application`、`oauth-recovery`、`request-dump`。专用 tracing target 为 `oauth_recovery` 和
 `request_dump`；普通日志保留各 Rust 模块的 target，便于按模块过滤。
-程序只管理上述规范名称的日志，旧命名文件由运维手动清理。
+程序只管理上述规范名称的日志，其他命名的文件由运维手动清理。
 普通日志未配置 `retention_days` 时默认使用 7 天，显式配置优先。
 
 按 UTC 日期整组保留：例如 9 月 8 日配置 1 天，会保留 9 月 7 日全天及 9 月 8 日的所有分片，
@@ -311,13 +389,12 @@ OpenAI 主动额度重置卡及其消费结果由上游持有，不写入 Postgr
 关闭的分片压缩为 `.log.gz`；成功压缩、同步并发布归档后才删除原文件，保留原修改时间。
 清理发生在启动和轮转时；空闲期间过期文件可能暂时多保留。检索时须同时读取 `.log` 与 `.log.gz`。
 
-升级旧配置时删除 `host.logging.file.max_files`；该字段已移除，旧配置会校验失败而不会继续按数量删日志。
-报文开关仍为 `host.logging.request_dump`，默认关闭；开启时原始报文按块完整写入独立文件，
+报文开关为 `host.logging.request_dump`，默认关闭；开启时原始报文按块完整写入独立文件，
 数据库请求诊断仍是有界摘要，不能用摘要事件数代替全量报文完整性。
 
 文件写入使用有界队列背压，正常退出会排空队列并同步文件。`file_logging` 健康探针在写入/同步失败后
 报告 `Unhealthy`，本次进程内恢复写入也不会清除已有缺口；压缩或清理失败报告 `Degraded`。
-这不是断电、强杀或磁盘故障下的零丢失承诺；已删除的历史文件也不能靠升级恢复。
+断电、强杀或磁盘故障可能造成日志丢失；需要恢复已删除文件时，应使用独立备份。
 容量不足时不会提前删除保留窗口内日志，必须根据完整日期的压缩后实际用量规划空间，并监控磁盘余量和
 健康探针。Docker stdout 的独立轮转不承担应用文件日志的完整保留承诺。
 
@@ -349,12 +426,31 @@ OpenAI 主动额度重置卡及其消费结果由上游持有，不写入 Postgr
    按配置的保留窗口及组织的数据处理要求管理已生成文件。不要为普通请求排查开启 OAuth 恢复记录，
    也不要直接上传整个日志目录或完整转储。
 
-反馈入口见 [Issue 表单](../.github/ISSUE_TEMPLATE/bug_report.yml)；错误诊断与查询合同见
+请求问题反馈使用 [接口问题反馈表单](../.github/ISSUE_TEMPLATE/api-bug-report.yml)；错误诊断与查询合同见
 [API 文档](../docs/api.md#10-dashboard用量与错误)。
+
+### 插件取文与 Fake-IP DNS
+
+插件受管 HTTP 会检查域名解析出的全部地址，再使用通过校验的地址连接，默认拒绝内网、回环、
+链路本地和保留地址。配置了代理也不会跳过目标地址校验，宿主不自动改用公共 DNS。
+
+若取文提示“目标地址被安全策略拦截”，先在**实际运行网关的主机或容器内**检查域名解析。
+Clash / Mihomo 的 Fake-IP 模式可能把公网域名解析为 `198.18.0.0/15` 中的地址，此时应调整代理 DNS，
+让需要访问的域名返回真实公网地址，不要关闭宿主检查或放行整个保留地址段。
+
+例如 Mihomo 使用 `fake-ip-filter-mode: blacklist` 时，将 `github.com` 追加到现有
+`dns.fake-ip-filter` 列表，保留原条目及其他 DNS、代理规则。Clash Verge Rev 开启 DNS 覆写时，
+应在 DNS 设置中修改持久配置，而不是只编辑会被重新生成的运行配置。规则模式和白名单模式含义不同，
+按所用版本的 [Mihomo DNS 文档](https://wiki.metacubex.one/config/dns/)配置。
+重新加载后确认解析结果已改变，再验证实际取文；浏览器或普通 `curl` 可访问不能代替宿主校验。
+
+宿主日志中的“插件受管 HTTP 请求失败”只记录固定原因、错误类别和发送状态，不包含请求网址、
+请求头、正文或凭据。域名解析失败、网络超时、连接失败和地址拒绝应分别处理，不需要开启请求转储。
 
 ## 密码语义
 
 - `admin.default_password` 只在首次创建管理员时使用。
+- 已有管理员在「系统设置 → 安全与访问 → 管理员密码」修改登录密码，需要验证当前密码；修改后所有管理员会话失效，使用新密码重新登录。
 - PostgreSQL 官方镜像只在空数据目录初始化时使用 `database.password`。
 - Redis 在每次容器创建时使用 `redis.password`。
 
@@ -365,15 +461,19 @@ OpenAI 主动额度重置卡及其消费结果由上游持有，不写入 Postgr
 
 ## 镜像升级与源码构建
 
-> [!WARNING]
-> 以下命令只适用于同一大版本内的升级，不支持跨大版本在线升级。跨大版本请使用全新的
-> `.runtime/` 数据目录重新部署，并重新导入或重新授权 Provider 账号与客户端 Key。
-
 每个 Release 独立提供 `config.example.yaml`、默认镜像固定到该版本的 `compose.yaml` 和校验和；
 各平台归档也包含 `deploy/config.example.yaml`。配置模板来自构建该版本的同一提交。
 使用二进制归档手动部署时，将模板中的 `api.asset_directory` 改为 `../web/dist`，指向归档内的静态资源。
+在线更新默认使用同一目录；如显式设置 `host.system_update.web_dist_dir`，应确保它指向实际提供页面的目录。
 升级时先阅读目标版本说明，下载同一 Release 的部署附件，对比模板并合并必要配置，保留已有凭据
 和 Compose 自定义项。不要用模板覆盖 `config.yaml`，也不要从 `main` 下载模板搭配旧镜像。
+
+按现有配置和接入方式检查以下升级条件：
+
+| 适用条件 | 升级操作 |
+| --- | --- |
+| `config.yaml` 含 `openai.wire_profile.location` | 该字段会被忽略，可删除；如需继续覆盖请求位置，将值填入管理端全局请求位置并开启开关，数据库初始化不会自动导入 |
+| `config.yaml` 含 `host.logging.file.max_files` | 该字段会被忽略，可删除；日志按 `retention_days` 保留，`max_file_size_mb` 只控制分片大小 |
 
 更新部署文件后，从安装目录拉取目标版本镜像并重建应用容器：
 
@@ -382,19 +482,16 @@ docker compose -f deploy/compose.yaml pull codex-proxy-rs
 docker compose -f deploy/compose.yaml up -d --no-build --wait codex-proxy-rs
 ```
 
-源码构建需要克隆源码仓库并准备配置与数据目录，以下命令从仓库根目录执行：
+源码构建需要克隆源码仓库并准备配置与数据目录。UI 组件库从锁定的 GitHub 提交下载，并在前端依赖安装阶段自动构建，无需准备同级源码仓库或额外 build context。以下命令从仓库根目录执行：
 
 ```bash
 docker compose -f deploy/compose.yaml build codex-proxy-rs
 docker compose -f deploy/compose.yaml up -d --no-build --wait
 ```
 
-源码提交、仓库发版和运行实例升级是三种独立状态：本地 commit 不等于 Release，Release/tag 和镜像
-已生成也不等于实例已升级。判断某项修复是否在线前，应先通过管理端版本接口或容器 image digest
-确认运行实例的实际 revision；实例只有在执行上面的 Compose pull/up，或成功完成管理端在线更新后
-才会改变。
+升级后通过管理端版本接口或容器 image digest 确认运行实例的版本和 revision。
 
-构建元数据仍可作为一次性进程环境传入，不需要 `.env` 文件：
+构建元数据通过一次性进程环境传入：
 
 ```bash
 CPR_VERSION="$(ruby -ryaml -e 'puts YAML.load_file("release/version.yaml").fetch("version").delete_prefix("v")')" \
@@ -403,18 +500,60 @@ CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose -f deploy/compose.yaml build codex-proxy-rs
 ```
 
+### 版本命名与升级规则
+
+管理端「系统更新」可临时选择通道检查更新，不保存选择，不会自动下载或安装。
+每次打开弹窗按当前运行版本匹配通道：正式版为 Stable，预发行按版本后缀匹配。
+升级并重启后按新运行版本匹配；侧栏更新提示始终使用当前运行通道。预发行编号 `N` 从 1 开始递增。
+
+| 通道 | 命名示例 | 接收的版本 |
+| --- | --- | --- |
+| Stable | `3.12.0` | 正式版 |
+| RC | `3.12.0-rc.1` | RC、正式版 |
+| Beta | `3.12.0-beta.1` | Beta、RC、正式版 |
+| Alpha | `3.12.0-alpha.1` | Alpha、Beta、RC、正式版 |
+| Exp | `3.10.0-exp.1` | 同一轮实验中编号更高的 exp，仅实验实例可选 |
+
+普通通道在同一大版本内持续接收更高版本，包括后续小版本和补丁版本的预发行。
+切回 Stable 不会降级：例如运行 `3.16.0-beta.2` 时，不能安装 `3.15.1`，需要等待 `3.16.0` 或更高正式版。
+下载、安装或待重启期间不能切换通道。
+
+同一 `X.Y.Z-exp.N` 系列只用于同一轮实验，不能混用不同实验分支；变更基线即进入另一实验线，需手动迁移。
+exp 不进入正式版、alpha、beta 或 rc，普通实例也不能选择 Exp。
+从 exp 切换正式版时需先备份，在目标版本的独立数据库中迁移业务数据，不能直接复用或整库还原实验数据库。
+
+版本大小遵循 [SemVer](https://semver.org/)，构建元数据 `+...` 不参与比较。未知预发行标识不提供在线更新。
+更新器先过滤不允许的目标，再选择版本最高的候选；其他通道或更高大版本领先，不影响当前发行线的更新。
+只有当前官方构建满足在线更新条件且存在允许安装的新版本时，才返回“有可用更新”。否则不显示更新标记、
+其他通道的版本及发布说明，手动检查显示“当前没有可用更新”。检查失败单独报告，不能当作没有更新。
+
+alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Latest 或镜像 `latest`。
+允许连续升级的发行线从首次发布起遵守[迁移冻结规则](../backend/migrations/README.md#冻结规则)，
+包括预发行到正式版的晋级；发版前验证对应升级路径，不能仅凭版本号认定数据库兼容。
+
 ### 管理端在线更新
 
-Compose 已显式装配正式发布构建所需的运行参数：
+官方构建按上述规则在线更新；源码等非官方构建返回不支持原因，不提供可用更新。
+点击「下载并更新」后在原有更新日志中显示下载、校验与安装过程，完成后显示「待重启」及待生效版本，重启后才使用新程序。
+「当前版本」始终表示正在运行的版本，「通道最新」表示所选通道的检查结果。
+
+手动更换镜像或程序后，更新器会核对安装文件并校准历史状态，不以旧成功记录推断需要重启。
+运行期间检测到外部文件变动或文件缺失时会报告异常，需要核对完整发行包并重启服务后再检查。
+回滚入口只接受与记录指纹一致的完整备份；旧格式记录没有指纹，或备份被替换、丢失时，不再提供在线回滚，
+但不会删除备份文件。此时需要按人工部署流程恢复已经核实的发行包。
+
+Compose 提供以下在线更新运行参数：
 
 - `CPR_UPDATE_REPOSITORY`：只接受 `owner/repository`；默认 `zyycn/codex-proxy-rs`。
 - `CPR_GITHUB_API_BASE`：正式环境必须为 `https://api.github.com/repos`。
-- `CPR_UPDATE_CHANNEL`：`stable` 会拒绝 prerelease。
-- `CPR_UPDATE_EXE_PATH`、`CPR_WEB_DIST_DIR`：分别指向容器内二进制和前端静态目录。
+- `CPR_UPDATE_EXE_PATH`、`CPR_WEB_DIST_DIR`：分别指向容器内二进制和前端静态目录；
+  `CPR_WEB_DIST_DIR` 同时供页面服务与更新器使用，相对路径以 `deploy/config.yaml` 所在目录为基准。
 - 更新临时目录、状态文件和锁文件默认由 `host.runtime_data_dir` 派生；
   `CPR_UPDATE_TEMP_DIR`、`CPR_UPDATE_STATE_FILE`、`CPR_UPDATE_LOCK_FILE` 仅用于显式覆盖。
 - `CPR_ENABLE_SELF_RESTART=true`：更新或回滚完成后允许管理端请求重启；Docker 进程退出后由
   Compose 的 `restart: unless-stopped` 拉起新进程。
+
+旧配置中的 `CPR_UPDATE_CHANNEL` 不再参与版本选择，可移除。
 
 Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.tar.gz` 与
 `checksums.txt`。服务会在替换前再次查询远端最新版本，校验下载 host、声明大小、SHA-256 和
@@ -427,10 +566,34 @@ Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.ta
 .runtime/data/update-tmp/
 ```
 
+### 插件兼容与发行目录
+
+教学示例在 `codex-proxy-plugins` 独立构建和发布，通过[插件管理](../docs/plugins.md)安装。
+宿主发行物当前不内置插件，但仍包含用于兼容检查的封口清单。
+
+| 文件或目录 | 用途 |
+| --- | --- |
+| `plugin-release-manifest.json` | 固定宿主版本、提交、平台与支持的插件合同；插件列表当前为空 |
+| 可执行文件同目录的 `plugins/official` | 随受信宿主发行物部署的只读目录，与二进制、Web 资源成套更新或恢复 |
+
+- 更新或回滚前，逐一检查启用实例的精确包与目标宿主是否兼容。制品缺失、不兼容或并发配置变更会阻止切换；失败或取消时恢复整组文件，不自动停用插件或接受其他制品
+- 非空官方清单中的包经身份、平台和摘要校验后幂等导入；导入不接受访问域、不创建配置、不启用，也不删除旧包。管理员确认访问域后才执行默认配置流程；重复摘要保留首次安装出处
+- `sealed` 是构建封口标记，不是密码学签名。普通上传、URL 或 GitHub 安装不能获得 `builtin` 身份，独立教学示例也不例外
+
+首次从不支持官方目录的旧更新器升级时，须完整解压平台发行包或更新正式容器镜像；旧更新器不会复制新增目录。
+后续在线更新会成套处理该目录。macOS arm64 提供构建产物；部署前仍需验证目标平台的插件运行与上游调用，不能只以打包成功判断可用。
+
 ## 备份与恢复
 
 ### 备份内容与限制
 
+- 插件包体、固定来源、下载凭据、制品接受事实、实例配置、版本配置快照、敏感配置、功能范围绑定和私有状态都保存在
+  PostgreSQL，随数据库一起备份。插件通过宿主回调读写的内置平台账号保存在同库的通用账号表。
+  来源使用的出站代理及其认证也须随库恢复，不能只备份 `plugin_*` 表；来源代理与账号代理独立选择，
+  不依赖进程代理环境，故障时不会自动回退直连。
+  包体单个上限为 32 MiB，需要计入数据库及备份容量；解压运行目录和 Redis 协调状态是可重建数据，
+  不作为插件安装或访问域事实。恢复时保留制品接受状态、实例配置、账号引用和状态代次的一致性；插件降级仍须
+  通过状态兼容校验，不通过手工替换缓存目录回滚。
 - 官方运行镜像内置与 Compose 数据库服务版本一致的 `pg_dump` / `pg_restore`，无需额外安装。
   自行替换 PostgreSQL 版本时，应同步核对备份工具版本。
 - 备份暂存目录为 `host.runtime_data_dir/backup-staging`；Compose 默认对应
@@ -467,7 +630,10 @@ pg_restore --no-owner --no-privileges --password \
 1. 先备份现有数据库，并停止应用；在独立的空数据库中恢复归档，检查数据和迁移版本。
 2. 应用保持停止，离线核对备份设置与记录。禁用快照中的旧计划，处理非终态记录
    （`queued/dumping/uploading/deleting`）、旧调度游标和到期清理条件，再决定哪些记录保留。
-3. 确认不会误执行旧任务或删除恢复前的远端对象后，再启动应用；重新测试 S3 连接并设置计划。
+3. 使用空 Redis 和空插件解包缓存做一次冷启动；逐一核对已启用实例的包摘要/平台、制品接受状态、配置与绑定、账号引用、
+   私有状态 schema/代次，并执行实际插件操作。缺少或损坏必需包体、引用不完整或状态不兼容时，恢复不能
+   记为成功，也不能用相同插件 ID 的其他包替代。
+4. 确认不会误执行旧任务或删除恢复前的远端对象后，再接入业务流量；重新测试 S3 连接并设置计划。
 
 只关闭计划备份不会停止 Worker 的任务恢复和到期删除。无法确认这些记录的影响时，
 不要把恢复后的数据库直接接入运行中的应用。具体处理应根据目标库数据制定，不提供清空生产记录的通用命令。

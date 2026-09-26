@@ -2,7 +2,7 @@
 //!
 //! 端口按业务资源拆分，方法使用领域模型，不暴露连接池、事务或 Redis client。
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -32,7 +32,8 @@ use crate::model::{
     },
     provider_credentials::{
         AuthorizationCommit, CredentialDetails, CredentialImportCommit, CredentialImportResult,
-        CredentialMutationResult, CredentialRotationCommit, ProviderExportCredentialInput,
+        CredentialMutationResult, CredentialRotationCommit, PluginAccountListQuery,
+        PluginAccountPage, ProviderExportCredentialInput,
     },
     quota_forecast_sampling::QuotaForecastHistory,
     settings::{AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RuntimeSettings},
@@ -88,6 +89,12 @@ pub type AdminStoreResult<T> = Result<T, AdminStoreError>;
 /// 账号目录与公共账号写操作。
 #[async_trait]
 pub trait AccountStore: Send + Sync {
+    /// 插件回调按授权 Provider/账号在数据库过滤后做稳定 cursor 分页。
+    async fn list_plugin_accounts(
+        &self,
+        query: PluginAccountListQuery,
+    ) -> AdminStoreResult<PluginAccountPage>;
+
     async fn list_accounts(
         &self,
         query: AccountListQuery,
@@ -123,11 +130,23 @@ pub trait AccountStore: Send + Sync {
         account_id: &gateway_core::account::ProviderAccountId,
     ) -> AdminStoreResult<Option<CredentialDetails>>;
 
+    /// 插件按全局账号 ID 读取时，由数据库记录提供权威 Provider 归属。
+    async fn credential_details_by_id(
+        &self,
+        account_id: &gateway_core::account::ProviderAccountId,
+    ) -> AdminStoreResult<Option<CredentialDetails>>;
+
     async fn load_credentials_for_export(
         &self,
         provider_kind: &gateway_core::routing::ProviderKind,
         account_ids: &[gateway_core::account::ProviderAccountId],
     ) -> AdminStoreResult<Vec<ProviderExportCredentialInput>>;
+
+    /// 插件凭据读取只接收账号 ID，不接受调用方另行声明 Provider。
+    async fn load_credential_for_plugin(
+        &self,
+        account_id: &gateway_core::account::ProviderAccountId,
+    ) -> AdminStoreResult<Option<ProviderExportCredentialInput>>;
 
     async fn commit_credential_import(
         &self,
@@ -139,7 +158,13 @@ pub trait AccountStore: Send + Sync {
         &self,
         command: AuthorizationCommit,
         context: &MutationContext,
-    ) -> AdminStoreResult<CredentialMutationResult>;
+    ) -> AdminStoreResult<crate::model::provider_credentials::AuthorizationCommitResult>;
+
+    /// 已提交的授权结果独立于 Redis 临时状态；只有原管理员身份可读。
+    async fn authorization_receipt(
+        &self,
+        key: &crate::model::provider_credentials::AuthorizationReceiptKey,
+    ) -> AdminStoreResult<Option<crate::model::provider_credentials::CredentialMutationResult>>;
 
     async fn commit_credential_rotation(
         &self,
@@ -158,6 +183,14 @@ pub trait AccountStore: Send + Sync {
         command: UpdateAccount,
         context: &MutationContext,
     ) -> AdminStoreResult<AccountUpdateResult>;
+
+    /// 在事务内按最新启用状态、账号上限和全局默认值判断，只降低并发上限。
+    async fn lower_concurrency_limit(
+        &self,
+        account_id: &gateway_core::account::ProviderAccountId,
+        limit: gateway_core::account::AccountConcurrencyLimit,
+        context: &MutationContext,
+    ) -> AdminStoreResult<Option<AccountUpdateResult>>;
 
     async fn recover_account(
         &self,
@@ -193,9 +226,28 @@ pub trait AccountRuntimeStore: Send + Sync {
         &self,
         account_ids: &[String],
     ) -> AdminStoreResult<AccountRuntimeSnapshot>;
+
+    /// 容量熔断自动冻结中的账号与其冻结截止时间；429 临时限流不包含在内。
+    async fn active_freezes(
+        &self,
+    ) -> AdminStoreResult<BTreeMap<String, crate::model::accounts::AccountFreeze>>;
+
+    /// 读取容量失败窗口内观测到的在途并发峰值（自适应并发下调的证据）。
+    async fn capacity_peaks(
+        &self,
+        account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, u32>>;
+
+    /// 仅当冻结快照仍匹配时解除或顺延；旧探测不得覆盖手动恢复或新一轮冻结。
+    async fn finish_freeze(
+        &self,
+        account_id: &str,
+        expected: &crate::model::accounts::AccountFreeze,
+        postpone_until: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool>;
 }
 
-/// 管理员密码、会话和安全审计。
+/// 控制面凭据、统一会话、登录限流与管理员安全审计。
 #[async_trait]
 pub trait AuthStore: Send + Sync {
     async fn load_user_identity(
@@ -261,6 +313,12 @@ pub trait ClientKeyStore: Send + Sync {
         user_id: &str,
         mutation: crate::model::client_keys::OwnedKeyMutation,
     ) -> AdminStoreResult<Revision>;
+    /// 按已验证的 ID 读取资料，不读取完整明文 Key。
+    async fn get_client_key(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Option<ClientKeyRecord>>;
+
     async fn list_client_keys(&self, query: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage>;
 
     async fn reveal_client_key(
@@ -395,6 +453,18 @@ pub trait ObservabilityStore: Send + Sync {
 /// Runtime settings 与管理员 API Key 写入。
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
+    async fn load_pricing(&self) -> AdminStoreResult<crate::model::pricing::StoredPricing>;
+    async fn sync_pricing(
+        &self,
+        changes: crate::model::pricing::PricingSyncChanges,
+        context: &MutationContext,
+    ) -> AdminStoreResult<crate::model::Revision>;
+    async fn update_pricing(
+        &self,
+        command: crate::model::pricing::UpdatePricing,
+        context: &MutationContext,
+    ) -> AdminStoreResult<crate::model::Revision>;
+
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings>;
 
     async fn admin_api_key_exists(&self) -> AdminStoreResult<bool>;
@@ -455,9 +525,25 @@ pub struct AdminStorePorts {
     observability: Arc<dyn ObservabilityStore>,
     settings: Arc<dyn SettingsStore>,
     backup: BackupStorePorts,
+    plugins: Arc<dyn super::plugins::PluginStore>,
+    plugin_state: Arc<dyn super::plugins::PluginStateStore>,
 }
 
 impl AdminStorePorts {
+    #[must_use]
+    pub fn plugins(&self) -> Arc<dyn super::plugins::PluginStore> {
+        Arc::clone(&self.plugins)
+    }
+
+    #[must_use]
+    pub fn plugin_state(&self) -> Arc<dyn super::plugins::PluginStateStore> {
+        Arc::clone(&self.plugin_state)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "组合根需显式注入各领域窄端口，不能用服务定位器隐藏依赖"
+    )]
     #[must_use]
     pub fn new(
         accounts: AdminAccountStorePorts,
@@ -466,6 +552,8 @@ impl AdminStorePorts {
         observability: Arc<dyn ObservabilityStore>,
         settings: Arc<dyn SettingsStore>,
         backup: BackupStorePorts,
+        plugins: Arc<dyn super::plugins::PluginStore>,
+        plugin_state: Arc<dyn super::plugins::PluginStateStore>,
     ) -> Self {
         Self {
             accounts,
@@ -475,6 +563,8 @@ impl AdminStorePorts {
             settings,
             backup,
             request_usage: None,
+            plugins,
+            plugin_state,
         }
     }
 

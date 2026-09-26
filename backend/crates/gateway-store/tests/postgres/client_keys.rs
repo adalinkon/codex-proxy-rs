@@ -50,6 +50,7 @@ async fn migrated_keys_persist_exactly_and_keep_short_keys_masked() {
             .create_client_key(
                 NewClientKey {
                     user_id: Some("test-owner".to_owned()),
+                    request_profile_overrides: Default::default(),
                     id: id.clone(),
                     name: format!("Migrated {index}"),
                     label: None,
@@ -106,6 +107,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
     let key = "legacy-key-case-sensitive!";
     let command = |id: &str| NewClientKey {
         user_id: None,
+        request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new(id).unwrap(),
         name: id.to_owned(),
         label: None,
@@ -142,6 +144,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
 fn generated_client_key_format_remains_valid() {
     let key = NewClientApiKey {
         user_id: None,
+        request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: "key-1".to_owned(),
         name: "default".to_owned(),
@@ -175,6 +178,7 @@ async fn client_key_names_are_checked_atomically_on_create_and_rename() {
     };
     let create = |id: &str, name: &str| NewClientKey {
         user_id: None,
+        request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new(id).unwrap(),
         name: name.to_owned(),
         label: None,
@@ -184,6 +188,7 @@ async fn client_key_names_are_checked_atomically_on_create_and_rename() {
         plaintext: format!("synthetic-credential-{id}"),
     };
     let update = |id: ClientApiKeyId, name: &str| UpdateClientKey {
+        request_profile_override_updates: Default::default(),
         id,
         name: name.to_owned(),
         label: None,
@@ -654,6 +659,7 @@ fn client_key_debug_redacts_plaintext() {
     let secret = format!("sk_{}", "s".repeat(43));
     let key = NewClientApiKey {
         user_id: None,
+        request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: "key-1".to_owned(),
         name: "default".to_owned(),
@@ -664,4 +670,113 @@ fn client_key_debug_redacts_plaintext() {
         requests_per_minute: 0,
     };
     assert!(!format!("{key:?}").contains(&secret));
+}
+
+#[tokio::test]
+async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance() {
+    use gateway_admin::model::{
+        MutationActor, MutationContext,
+        client_keys::{NewClientKey, UpdateClientKey},
+    };
+    use gateway_core::{account::OpaqueProviderData, policy::RateLimits};
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("key_profiles").await else {
+        return;
+    };
+    let store = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "profile-test".to_owned(),
+    };
+    let profile = OpaqueProviderData::new(
+        serde_json::json!({"client":"cli","platform":"linux","versionMode":"latest"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let id = ClientApiKeyId::new("key_profile").unwrap();
+    let openai = gateway_core::routing::ProviderKind::new("openai").unwrap();
+    let xai = gateway_core::routing::ProviderKind::new("xai").unwrap();
+    let (_, record) = store
+        .create_client_key(
+            NewClientKey {
+                user_id: Some("test-owner".to_owned()),
+                id: id.clone(),
+                name: "profile".to_owned(),
+                label: None,
+                group_ids: vec![],
+                limits: RateLimits::unlimited(),
+                budget: Default::default(),
+                plaintext: "synthetic-profile-test-key".to_owned(),
+                request_profile_overrides: BTreeMap::from([
+                    (openai.clone(), profile.clone()),
+                    (xai.clone(), profile.clone()),
+                ]),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        record.request_profile_overrides.get(&openai),
+        Some(&profile)
+    );
+    assert_eq!(record.request_profile_overrides.get(&xai), Some(&profile));
+    let update = |override_value: Option<Option<OpaqueProviderData>>| UpdateClientKey {
+        id: id.clone(),
+        name: "profile".to_owned(),
+        label: None,
+        group_ids: vec![],
+        limits: RateLimits::unlimited(),
+        daily_limit_usd: None,
+        weekly_limit_usd: None,
+        request_profile_override_updates: override_value
+            .map(|profile| BTreeMap::from([(openai.clone(), profile)]))
+            .unwrap_or_default(),
+    };
+    let (_, unchanged) = store
+        .update_client_key(update(None), &context)
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.request_profile_overrides.get(&openai),
+        Some(&profile)
+    );
+    assert_eq!(
+        unchanged.request_profile_overrides.get(&xai),
+        Some(&profile)
+    );
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.client_api_keys[0].request_profiles.values().next(),
+        Some(&profile)
+    );
+    assert_eq!(
+        snapshot.client_api_keys[0].request_profiles.get(&xai),
+        Some(&profile)
+    );
+    let mut clear_xai = update(None);
+    clear_xai
+        .request_profile_override_updates
+        .insert(xai.clone(), None);
+    let (_, cleared_xai) = store.update_client_key(clear_xai, &context).await.unwrap();
+    assert!(!cleared_xai.request_profile_overrides.contains_key(&xai));
+    assert_eq!(
+        cleared_xai.request_profile_overrides.get(&openai),
+        Some(&profile)
+    );
+    let (_, cleared) = store
+        .update_client_key(update(Some(None)), &context)
+        .await
+        .unwrap();
+    assert!(!cleared.request_profile_overrides.contains_key(&openai));
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert!(snapshot.client_api_keys[0].request_profiles.is_empty());
+    database.close().await;
 }

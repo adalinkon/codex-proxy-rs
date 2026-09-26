@@ -1,6 +1,9 @@
 //! 系统管理接口的查询与请求 wire contract。
+
 //!
 //! 这里不依赖更新服务或进程控制；应用层通过窄端口提供系统操作事实。
+
+use crate::auth::SessionState;
 
 use std::convert::Infallible;
 
@@ -17,13 +20,13 @@ use axum::{
 use futures::{Stream, StreamExt};
 use gateway_admin::model::system::{
     SystemOperationAccepted, SystemOperationKind, SystemOperationState, SystemOperationStatus,
-    SystemUpdateDetail, SystemUpdateEvent, SystemUpdateEventLevel, SystemUpdateStatus,
-    SystemVersion,
+    SystemUpdateChannel, SystemUpdateDetail, SystemUpdateEvent, SystemUpdateEventLevel,
+    SystemUpdatePolicy, SystemUpdateStatus, SystemVersion,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse, AdminSessionState,
+    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse,
     wire::map_admin_service_error,
 };
 
@@ -32,9 +35,15 @@ use super::{
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateDetailQuery {
     refresh: Option<bool>,
+    channel: Option<SystemUpdateChannel>,
 }
 
 impl UpdateDetailQuery {
+    #[must_use]
+    pub const fn channel(&self) -> Option<SystemUpdateChannel> {
+        self.channel
+    }
+
     /// 是否强制从发布源刷新。
     #[must_use]
     pub fn refresh(&self) -> bool {
@@ -47,6 +56,7 @@ impl UpdateDetailQuery {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRequest {
     target_version: String,
+    channel: Option<SystemUpdateChannel>,
 }
 
 impl UpdateRequest {
@@ -92,6 +102,7 @@ impl From<SystemVersion> for SystemVersionView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemUpdateDetailView {
+    policy: SystemUpdatePolicy,
     current_version: String,
     latest_version: String,
     has_update: bool,
@@ -112,6 +123,7 @@ impl From<SystemUpdateDetail> for SystemUpdateDetailView {
         Self {
             deployment_mode_label: deployment_mode_label(&detail.deployment_mode).to_owned(),
             build_type_label: build_type_label(&detail.build_type),
+            policy: detail.policy,
             current_version: detail.current_version,
             latest_version: detail.latest_version,
             has_update: detail.has_update,
@@ -160,6 +172,7 @@ impl From<SystemOperationState> for SystemOperationStateView {
 struct SystemUpdateStatusView {
     previous_version: Option<String>,
     current_version: Option<String>,
+    need_restart: bool,
     operation: SystemOperationStateView,
 }
 
@@ -168,6 +181,7 @@ impl From<SystemUpdateStatus> for SystemUpdateStatusView {
         Self {
             previous_version: status.previous_version,
             current_version: status.current_version,
+            need_restart: status.need_restart,
             operation: status.operation.into(),
         }
     }
@@ -179,7 +193,6 @@ struct UpdateAcceptedView {
     operation_id: String,
     deployment_mode: String,
     message: String,
-    need_restart: bool,
     target_version: String,
 }
 
@@ -214,7 +227,7 @@ struct SystemUpdateEventView {
 /// 构造固定 GET/POST 系统管理路由。
 pub fn router<S>() -> Router<S>
 where
-    S: AdminSessionState + Clone + Send + Sync + 'static,
+    S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/api/admin/system/version", get(version::<S>))
@@ -234,7 +247,7 @@ async fn version<S>(
     State(state): State<S>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let version = state
         .admin_services()
@@ -254,12 +267,12 @@ async fn update_detail<S>(
     AdminQuery(query): AdminQuery<UpdateDetailQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let detail = state
         .admin_services()
         .system()
-        .update_detail(query.refresh())
+        .update_detail(query.refresh(), query.channel())
         .await
         .map_err(map_system_error)?;
     Ok(AdminResponse::new(
@@ -273,7 +286,7 @@ async fn update_event_stream<S>(
     State(state): State<S>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let stream = state
         .admin_services()
@@ -293,31 +306,32 @@ async fn perform_update<S>(
     payload: Option<AdminJson<UpdateRequest>>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
+    let (target, channel) = payload.map_or((None, None), |AdminJson(value)| {
+        (Some(value.target_version), value.channel)
+    });
     let result = state
         .admin_services()
         .system()
-        .perform_update(payload.map(|AdminJson(value)| value.into_target_version()))
+        .perform_update(target, channel)
         .await
         .map_err(map_system_error)?;
     let SystemOperationAccepted::Update {
         operation_id,
         deployment_mode,
         message,
-        need_restart,
         target_version,
     } = result
     else {
         return Err(AdminError::internal());
     };
     Ok(AdminResponse::new(
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         AdminEnvelope::ok(UpdateAcceptedView {
             operation_id,
             deployment_mode,
             message,
-            need_restart,
             target_version,
         }),
     ))
@@ -328,7 +342,7 @@ async fn update_status<S>(
     State(state): State<S>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let status = state
         .admin_services()
@@ -347,7 +361,7 @@ async fn rollback<S>(
     State(state): State<S>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()
@@ -378,7 +392,7 @@ async fn restart<S>(
     State(state): State<S>,
 ) -> Result<impl IntoResponse, AdminError>
 where
-    S: AdminSessionState + Send + Sync,
+    S: SessionState + Send + Sync,
 {
     let result = state
         .admin_services()

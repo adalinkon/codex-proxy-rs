@@ -1,8 +1,8 @@
 <script setup lang="ts">
+import type { BaseTableColumn } from '@codex-proxy/ui'
 import type { UsageDisplayRecord } from '../utils/records'
-import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
+import { BaseTable } from '@codex-proxy/ui'
 import { Minimize2 } from '@lucide/vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import {
   usageAccountText,
@@ -40,6 +40,15 @@ withDefaults(
     :loading="loading"
     :empty-text="emptyText"
   >
+    <template #clientApiKeyName="{ displayValue }">
+      <span
+        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+        :title="String(displayValue)"
+      >
+        {{ displayValue }}
+      </span>
+    </template>
+
     <template #provider="{ row }">
       <ProviderIconGroup
         :provider="String(row.provider || '')"
@@ -53,6 +62,13 @@ withDefaults(
         :title="usageAccountText(row)"
       >
         {{ usageAccountText(row) }}
+      </span>
+      <span
+        v-if="row.accountNotes?.trim()"
+        class="mt-1 block max-w-full truncate text-cp-xs font-emphasis text-cp-text-quaternary"
+        :title="row.accountNotes"
+      >
+        {{ row.accountNotes }}
       </span>
     </template>
 

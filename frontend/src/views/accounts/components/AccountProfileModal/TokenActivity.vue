@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import type { ProfileActivityLevel, ProfileActivityMode } from '../../utils/accountProfileStatistics'
 import type { AccountProfileDailyUsage } from '@/api'
-import { computed, shallowRef } from 'vue'
+import { BaseEmpty, BaseSegmented } from '@codex-proxy/ui'
 
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import { computed, shallowRef } from 'vue'
 import { buildProfileActivityGrid, profileActivityCellLabel } from '../../utils/accountProfileStatistics'
 
 const props = defineProps<{
@@ -47,7 +46,7 @@ const monthLabels = computed(() =>
     <BaseEmpty
       v-if="dailyUsage === null"
       title="暂无 Token 活动"
-      description="本次未获取到每日 Token 活动。"
+      description="本次未获取到每日 Token 活动"
       size="sm"
       surface="none"
     />

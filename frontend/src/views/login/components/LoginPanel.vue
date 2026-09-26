@@ -1,13 +1,9 @@
 <script setup lang="ts">
+import { BaseButton, BaseCard, BaseFormItem, BaseIconButton, BaseInput } from '@codex-proxy/ui'
 import { Eye, EyeOff, KeyRound, Mail, Moon, Sun } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
 
 import AppBrandMark from '@/components/AppBrandMark.vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 
 type ThemeName = 'light' | 'dark'
 

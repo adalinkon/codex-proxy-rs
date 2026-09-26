@@ -8,7 +8,11 @@ pub mod auth;
 pub mod backup;
 pub mod client_distribution;
 pub mod client_keys;
+pub mod import_tasks;
 pub mod observability;
+pub mod plugin_client_keys;
+pub mod plugins;
+pub mod pricing;
 pub mod provider_credentials;
 pub mod proxies;
 pub mod quota_forecast;
@@ -22,6 +26,7 @@ pub mod users;
 pub enum AdminErrorKind {
     Invalid,
     Unauthorized,
+    Forbidden,
     NotFound,
     Conflict,
     RateLimited,

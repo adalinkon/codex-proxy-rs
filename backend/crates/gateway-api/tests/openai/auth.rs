@@ -1,9 +1,120 @@
-use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use axum::http::{
+    HeaderMap, HeaderValue, Method, StatusCode,
+    header::{self, AUTHORIZATION},
+};
+use futures::future::BoxFuture;
 
 use gateway_api::openai::auth::{
     ClientApiKeyAuthError, bearer_client_api_key, identify_codex_client,
 };
-use gateway_core::policy::CodexClientKind;
+use gateway_core::{
+    engine::{
+        authentication::ClientAuthenticationRequest,
+        execution::{
+            AuthenticatedClient, ClientAuthenticationError, ExecutionService, StartExecution,
+            StartProviderExecution, StartedExecution,
+        },
+    },
+    error::{GatewayError, GatewayErrorKind},
+    policy::CodexClientKind,
+    routing::PublicModelId,
+};
+use tower::ServiceExt as _;
+
+struct EnvelopeAuthentication {
+    client: AuthenticatedClient,
+    calls: AtomicUsize,
+}
+
+impl ExecutionService for EnvelopeAuthentication {
+    fn authenticate(&self, _: &str) -> Result<AuthenticatedClient, ClientAuthenticationError> {
+        Err(ClientAuthenticationError::InvalidKey)
+    }
+
+    fn authenticate_request(
+        &self,
+        request: ClientAuthenticationRequest,
+    ) -> BoxFuture<'_, Result<AuthenticatedClient, ClientAuthenticationError>> {
+        assert_eq!(request.authorization(), "External controlled-credential");
+        let debug = format!("{request:?}");
+        for private in [
+            "controlled-credential",
+            "controlled-fixture",
+            "private-client",
+            "192.0.2.9",
+        ] {
+            assert!(!debug.contains(private));
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let client = self.client.clone();
+        Box::pin(async move { Ok(client) })
+    }
+
+    fn public_models(&self, _: &AuthenticatedClient) -> Vec<PublicModelId> {
+        Vec::new()
+    }
+
+    fn contains_public_model(&self, _: &AuthenticatedClient, _: &PublicModelId) -> bool {
+        false
+    }
+
+    fn start(&self, _: StartExecution) -> BoxFuture<'_, Result<StartedExecution, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Internal,
+                "authentication envelope test must not execute",
+            ))
+        })
+    }
+
+    fn start_provider_endpoint(
+        &self,
+        _: StartProviderExecution,
+    ) -> BoxFuture<'_, Result<StartedExecution, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Internal,
+                "authentication envelope test must not execute",
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn plugin_authentication_envelope_contains_only_authorization() {
+    let fixture = crate::admin::AdminTestFixture::new().await;
+    let execution = Arc::new(EnvelopeAuthentication {
+        client: super::authenticated_client("unused-native-key"),
+        calls: AtomicUsize::new(0),
+    });
+    let app = super::api_router_with_admin_and_execution(fixture.services, execution.clone());
+    let mut request = crate::support::empty_request(Method::GET, "/v1/models");
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("External controlled-credential"),
+    );
+    request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("admin_session=controlled-fixture"),
+    );
+    request.headers_mut().insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("private-client"),
+    );
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("192.0.2.9"));
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(execution.calls.load(Ordering::SeqCst), 1);
+}
 
 #[test]
 fn bearer_client_api_key_should_reject_missing_authorization() {
@@ -179,4 +290,122 @@ fn cli_user_agent_should_expose_semver_or_recognized_missing_version() {
             .version()
             .is_none()
     );
+}
+
+#[test]
+fn chatgpt_remote_desktop_without_app_version_should_not_use_a_version_gate() {
+    for name in [
+        "codex_chatgpt_android_remote",
+        "codex_chatgpt_ios_remote",
+        "codex_chatgpt_future_os_remote",
+    ] {
+        for remote_version in ["dev", "1.2.3"] {
+            for (product, originator) in [
+                ("Codex Desktop", None),
+                ("codex_cli_rs", Some("Codex Desktop")),
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "user-agent",
+                    HeaderValue::from_str(&format!(
+                        "{product}/0.154.0-alpha.6.2 (Windows 10.0.26200; x86_64) unknown ({name}; {remote_version})"
+                    ))
+                    .unwrap(),
+                );
+                if let Some(originator) = originator {
+                    headers.insert("originator", HeaderValue::from_static(originator));
+                }
+                assert_eq!(identify_codex_client(&headers), None, "{headers:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn chatgpt_remote_marker_should_require_a_complete_exact_client_suffix() {
+    for suffix in [
+        "(codex_chatgpt_android_remote_extra; dev)",
+        "(unofficial_codex_chatgpt_ios_remote; dev)",
+        "(codex_chatgpt__remote; dev)",
+        "(codex_chatgpt_remote; dev)",
+        "(codex_chatgpt_future os_remote; dev)",
+        "(codex_chatgpt_future;os_remote; dev)",
+        "codex_chatgpt_android_remote; dev",
+        "(codex_chatgpt_android_remote; dev",
+        "(codex_chatgpt_android_remote; dev) trailing",
+        "(codex_chatgpt_android_remote; dev) (another_client; dev)",
+        "(codex_chatgpt_android_remote; )",
+        "(another_client; codex_chatgpt_android_remote)",
+        "(Codex Desktop; dev)",
+        "(Codex Desktop; ) (codex_chatgpt_android_remote; dev)",
+        "(Codex Desktop; invalid) (codex_chatgpt_ios_remote; dev)",
+        "(Codex Desktop)",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_str(&format!("Codex Desktop/0.154.0-alpha.6.2 {suffix}")).unwrap(),
+        );
+        let client = identify_codex_client(&headers).expect("Desktop still requires a version");
+        assert_eq!(client.kind(), CodexClientKind::Desktop, "{suffix}");
+        assert!(client.version().is_none(), "{suffix}");
+    }
+}
+
+#[test]
+fn chatgpt_remote_desktop_should_preserve_explicit_version_validation() {
+    for (value, expected) in [
+        (
+            HeaderValue::from_static("26.908.70816"),
+            Some("26.908.70816"),
+        ),
+        (HeaderValue::from_static("26.1.0"), Some("26.1.0")),
+        (HeaderValue::from_static("dev"), None),
+        (HeaderValue::from_static(""), None),
+        (HeaderValue::from_bytes(&[0xff]).unwrap(), None),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("version", value);
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(
+                "Codex Desktop/0.154.0-alpha.6.2 (codex_chatgpt_android_remote; dev)",
+            ),
+        );
+        let client = identify_codex_client(&headers).expect("explicit Desktop version");
+        assert_eq!(client.kind(), CodexClientKind::Desktop);
+        assert_eq!(
+            client.version().map(ToString::to_string).as_deref(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn chatgpt_remote_marker_should_not_override_an_existing_desktop_version_suffix() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "user-agent",
+        HeaderValue::from_static(
+            "Codex Desktop/0.154.0-alpha.6.2 (Codex Desktop; 26.1.0) (codex_chatgpt_ios_remote; dev)",
+        ),
+    );
+    let client = identify_codex_client(&headers).expect("Desktop version remains available");
+    assert_eq!(client.version().unwrap().to_string(), "26.1.0");
+}
+
+#[test]
+fn chatgpt_remote_suffix_created_by_header_truncation_should_not_skip_the_gate() {
+    let suffix = " (codex_chatgpt_android_remote; dev)";
+    let mut user_agent = "Codex Desktop/0.154.0-alpha.6.2 ".to_owned();
+    user_agent.push_str(&"x".repeat(4096 - user_agent.len() - suffix.len()));
+    user_agent.push_str(suffix);
+    user_agent.push_str(" (another_client; dev)");
+    let mut headers = HeaderMap::new();
+    headers.insert("user-agent", HeaderValue::from_str(&user_agent).unwrap());
+
+    let client =
+        identify_codex_client(&headers).expect("incomplete headers still require a version");
+    assert_eq!(client.kind(), CodexClientKind::Desktop);
+    assert!(client.version().is_none());
 }

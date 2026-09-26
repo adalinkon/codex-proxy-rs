@@ -155,6 +155,79 @@ async fn late_upstream_migrations_run_once_and_match_a_fresh_install() {
     fresh.close().await;
 }
 
+#[tokio::test]
+async fn existing_fork_upgrades_without_losing_users_keys_grants_or_budget_resets() {
+    let old = Migrator::with_migrations(
+        TEST_MIGRATOR
+            .iter()
+            .filter(|migration| {
+                migration.version <= 6 || migration.version >= UPSTREAM_VERSION_LIMIT
+            })
+            .cloned()
+            .collect(),
+    );
+    let Some(upgraded) = TestDatabase::create_with_migrator("fork_upgrade", &old).await else {
+        return;
+    };
+    sqlx::raw_sql("insert into account_groups(id,name,color,created_at,updated_at)
+        values('grp_00000000000000000000000000000001','existing group','#112233FF',now(),now());
+        insert into user_account_groups values('test-owner','grp_00000000000000000000000000000001');
+        insert into client_api_keys(id,name,key,user_id,created_at,updated_at)
+        values('existing-key','existing key','test-migration-key','test-owner',now(),now());
+        insert into user_charge_events values('existing-request','test-owner','existing-key',1.25,now());
+        update admin_users set daily_limit_usd=10,budget_reset_at='2026-09-20T00:00:00Z' where id='test-owner';
+        insert into user_budget_reset_operations values('00000000-0000-0000-0000-000000000001','test-owner','2026-09-20T00:00:00Z');")
+        .execute(&upgraded.pool).await.unwrap();
+    let before = applied_migrations(&upgraded.pool).await;
+    let saved: Vec<String> = sqlx::query_scalar(
+        "select row_to_json(t)::text from admin_users t union all
+        select row_to_json(t)::text from user_account_groups t union all
+        select row_to_json(t)::text from user_charge_events t union all
+        select row_to_json(t)::text from user_budget_reset_operations t order by 1",
+    )
+    .fetch_all(&upgraded.pool)
+    .await
+    .unwrap();
+    TEST_MIGRATOR.run(&upgraded.pool).await.unwrap();
+    let after = applied_migrations(&upgraded.pool).await;
+    assert_eq!(after.len(), TEST_MIGRATOR.iter().count());
+    for applied in before {
+        assert!(after.contains(&applied));
+    }
+    let retained: Vec<String> = sqlx::query_scalar(
+        "select row_to_json(t)::text from admin_users t union all
+        select row_to_json(t)::text from user_account_groups t union all
+        select row_to_json(t)::text from user_charge_events t union all
+        select row_to_json(t)::text from user_budget_reset_operations t order by 1",
+    )
+    .fetch_all(&upgraded.pool)
+    .await
+    .unwrap();
+    assert_eq!(saved, retained);
+    let key: (String, String, String) =
+        sqlx::query_as("select name,key,user_id from client_api_keys where id='existing-key'")
+            .fetch_one(&upgraded.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        key,
+        (
+            "existing key".into(),
+            "test-migration-key".into(),
+            "test-owner".into()
+        )
+    );
+    TEST_MIGRATOR.run(&upgraded.pool).await.unwrap();
+    assert_eq!(after, applied_migrations(&upgraded.pool).await);
+    let fresh = TestDatabase::create("fork_upgrade_fresh").await.unwrap();
+    assert_eq!(
+        schema_definition(&upgraded.pool).await,
+        schema_definition(&fresh.pool).await
+    );
+    upgraded.close().await;
+    fresh.close().await;
+}
+
 async fn applied_migrations(pool: &PgPool) -> Vec<(i64, Vec<u8>, DateTime<Utc>)> {
     sqlx::query_as(
         "select version, checksum, installed_on from _sqlx_migrations where success order by version"

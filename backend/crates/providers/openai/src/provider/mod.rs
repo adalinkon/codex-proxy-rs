@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use gateway_core::account::{AccountFeedbackStats, ProviderAccount};
 use gateway_core::engine::continuation::{ContinuationBinding, NativeContinuationScope};
+use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_core::engine::provider::{
     ContinuationRequestObservation, EventStream, Provider, ProviderCallMetadata, ProviderRequest,
     ProviderRequestObservation, ProviderSelectionObservation, ProviderStream,
@@ -28,8 +29,8 @@ use gateway_core::event::{
 };
 use gateway_core::lifecycle::CancellationToken;
 use gateway_core::operation::{
-    GenerateRequest, ImageRequest, ImageRequestKind, Operation, OperationKind,
-    ProviderSessionState, StandaloneSearchRequest,
+    CapabilityRequirements, GenerateRequest, ImageRequest, ImageRequestKind, Operation,
+    OperationKind, ProviderSessionState, StandaloneSearchRequest,
 };
 use gateway_core::provider_ports::ProviderSessionAffinityKey;
 use gateway_core::routing::{
@@ -45,7 +46,7 @@ use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
 use gateway_protocol::openai::events::{
     ParsedRateLimits, parse_rate_limit_headers, rate_limits_to_header_pairs,
 };
-use reqwest::Client;
+use reqwest::{Client, header::HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -72,7 +73,7 @@ use crate::transport::diagnostics::{
     CodexFailureCategory, CodexUpstreamFailure, CodexUpstreamSendPhase,
 };
 use crate::transport::profile::{
-    APPCAST_POLL_INTERVAL, CodexDesktopReleaseService, CodexRequestLocation, CodexWireProfileState,
+    APPCAST_POLL_INTERVAL, CodexDesktopReleaseService, CodexWireProfileState,
 };
 use crate::transport::protocol::responses::{
     CodexResponsesRequest, PREVIOUS_RESPONSE_NOT_FOUND_CODE, PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
@@ -80,24 +81,28 @@ use crate::transport::protocol::responses::{
 };
 use crate::transport::protocol::websocket::WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE;
 use crate::transport::request::{
-    CodexRequestEncodeError, RequestAccountScope, encode_generate_request, scope_request_to_account,
+    CodexRequestEncodeError, RequestAccountScope, align_structured_location_fields,
+    encode_generate_request, scope_request_to_account,
 };
 use crate::transport::session::CodexSessionIdentity;
 use crate::transport::usage::normalize_service_tier;
-use crate::transport::websocket::{CodexWebSocketExchangeError, PreviousResponseUnavailableReason};
+use crate::transport::websocket::{
+    CodexWebSocketExchangeError, PreviousResponseUnavailableReason, WEBSOCKET_CLOSE_MESSAGE_TOO_BIG,
+};
 use crate::transport::{
     CODEX_ALPHA_SEARCH_PATH, CODEX_IMAGE_EDITS_PATH, CODEX_IMAGE_GENERATIONS_PATH,
     CODEX_RESPONSES_PATH, CodexAccountSelectionTelemetry, CodexBackendClient,
     CodexBackendJsonResponse, CodexBackendStreamingResponse, CodexBackendTransport,
     CodexClientError, CodexRateLimitUpdates, CodexRequestContext, CodexResponseMetadata,
-    CodexTransportMetrics, CodexTurnStateUpdate, CodexUpstreamDiagnostics, CodexWebSocketPool,
-    endpoint_url,
+    CodexResponseMetadataUpdates, CodexTransportMetrics, CodexUpstreamDiagnostics,
+    CodexWebSocketPool, endpoint_url, normalize_selected_codex_downstream_body,
 };
 
 mod execution;
 mod failure;
 mod observation;
 mod workers;
+pub(crate) use workers::ClientReleaseServices;
 
 use execution::*;
 #[doc(hidden)]
@@ -135,13 +140,13 @@ pub enum CodexProviderConfigError {
     InvalidBaseUrl,
 }
 
+#[derive(Clone)]
 pub struct CodexProvider {
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
     account_feedback: Arc<AccountFeedbackStats>,
     client: CodexBackendClient,
-    location: Option<CodexRequestLocation>,
     responses_url: Url,
     image_generations_url: Url,
     image_edits_url: Url,
@@ -151,7 +156,84 @@ pub struct CodexProvider {
     stream_max_retries: u32,
 }
 
+struct PreparedGenerateRequest {
+    upstream: CodexResponsesRequest,
+    previous_session: Option<OpenAiSessionState>,
+    continuation_requested: bool,
+    session_affinity: Option<CodexSessionAffinity>,
+    cyber_policy_session_key: Option<ProviderSessionAffinityKey>,
+}
+
+struct SelectedGenerate {
+    lease: CodexCredentialLease,
+    session_affinity: Option<CodexSessionAffinity>,
+    cyber_policy_key: Option<ProviderSessionAffinityKey>,
+    account_selection_wait_ms: u64,
+    frozen_requirements: CapabilityRequirements,
+}
+
 impl CodexProvider {
+    fn prepare_generate_request(
+        &self,
+        generate: &GenerateRequest,
+        upstream_model: &UpstreamModelId,
+        context: &AttemptContext,
+    ) -> Result<PreparedGenerateRequest, ProviderError> {
+        let previous_session = decode_openai_session_state(generate);
+        let continuation_requested = generate.native_continuation_requested();
+        let mut upstream = encode_generate_request(generate, upstream_model.as_str(), None)
+            .map_err(map_request_error)?;
+        // 插件加工后仍重新应用宿主强制策略与本地会话身份。
+        upstream.apply_fast_policy(context.disable_fast());
+        if let Some(conversation_id) = previous_session
+            .as_ref()
+            .and_then(|state| state.conversation_id.as_ref())
+        {
+            upstream.local_conversation_id = Some(conversation_id.clone());
+        }
+        if let Some(identity) = &self.session_identity {
+            identity.prepare_local_conversation(&mut upstream);
+        }
+        if let Some(previous_session) = previous_session.as_ref() {
+            upstream.turn_state = if same_client_turn(
+                previous_session.client_turn_id.as_deref(),
+                upstream.client_turn_id.as_deref(),
+            ) {
+                upstream
+                    .turn_state
+                    .take()
+                    .or_else(|| previous_session.turn_state.clone())
+            } else {
+                None
+            };
+        }
+        let session_affinity =
+            derive_codex_session_affinity(&upstream, context.client_api_key_ref());
+        let cyber_policy_session_key =
+            derive_codex_cyber_policy_session_key(&upstream, context.client_api_key_ref());
+        Ok(PreparedGenerateRequest {
+            upstream,
+            previous_session,
+            continuation_requested,
+            session_affinity,
+            cyber_policy_session_key,
+        })
+    }
+
+    fn client_for_request(
+        &self,
+        context: &AttemptContext,
+    ) -> Result<CodexBackendClient, ProviderError> {
+        let Some(profile) = context.request_profile() else {
+            return Ok(self.client.clone());
+        };
+        let profile = serde_json::from_value(Value::Object(profile.expose_to_provider().clone()))
+            .map_err(|_| {
+            provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
+        })?;
+        Ok(self.client.clone().with_request_profile(profile))
+    }
+
     // Provider 构造集中装配独立领域服务和透明传输依赖，拆分参数会模糊所有权。
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -174,7 +256,6 @@ impl CodexProvider {
             .map_err(|_| CodexProviderConfigError::InvalidBaseUrl)?;
         let search_url = Url::parse(&endpoint_url(&base_url, CODEX_ALPHA_SEARCH_PATH))
             .map_err(|_| CodexProviderConfigError::InvalidBaseUrl)?;
-        let location = profile.snapshot().location;
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
@@ -183,7 +264,6 @@ impl CodexProvider {
             quota,
             account_feedback,
             client,
-            location,
             responses_url,
             image_generations_url,
             image_edits_url,
@@ -212,6 +292,27 @@ impl fmt::Debug for CodexProvider {
 
 #[async_trait]
 impl Provider for CodexProvider {
+    fn resolve_request_profile(
+        &self,
+        configuration: &gateway_core::account::OpaqueProviderData,
+    ) -> Result<gateway_core::account::OpaqueProviderData, ProviderError> {
+        let selection =
+            crate::transport::profile::identity::RequestProfileSelection::parse(configuration)
+                .map_err(|_| {
+                    provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    )
+                })?;
+        let profile = selection
+            .resolve(self.client.profile_state())
+            .map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?;
+        crate::transport::profile::selection::object(&profile)
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))
+    }
+
     fn name(&self) -> &'static str {
         PROVIDER_NAME
     }
@@ -256,8 +357,7 @@ impl Provider for CodexProvider {
                 ..Default::default()
             };
         };
-        let Ok(encoded) = encode_generate_request(request, "observability", self.location.as_ref())
-        else {
+        let Ok(encoded) = encode_generate_request(request, "observability", None) else {
             return ProviderRequestObservation::default();
         };
         let semantics = encoded.semantics();
@@ -282,16 +382,27 @@ impl Provider for CodexProvider {
         }
     }
 
+    fn model_catalog_is_exhaustive(&self) -> bool {
+        false
+    }
+
     async fn query_model_capabilities(
         &self,
     ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
         let snapshot = self.catalog.synchronize().await.map_err(|_| {
             provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
         })?;
+        let mut accounts = snapshot.model_catalog_accounts();
         Ok(snapshot
             .models()
             .iter()
-            .map(compile_model_capabilities)
+            .map(|model| {
+                compile_model_capabilities(model).with_catalog_accounts(
+                    accounts
+                        .remove(model.request_model().as_str())
+                        .unwrap_or_default(),
+                )
+            })
             .collect())
     }
 
@@ -315,7 +426,7 @@ impl Provider for CodexProvider {
     }
 
     async fn execute(
-        &self,
+        self: Arc<Self>,
         request: ProviderRequest,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
@@ -356,57 +467,155 @@ impl Provider for CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         };
-        let previous_session = decode_openai_session_state(generate);
-        let continuation_requested = generate.native_continuation_requested();
-        let mut upstream_request =
-            encode_generate_request(generate, upstream_model.as_str(), self.location.as_ref())
-                .map_err(map_request_error)?;
-        if let Some(conversation_id) = previous_session
-            .as_ref()
-            .and_then(|state| state.conversation_id.as_ref())
-        {
-            upstream_request.local_conversation_id = Some(conversation_id.clone());
-        }
-        if let Some(identity) = &self.session_identity {
-            identity.prepare_local_conversation(&mut upstream_request);
-        }
-        if let Some(previous_session) = previous_session.as_ref() {
-            upstream_request.turn_state = if same_client_turn(
-                previous_session.client_turn_id.as_deref(),
-                upstream_request.client_turn_id.as_deref(),
-            ) {
-                upstream_request
-                    .turn_state
-                    .take()
-                    .or_else(|| previous_session.turn_state.clone())
-            } else {
-                None
-            };
-        }
-        let session_affinity =
-            derive_codex_session_affinity(&upstream_request, context.client_api_key_ref());
-        let cyber_policy_session_key =
-            derive_codex_cyber_policy_session_key(&upstream_request, context.client_api_key_ref());
-
+        // 其他协议必须先取得真实账号，再按固定 attempt 阶段调用转换器；选号前不能
+        // 把未知正文当成 OpenAI wire 解释会话、亲和或传输字段。
+        let preselection = (generate.protocol_payload().protocol() == PROVIDER_NAME)
+            .then(|| self.prepare_generate_request(generate, upstream_model, &context))
+            .transpose()?;
+        let (selection_session_affinity, selection_cyber_policy_key, requires_websocket) =
+            preselection.map_or((None, None, false), |prepared| {
+                let requires_websocket =
+                    transport_requirement(&prepared.upstream).requires_websocket()
+                        || (context.continuation_attempt() == ContinuationAttempt::Native
+                            && (prepared.previous_session.as_ref().is_some_and(|state| {
+                                state.continuation_scope
+                                    == OpenAiContinuationScope::ConnectionLocal
+                            }) || matches!(context.continuation(), Some(ContinuationBinding::Pinned(binding))
+                                    if binding.scope() == NativeContinuationScope::ConnectionLocal)));
+                (
+                    prepared.session_affinity,
+                    prepared.cyber_policy_session_key,
+                    requires_websocket,
+                )
+            });
         let selection_started_at = Instant::now();
-        let lease = self
-            .selector
-            .select_with_cyber_policy(
-                &SelectCodexCredential {
-                    upstream_model: upstream_model.as_str(),
-                    request_url: &self.responses_url,
-                    attempt: &context,
-                    session_affinity_key: session_affinity.as_ref().map(|affinity| affinity.key()),
-                },
-                cyber_policy_session_key.as_ref(),
-                session_affinity.as_ref(),
-            )
-            .await
-            .map_err(map_selection_error)?;
+        let selection = async {
+            self.selector
+                .select_with_cyber_policy(
+                    &SelectCodexCredential {
+                        upstream_model: upstream_model.as_str(),
+                        request_url: &self.responses_url,
+                        attempt: &context,
+                        session_affinity_key: selection_session_affinity
+                            .as_ref()
+                            .map(|affinity| affinity.key()),
+                    },
+                    selection_cyber_policy_key.as_ref(),
+                    selection_session_affinity.as_ref(),
+                    requires_websocket,
+                )
+                .await
+                .map_err(map_selection_error)
+        };
+        // 恢复期间排队也消耗启动窗口；只包住选账号，不限制业务响应时长。
+        let lease = if let Some(remaining) = context.connection_budget().startup_remaining() {
+            tokio::time::timeout(remaining, selection)
+                .await
+                .map_err(|_| {
+                    provider_error(ProviderErrorKind::Timeout, UpstreamSendState::NotSent)
+                })??
+        } else {
+            selection.await?
+        };
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let provider_kind = ProviderKind::new(PROVIDER_NAME)
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
+        let account_id = lease.account_id().clone();
+        let frozen_requirements = Operation::Generate(generate.clone()).capability_requirements();
+        let provider = Arc::clone(&self);
+        let terminal_context = context.clone();
+        let terminal_model = upstream_model.clone();
+        context
+            .execute_middleware(
+                Operation::Generate(generate.clone()),
+                provider_kind,
+                Some(upstream_model.as_str().to_owned()),
+                account_id,
+                Box::new(move |operation, middleware_headers| {
+                    Box::pin(async move {
+                        provider
+                            .execute_selected_generate(
+                                operation,
+                                middleware_headers,
+                                terminal_model,
+                                terminal_context,
+                                SelectedGenerate {
+                                    lease,
+                                    session_affinity: selection_session_affinity,
+                                    cyber_policy_key: selection_cyber_policy_key,
+                                    account_selection_wait_ms,
+                                    frozen_requirements,
+                                },
+                            )
+                            .await
+                    })
+                }),
+            )
+            .await
+    }
+}
+
+impl CodexProvider {
+    async fn execute_selected_generate(
+        self: Arc<Self>,
+        operation: Operation,
+        middleware_headers: Vec<MiddlewareHeader>,
+        upstream_model: UpstreamModelId,
+        context: AttemptContext,
+        selected: SelectedGenerate,
+    ) -> Result<ProviderStream, ProviderError> {
+        let SelectedGenerate {
+            mut lease,
+            session_affinity: selection_session_affinity,
+            cyber_policy_key: selection_cyber_policy_key,
+            account_selection_wait_ms,
+            frozen_requirements,
+        } = selected;
+        let Operation::Generate(generate) = operation else {
+            return Err(provider_error(
+                ProviderErrorKind::Protocol,
+                UpstreamSendState::NotSent,
+            ));
+        };
+        if generate.protocol_payload().protocol() != PROVIDER_NAME
+            || native_request_requirements(&generate) != frozen_requirements
+        {
+            return Err(provider_error(
+                ProviderErrorKind::InvalidRequest,
+                UpstreamSendState::NotSent,
+            ));
+        }
+        validate_openai_reasoning(generate.protocol_payload().body())?;
+        let processed = self.prepare_generate_request(&generate, &upstream_model, &context)?;
+        let mut upstream_request = processed.upstream;
+        let previous_session = processed.previous_session;
+        let continuation_requested = processed.continuation_requested;
+        let session_affinity = processed.session_affinity;
+        let cyber_policy_session_key = processed.cyber_policy_session_key;
+        if selection_session_affinity
+            .as_ref()
+            .map(|affinity| affinity.key())
+            != session_affinity.as_ref().map(|affinity| affinity.key())
+            || selection_cyber_policy_key.as_ref() != cyber_policy_session_key.as_ref()
+        {
+            self.selector
+                .validate_translated_selection(
+                    &mut lease,
+                    session_affinity.as_ref(),
+                    cyber_policy_session_key.as_ref(),
+                )
+                .await
+                .map_err(map_selection_error)?;
+        }
         let lease = Arc::new(lease);
-        // 首字计时的起点：账号选择完成之后、上游建立之前。
+        if previous_session.as_ref().is_some_and(|state| {
+            state
+                .credential_revision
+                .is_some_and(|revision| revision != lease.account().revision().get())
+        }) {
+            return Err(continuation_replay_required_error("scope_unavailable"));
+        }
         let output_started_at = Instant::now();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
@@ -497,8 +706,39 @@ impl Provider for CodexProvider {
             lease.installation_id(),
             account_scope,
         );
+        if matches!(
+            lease.authentication(),
+            crate::credential::CodexRuntimeAuthentication::OAuth(_)
+        ) {
+            normalize_selected_codex_downstream_body(
+                upstream_request.body_mut(),
+                generate.protocol_payload().context(),
+            );
+        }
+        if let Some(location) = lease
+            .account()
+            .request_location()
+            .or(context.request_location())
+        {
+            align_structured_location_fields(
+                upstream_request.body_mut(),
+                chrono::Utc::now(),
+                location,
+            );
+        }
         let requirement = transport_requirement(&upstream_request);
-        let requested_transport = selected_transport(&upstream_request);
+        let http_only = lease.transport() == crate::credential::ResponsesTransport::Http;
+        if http_only && requirement.requires_websocket() {
+            return Err(provider_error(
+                ProviderErrorKind::Unsupported,
+                UpstreamSendState::NotSent,
+            ));
+        }
+        let requested_transport = if http_only {
+            CodexProviderTransport::HttpOnly
+        } else {
+            selected_transport(&upstream_request)
+        };
         let session_http_fallback = requirement.allows_pre_send_http_fallback()
             && session_affinity
                 .as_ref()
@@ -510,6 +750,19 @@ impl Provider for CodexProvider {
         } else {
             requested_transport
         };
+        if transport == CodexProviderTransport::PreferWebSocket
+            && middleware_headers.iter().any(|header| {
+                match HeaderValue::from_bytes(header.value()) {
+                    Ok(value) => value.to_str().is_err(),
+                    Err(_) => true,
+                }
+            })
+        {
+            return Err(provider_error(
+                ProviderErrorKind::Protocol,
+                UpstreamSendState::NotSent,
+            ));
+        }
         apply_transport(&mut upstream_request, transport);
         let metadata = ProviderCallMetadata::new(
             provider_kind,
@@ -527,6 +780,11 @@ impl Provider for CodexProvider {
         let session_capture =
             (!continuation_requested || previous_session.is_some()).then(|| OpenAiSessionCapture {
                 account_id: lease.account_id().as_str().to_owned(),
+                credential_revision: matches!(
+                    lease.authentication(),
+                    crate::credential::CodexRuntimeAuthentication::ApiKey(_)
+                )
+                .then_some(lease.account().revision().get()),
                 conversation_id: upstream_request.local_conversation_id.clone(),
                 turn_state: upstream_request.turn_state.clone(),
                 client_turn_id: upstream_request.client_turn_id.clone(),
@@ -543,12 +801,18 @@ impl Provider for CodexProvider {
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
         let events = cold_response_stream(ColdResponse {
-            client: self.client.for_account(lease.account()).map_err(|_| {
-                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-            })?,
+            client: self
+                .client_for_request(&context)?
+                .for_account(lease.account())
+                .map_err(|_| {
+                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+                })?
+                .with_authentication(lease.authentication())
+                .with_connection_budget(context.connection_budget().clone())
+                .with_middleware_headers(middleware_headers),
             response_origin: self.responses_url.clone(),
             request: upstream_request,
-            upstream_model: upstream_model.clone(),
+            upstream_model,
             transport_policy: transport,
             context,
             selector: Arc::clone(&self.selector),
@@ -573,4 +837,35 @@ impl Provider for CodexProvider {
             stream
         })
     }
+}
+
+fn native_request_requirements(request: &GenerateRequest) -> CapabilityRequirements {
+    // 此处只解释已知 OpenAI wire；不在 Core 的通用转换路径推断任意目标协议。
+    Operation::Generate(GenerateRequest::from_protocol_payload(
+        request.protocol_payload().clone(),
+    ))
+    .capability_requirements()
+}
+
+fn validate_openai_reasoning(body: &Map<String, Value>) -> Result<(), ProviderError> {
+    let Some(effort) = body
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+    else {
+        return Ok(());
+    };
+    let Some(effort) = effort.as_str() else {
+        return Err(provider_error(
+            ProviderErrorKind::InvalidRequest,
+            UpstreamSendState::NotSent,
+        ));
+    };
+    if effort.is_empty() || effort.len() > 64 || effort.chars().any(char::is_control) {
+        return Err(provider_error(
+            ProviderErrorKind::InvalidRequest,
+            UpstreamSendState::NotSent,
+        ));
+    }
+    Ok(())
 }
