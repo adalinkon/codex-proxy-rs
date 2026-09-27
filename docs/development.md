@@ -48,7 +48,7 @@ pnpm --dir frontend build:source
 pnpm --dir modules/plugins/examples/workbench/frontend build:source
 ```
 
-`build:source` 用各项目的 `tsconfig.source.json` 检查源码类型，再构建到各自 `.vite/source-dist`，不改写正式依赖、锁文件或 `dist`。正常 `dev`、`build`、宿主发行 CI 和 Docker 仍消费锁定的 UI 包，无需初始化子模块。CI 另有源码联调检查，显式检出子模块、核对 UI 提交锁定并验证这两个命令。
+`build:source` 用各项目的 `tsconfig.source.json` 检查源码类型，管理端构建到 `frontend/node_modules/.vite/source-dist`，示例构建到其前端项目的 `.vite/source-dist`，不改写正式依赖、锁文件或 `dist`。正常 `dev`、`build`、宿主发行 CI 和 Docker 仍消费锁定的 UI 包，无需初始化子模块。CI 另有源码联调检查，显式检出子模块、核对 UI 提交锁定并验证这两个命令。
 
 ### 本地 SDK 验证
 

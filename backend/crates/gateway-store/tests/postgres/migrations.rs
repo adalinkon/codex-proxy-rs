@@ -157,11 +157,17 @@ async fn late_upstream_migrations_run_once_and_match_a_fresh_install() {
 
 #[tokio::test]
 async fn existing_fork_upgrades_without_losing_users_keys_grants_or_budget_resets() {
+    for last_upstream in [6, 18] {
+        assert_existing_fork_upgrade(last_upstream).await;
+    }
+}
+
+async fn assert_existing_fork_upgrade(last_upstream: i64) {
     let old = Migrator::with_migrations(
         TEST_MIGRATOR
             .iter()
             .filter(|migration| {
-                migration.version <= 6 || migration.version >= UPSTREAM_VERSION_LIMIT
+                migration.version <= last_upstream || migration.version >= UPSTREAM_VERSION_LIMIT
             })
             .cloned()
             .collect(),

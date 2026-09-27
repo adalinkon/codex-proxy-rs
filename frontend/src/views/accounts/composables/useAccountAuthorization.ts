@@ -1,7 +1,7 @@
 import type { AccountImportSettings, AccountOAuthStartResponse } from '@/api'
 import { computed, onScopeDispose, shallowRef } from 'vue'
 import { completeAccountOAuth, startAccountOAuth } from '@/api'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 type Status = 'idle' | 'starting' | 'waiting' | 'paused' | 'expired' | 'completing'
 

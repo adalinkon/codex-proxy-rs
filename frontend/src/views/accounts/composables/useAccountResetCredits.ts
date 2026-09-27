@@ -7,8 +7,7 @@ import {
 } from '@/api'
 
 import { ApiError } from '@/api/request'
-import { errorMessage } from '@/utils/async'
-import { generateRequestId } from '@/utils/uuid'
+import { errorMessage, generateRequestId } from '@/utils/operation'
 
 interface PendingResetCreditOperation {
   accountId: string

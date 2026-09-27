@@ -12,7 +12,7 @@ import { BaseButton, BaseFormItem, BaseIconButton, BaseInput, BaseSegmented, Bas
 import { Plus, RefreshCw, Trash2 } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import { getApiKeys } from '@/api'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 import PluginHelpPopover from './PluginHelpPopover.vue'
 
 const props = withDefaults(defineProps<{

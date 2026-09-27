@@ -173,6 +173,7 @@ impl AdminTestFixture {
             gateway_admin::ports::backup::BackupStorePorts::disabled(),
             plugin_ports.clone(),
             plugin_ports.clone(),
+            plugin_ports.clone(),
         )
         .with_request_usage(Arc::new(users::TestRequestUsageStore));
         let providers: Vec<Arc<dyn ProviderAdmin>> = vec![
@@ -614,6 +615,7 @@ impl SettingsStore for MemorySettingsStore {
             max_waiting_per_account: command.max_waiting_per_account,
             concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
             responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
+            smart_scheduling: command.smart_scheduling,
             rotation_strategy: command.rotation_strategy,
             min_codex_desktop_version: command.min_codex_desktop_version,
             min_codex_cli_version: command.min_codex_cli_version,
@@ -919,6 +921,19 @@ fn mutation(
 
 #[async_trait]
 impl ClientKeyStore for MemoryClientKeyStore {
+    async fn update_client_key_budget_limits(
+        &self,
+        _: gateway_admin::model::client_keys::UpdateClientKeyBudgetLimits,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetMutationOrigin,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Option<Revision>> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "client key",
+            "unused budget update",
+        ))
+    }
+
     async fn mutate_owned_key(
         &self,
         _: &str,
@@ -1063,6 +1078,9 @@ impl AccountStore for UnusedStore {
         _: TimeRange,
         _: &[String],
     ) -> AdminStoreResult<Vec<AccountUsage>> {
+        if self.account.lock().expect("account").is_some() {
+            return Ok(Vec::new());
+        }
         Err(unavailable("account usage"))
     }
 
@@ -1456,7 +1474,12 @@ impl ProviderAdmin for UnusedProvider {
         &self,
         _: gateway_admin::model::provider_credentials::ProviderQuotaRequest,
     ) -> Result<ProviderQuota, ProviderAdminError> {
-        Err(unsupported_provider())
+        Err(self
+            .error
+            .lock()
+            .expect("provider error")
+            .clone()
+            .unwrap_or_else(unsupported_provider))
     }
 
     async fn models(
@@ -1565,6 +1588,7 @@ fn test_runtime_settings() -> RuntimeSettings {
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+        smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
         rotation_strategy: RotationStrategy::Smart,
         min_codex_desktop_version: None,
         min_codex_cli_version: None,

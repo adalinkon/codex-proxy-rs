@@ -5,7 +5,7 @@ import { BaseEmpty, BaseFormItem, BaseInput, BaseTag } from '@codex-proxy/ui'
 
 import { computed, nextTick, shallowRef, useTemplateRef, watch } from 'vue'
 import SchemaForm from '@/components/SchemaForm/index.vue'
-import { jsonObjectError, parseJsonObject } from '@/utils/jsonObject'
+import { jsonObjectError, parseJsonObject } from '@/utils/data'
 import PluginHelpPopover from './PluginHelpPopover.vue'
 
 const props = withDefaults(defineProps<{

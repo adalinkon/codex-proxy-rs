@@ -4,14 +4,14 @@ import { Blocks, CircleAlert, RefreshCw } from '@lucide/vue'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, shallowRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { usePluginManagementViewsStore } from '@/stores/modules/plugin-management-views'
+import { usePluginViewsStore } from '@/stores/modules/plugin-views'
 import { pluginPageLocation } from '../utils/navigation'
 import PluginManagementFrame from './PluginManagementFrame.vue'
 import PluginPageLoading from './PluginPageLoading.vue'
 
 const route = useRoute()
 const router = useRouter()
-const directory = usePluginManagementViewsStore()
+const directory = usePluginViewsStore()
 const { pageViews, loading, loaded, loadError } = storeToRefs(directory)
 const frameReload = shallowRef(0)
 

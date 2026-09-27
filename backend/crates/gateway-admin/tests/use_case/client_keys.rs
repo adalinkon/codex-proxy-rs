@@ -32,6 +32,15 @@ struct TestClientKeyStore {
 
 #[async_trait]
 impl ClientKeyStore for TestClientKeyStore {
+    async fn update_client_key_budget_limits(
+        &self,
+        _: gateway_admin::model::client_keys::UpdateClientKeyBudgetLimits,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetMutationOrigin,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Option<Revision>> {
+        Err(unused())
+    }
+
     async fn mutate_owned_key(
         &self,
         _: &str,

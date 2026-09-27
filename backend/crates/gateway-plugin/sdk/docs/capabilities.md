@@ -54,6 +54,7 @@ Provider 固定为宿主内置的 OpenAI 与 xAI。插件提供以下扩展能�
 | `frontend_authentication` | `methods::FRONTEND_IDENTIFIER`、`methods::FRONTEND_AUTHENTICATE` |
 | `management` | `PluginBuilder::management`；公开回调另用 `methods::MANAGEMENT_CALLBACK` |
 | `command_line` | `PluginBuilder::command_line` |
+| `maintenance` | `methods::RECONCILE`；无需功能绑定 |
 
 ## 访问域
 
@@ -65,9 +66,13 @@ Provider 固定为宿主内置的 OpenAI 与 xAI。插件提供以下扩展能�
 | `network` | 通过 `host.http.*` 使用宿主受管出站网络；仍受统一代理、超时、大小和流控规则约束 |
 | `models` | 列出非秘密 Key、按所选 Key 查询模型，以及通过 `host.model.*` 调用模型；调用可能产生消耗 |
 | `accounts` | 查询账号、读取原始凭据及创建或替换账号；写入仍经过 revision CAS、审计和发布事务 |
-| `data` | 在管理／命令阶段只读全部账号的最小基础信息及已有额度观测，不包含凭据、写入或预测 |
+| `data` | 在管理／命令／维护阶段只读账号、Key 的最小基础信息及已有额度观测，不包含凭据、写入或预测 |
 | `requests` | 参与请求／响应处理、路由、调度、观察及亲和查询 |
 | `public_endpoints` | 提供无需登录即可访问的已声明静态资源或一次性票据回调 |
+| `groups` | 创建本实例分组，允许将所有现有及未来新增账号加入或移出这些分组，保留其他分组关系 |
+| `keys` | 创建仅绑定本实例分组的 Key，返回非秘密身份；不授予其他 Key 的修改或明文读取权限 |
+| `key_budgets` | 在管理／命令／维护阶段查询全部 Client Key 的预算、修改日／周金额上限，不读取密钥或修改其他 Key 配置 |
+| `quota_observations` | 在管理／命令／维护阶段读取及刷新全部账号的额度观测，不暴露凭据或执行上游额度重置 |
 
 `host.log` 和本插件声明的 `host.state.*` 是基础设施，不需要额外 permission。公开调用阶段不开放任何
 宿主回调；权限也不能把一个父调用的句柄、流或上下文转移到另一个调用。
@@ -79,15 +84,20 @@ Provider 固定为宿主内置的 OpenAI 与 xAI。插件提供以下扩展能�
 ### 基础事实
 
 纯展示页面声明 `management` 和 `data` 即可，不需要请求处理 binding 或 `accounts` 权限。
-`data` 是独立的管理员授权域，只允许 `management`、`command_line` 阶段使用；请求链、注册及公开回调均拒绝。
-它可读取全部账号的下列最小事实，不继承或授予客户端 Key 的模型执行权。
+`data` 是独立的管理员授权域，只允许 `management`、`command_line`、`maintenance` 阶段使用；请求链、注册及公开回调均拒绝。
+它可读取全部账号与 Key 的下列最小事实，不继承或授予客户端 Key 的模型执行权。
 
 | SDK 方法 | 回调 | 查询与结果 |
 | --- | --- | --- |
 | `call.host.account_facts(query)` | `host.data.accounts.list` | `AccountFactsQuery`：可选 `provider_id`、`cursor`，必填 `limit`（1～200）；按账号 ID 升序，`next_cursor=null` 表示本页已结束 |
 | `call.host.quota_facts(query)` | `host.data.quota.get` | `QuotaFactsQuery { account_id }`：读取 Provider 现有观测，不访问上游刷新 |
+| `call.host.key_facts(query)` | `host.data.keys.get` | `ClientKeyFactsQuery { client_key_id }`：读取当前 Key 的启用状态及显式分组 ID，不返回密钥 |
 
 类型在 `call::data`。控制参数为 `{}`，查询和结果使用二进制 JSON；结果固定 `schema_version=1`。
+
+`key_facts` 每次读取当前管理数据，返回 `client_key_id`、`enabled`、`group_ids`；不存在的 Key 沿用事实接口的 `rejected` 错误。它需要 `data` 权限，`keys`、`key_budgets` 和 `quota_observations` 权限不能替代。原有 Key 目录响应保持不变。旧宿主不支持新增方法，插件应将包含该方法的宿主版本声明为最低兼容版本。
+
+`group_ids` 表示显式绑定，包含停用分组，不是最终可路由账号集合；空绑定也不代表单账号范围。通过 `account_facts` 关联账号时需完整遍历分页，结果包含停用账号。跨查询关联及同步策略由插件负责，这些调用不构成跨查询事务，管理员修改绑定后应重新检查。
 账号仅返回 `account_id`、`provider_id`、`group_ids`、`enabled` 和 `updated_at_ms`，不附带姓名、邮箱、令牌或代理信息。
 额度仅返回观测时间与窗口的 `key`、`window_seconds`、`used_percent`、`reset_at_ms`。
 时间均为 UTC Unix 毫秒，比例为百分数；未知值保留 `null`，不能解释为 0。`observed_at_ms=null` 表示没有可用观测时间，
@@ -107,6 +117,25 @@ for account in page.accounts {
 已有 `usage` 观察提供请求最终用量、时间和结算事实；该投递有界、不是历史补偿接口。
 本接口不提供 SQL、池汇总、健康分、额度预测或历史使用记录查询；插件结果保存在自身 `host.state.*` 中。
 
+### 额度观测刷新
+
+`quota_observations` 授权访问所有当前及未来账号的额度观测。它与只读 `data`、含原始凭据的 `accounts`
+分别授权；不会授予账号目录、凭据读取、账号修改、上游额度重置或 Key 预算操作权限。
+需要枚举账号时另行声明 `data`，已知账号 ID 时可直接查询或刷新。
+
+- `call.host.quota_facts(query)` / `host.data.quota.get`：`data` 或 `quota_observations` 任一域可读取已有快照，不访问上游。
+- `call.host.refresh_account_quota(query)` / `host.quota_observations.refresh`：仅 `quota_observations` 可请求 Provider 刷新观测。
+
+两个方法仅在 `management`、`command_line`、`maintenance` 阶段开放；均使用 `call::data::QuotaFactsQuery`
+和 `QuotaFacts`，控制参数为 `{}`，输入输出在二进制 JSON 中。刷新复用原生 Provider 的凭据、代理、超时及
+观测落库规则，返回同一最小事实投影，不返回凭据、预测、个人资料或 Provider 原始响应。
+刷新观测不会消费额度重置券，也不会自动重置任何 Key；Provider 仍可能依据真实上游响应更新账号可用性观测。
+
+接口不承诺每次得到不同的周期或样本，也不保证结果对应一个账号重置事件。不存在账号返回 `rejected`；
+Provider 不支持刷新（如 OpenAI URL + Key 账号）返回 `invalid_input`，其他失败沿用原生管理错误映射。
+刷新受父调用期限和取消约束；结果未知不表示观测未落库。SDK 不自动重复调用，插件应控制刷新频率并处理失败，
+不能把失败、空值或旧快照当作额度恢复。维护阶段只允许这条受控原生刷新，不因此获得任意网络访问权。
+
 ### 账号与凭据
 
 `accounts` 域开放 `host.auth.list/get_runtime/get/save`：
@@ -117,6 +146,68 @@ for account in page.accounts {
 
 插件可以自行选择其业务需要的账号和 Provider，不需要安装器预先配置允许列表。宿主仍校验账号归属、资格、
 凭据版本和并发事务；原始凭据不得进入日志、审计正文或控制元数据。
+
+### 自有资源与维护
+
+声明 `maintenance` 并注册 `methods::RECONCILE`，宿主会在实例启用发布、进程恢复及配置变更后调用
+`plugin.reconcile`，并每 30 秒补偿一次。处理器必须幂等；调用可能重复，配置通知会合并，不表示逐条账号事件。
+每个实例串行执行，不同实例相互独立；调用限时 30 秒，失败后等待 5 秒重试。维护失败不回滚已经提交的资源，
+下一次对账继续补齐。只读校验、准备候选与 CLI 帮助不会启动维护；停用、替换和宿主关闭时取消旧任务。
+
+维护阶段允许日志、私有状态，以及已授权的 `data`、`groups`、`keys`、`key_budgets`、`quota_observations` 回调；不开放任意网络、凭据或模型执行。
+其他管理／命令入口也可使用下列资源方法：
+
+| SDK 方法 | 参数与行为 |
+| --- | --- |
+| `call.host.ensure_group(GroupEnsureRequest)` | `resource_key`、`name`、`color`、可选 `description`；首次创建，之后返回已有 `{id,name,enabled}` |
+| `call.host.change_group_members(GroupMembersChange)` | `resource_key`、`add`、`remove`；两列表合计最多 200 个账号 ID，不得重复或交叉，返回实际 `added`／`removed` 数量 |
+| `call.host.ensure_key(KeyEnsureRequest)` | `resource_key`、`name`、非空 `group_resource_keys`（最多 64 个）、`max_concurrency`、`requests_per_minute`、`daily_limit_usd`、`weekly_limit_usd`；返回 `{id,name,enabled}`，预算零值沿用原生无限制语义 |
+
+资源键使用 1～64 位小写字母、数字、`_`、`.`、`-`，首位为字母或数字，在实例和资源类型内唯一。
+归属由宿主签发，插件不能指定其他实例。`ensure` 只在首次创建时使用属性，不覆盖管理员对名称、启用状态或限制的修改；
+同名的管理员资源不会被接管，名称冲突会失败。账号已被删除时增量加入会忽略该 ID。
+无实际变化时不会写审计或递增配置版本。创建与归属登记、成员变更、授权复验均在同一事务完成。
+
+插件升级沿用实例资源；停用保留分组和 Key，其原生启用状态保持不变。删除实例解除归属，资源仍由管理员管理；
+重新安装为新实例不会接管旧资源。管理员删除自有资源后，仍启用的维护逻辑可在下次对账重新创建。
+Key 明文仍通过宿主管理面查看，插件模型调用使用返回的 Key ID。
+
+典型处理器先确保分组存在，再通过 `data` 分页查询账号并增量补齐成员，最后确保 Key 存在。
+安装 `groups` 域即授权纳入全部当前及未来账号；插件可按自己的配置筛选账号，但该筛选不构成宿主的权限边界。
+
+### Client Key 预算
+
+`key_budgets` 是原生 Key 预算访问域，仅在 `management`、`command_line`、`maintenance` 阶段使用。
+接受该域即允许查询全部当前及未来 Client Key 的预算并设置金额上限，包括管理员和其他插件创建的 Key；
+插件配置中的 Key 筛选不构成宿主权限边界。`keys` 只负责插件自有 Key 的创建，不能替代这一预算管理授权。
+`key_budgets` 不授予模型执行、密钥读取、Key 创建、名称／分组／画像或并发／RPM 配置修改权限。
+
+类型位于 `call::key_budgets`；下列预算方法控制参数为 `{}`，输入输出为二进制 JSON：
+
+| SDK 方法 / 回调 | 输入与结果 |
+| --- | --- |
+| `get_key_budget` / `host.keys.get_budget` | `{client_key_id}`；返回 `KeyBudget`，包含 ID、日／周上限及已用金额、日／周重置时间 |
+| `update_key_budget_limits` / `host.keys.update_budget_limits` | `{client_key_id, daily_limit_usd?, weekly_limit_usd?}`；至少指定一项；返回 `{client_key_id}` |
+
+`list_keys` / `host.keys.list` 仍可查询非秘密目录，仅返回 `{id,name,enabled}` 和游标，沿用目录的控制参数编码。
+上述操作均接受 Key ID，不接受 Key 明文，也不要求先查询目录。
+
+金额为非负十进制字符串，沿用原生金额精度；上限 `"0"` 表示不限。`KeyBudget` 的字段为
+`daily_limit_usd`、`weekly_limit_usd`、`daily_used_usd`、`weekly_used_usd`、`daily_resets_at_ms`、`weekly_resets_at_ms`；
+时间为 UTC Unix 毫秒，窗口按 Key 创建日期起算并连续推进；查询返回当前周期，不触发推理准入或清零，停用的 Key 仍可管理。
+
+上限更新仅写入提供的日／周金额；省略或 `null` 的项保持不变。它保留已用金额、窗口到期时间、费用历史及其他 Key 配置。
+写入复用 Key 行锁，与结算串行；实际变化时授权、修改、配置 revision 和审计在同一事务提交，并通知原生配置发布。
+相同值再次赋值不产生新 revision 或审计；并发更新按事务顺序生效，同一字段由后提交的值覆盖，接口不提供调用去重或比较交换。
+将非零上限降低到已用金额及以下会拒绝后续准入，提高限额可恢复准入，在途请求仍按原生规则完成和结算。
+
+本 fork 不提供 Key 用量重置。SDK 保留上游 `reset_key_budget` 的协议类型以便插件源码兼容，
+但宿主拒绝 `host.keys.reset_budget`，即使已授予 `key_budgets` 权限也返回 `permission_denied`。
+用户共享额度的重置仍仅由管理员通过用户管理执行。
+
+SDK 不自动重试。超时或断连不能证明写入未提交；重试上限赋值也可能覆盖期间其他调用的修改。
+不存在的 Key 返回 `rejected`，无权限或阶段不符返回 `permission_denied`；写入事务复验发现实例停用、版本或授权变化时返回 `conflict`，
+非法输入返回 `invalid_input`。账号关联和 Key 预算分配由插件决定，宿主不自动串联上述接口。
 
 ### Key、模型与模型调用
 

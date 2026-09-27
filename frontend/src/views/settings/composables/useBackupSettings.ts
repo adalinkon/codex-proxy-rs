@@ -8,7 +8,7 @@ import {
   updateBackupSchedule,
   updateBackupStorage,
 } from '@/api'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 /** 存储与计划配置共用的加载/保存/测试 composable。 */
 export function useBackupSettings() {

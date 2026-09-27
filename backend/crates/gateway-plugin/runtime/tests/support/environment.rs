@@ -52,6 +52,32 @@ impl Environment {
             .await;
     }
 
+    pub async fn grant_group_to_owner(&self, group_id: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "insert into {}.user_account_groups(user_id,account_group_id) values('plugin-test-admin',$1) on conflict do nothing", self.schema
+        ))).bind(group_id).execute(&self.admin).await.unwrap();
+    }
+
+    pub async fn seed_client_key_budget(&self, id: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update {}.client_api_keys set daily_limit_usd=10, weekly_limit_usd=20 where id=$1",
+            self.schema
+        )))
+        .bind(id)
+        .execute(&self.admin)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "insert into {}.client_key_budget_windows
+             (client_api_key_id, daily_start, daily_end, daily_used_usd, weekly_start, weekly_end, weekly_used_usd)
+             select k.id,p.daily_start,p.daily_end,3,p.weekly_start,p.weekly_end,4
+             from {}.client_api_keys k cross join lateral {}.budget_periods(k.created_at,now()) p where k.id=$1",
+            self.schema, self.schema, self.schema
+        )))
+        .bind(id)
+        .execute(&self.admin).await.unwrap();
+    }
+
     pub async fn client_key_with_limits(
         &self,
         id: &str,
@@ -172,6 +198,16 @@ impl Environment {
             .map(|grant| serde_json::from_value(json!(grant.permission)).unwrap())
             .collect();
         let mut contributes = Contributions::new();
+        if configuration.get("maintenance_fixture").is_some() {
+            contributes.extend([super::contribution_for_id(
+                &plugin_id,
+                Capability::Maintenance,
+                vec![Stage::Maintenance],
+                vec![],
+                vec![],
+            )]);
+        }
+
         if configuration.get("command_registration").is_some() {
             contributes.extend([super::contribution_for_id(
                 &plugin_id,

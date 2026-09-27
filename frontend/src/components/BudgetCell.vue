@@ -4,7 +4,7 @@ import { BasePopover } from '@codex-proxy/ui'
 import { computed } from 'vue'
 import { useUiClock } from '@/composables/useUiClock'
 import { formatBudgetAmount as amount, formatBudgetResetCountdown } from '@/utils/budget'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 const props = defineProps<{ budget: BudgetAmounts, name: string, period?: '日' | '周', size?: 'sm' | 'lg', resetDisplay?: 'countdown' | 'datetime' }>()
 const now = useUiClock()

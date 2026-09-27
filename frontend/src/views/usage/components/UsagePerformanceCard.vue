@@ -7,7 +7,7 @@ import { computed, shallowRef } from 'vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { requestActivityByBucket, zeroInactiveValues } from '@/components/charts/timeSeriesGap'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/number'
+import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/format'
 
 import {
   tooltipIndex,

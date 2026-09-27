@@ -2,7 +2,7 @@ import { toast } from '@codex-proxy/ui'
 
 import { shallowRef } from 'vue'
 import { ApiError } from '@/api/request'
-import { errorMessage, withMinimumDuration } from '@/utils/async'
+import { errorMessage, withMinimumDuration } from '@/utils/operation'
 
 type MaybePromise<T> = T | Promise<T>
 interface AsyncActionRunOptions {

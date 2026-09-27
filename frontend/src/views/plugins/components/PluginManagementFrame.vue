@@ -15,7 +15,7 @@ import {
 import { API_BASE_URL } from '@/api/constants'
 import { ApiError } from '@/api/request'
 import { useThemeStore } from '@/stores/modules/theme'
-import { errorMessage } from '@/utils/async'
+import { errorMessage, generateRequestId } from '@/utils/operation'
 import {
   assemblePluginManagementPage,
   MAXIMUM_MANAGEMENT_BODY_BYTES,
@@ -131,8 +131,8 @@ async function loadPage() {
   loading.value = true
   loadError.value = ''
   const controller = new AbortController()
-  const channel = crypto.randomUUID()
-  const sessionId = crypto.randomUUID()
+  const channel = generateRequestId()
+  const sessionId = generateRequestId()
   try {
     await nextTick()
     if (sequence !== loadSequence)

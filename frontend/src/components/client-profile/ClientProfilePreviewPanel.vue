@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { ClientProfilePreview } from '@/api/modules/client-profiles'
 import { BaseSkeleton } from '@codex-proxy/ui'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 defineProps<{
   preview?: Pick<ClientProfilePreview, 'userAgent' | 'versionSource' | 'checkedAt' | 'error'>

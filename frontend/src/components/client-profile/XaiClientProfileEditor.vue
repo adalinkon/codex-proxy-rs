@@ -3,7 +3,7 @@ import type { XaiClientProfilePreview, XaiClientProfileSelection } from '@/api/m
 import { BaseButton, BaseFormItem, BaseInput, BaseSegmented, BaseSelect } from '@codex-proxy/ui'
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getXaiClientProfileOptions, previewXaiClientProfile } from '@/api/modules/client-profiles'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 import ClientProfilePreviewPanel from './ClientProfilePreviewPanel.vue'
 
 const props = withDefaults(defineProps<{ active?: boolean, disabled?: boolean, allowInherit?: boolean }>(), {

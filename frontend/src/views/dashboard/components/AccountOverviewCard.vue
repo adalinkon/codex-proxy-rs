@@ -4,7 +4,7 @@ import { BaseCard, BaseEmpty } from '@codex-proxy/ui'
 
 import { CircleCheck, RefreshCw, ShieldAlert, TriangleAlert } from '@lucide/vue'
 import { computed } from 'vue'
-import { formatCompactNumber } from '@/utils/number'
+import { formatCompactNumber } from '@/utils/format'
 import AccountUsageWindow from '@/views/accounts/components/AccountUsageWindow/index.vue'
 import { metricToneIconClasses, metricToneValueClasses } from '../constants'
 import DashboardAccountIdentity from './DashboardAccountIdentity.vue'

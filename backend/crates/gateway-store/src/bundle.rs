@@ -182,6 +182,7 @@ async fn connect(
         }),
         backup_ports(pool.clone(), &config)?,
         plugins.clone(),
+        plugins.clone(),
         plugins,
     )
     .with_request_usage(Arc::new(AdminRequestUsageStoreAdapter {

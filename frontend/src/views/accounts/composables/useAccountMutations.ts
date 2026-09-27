@@ -16,7 +16,7 @@ import {
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useDownload } from '@/composables/useDownload'
 import { useIdSet } from '@/composables/useIdSet'
-import { errorMessage, withMinimumDuration } from '@/utils/async'
+import { errorMessage, withMinimumDuration } from '@/utils/operation'
 import { isSupportedProvider } from '@/utils/providers'
 
 import { useAccountOnboarding } from './useAccountOnboarding'

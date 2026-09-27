@@ -1,4 +1,5 @@
 import type { Ref } from 'vue'
+import type { PluginUpdateSelection } from './usePluginUpdateCheck'
 import type {
   ConfigurePluginInstanceRequest,
   CreatePluginSourceCredentialRequest,
@@ -31,8 +32,8 @@ import {
   updatePluginInstance,
 } from '@/api'
 import { ApiError } from '@/api/request'
-import { usePluginManagementViewsStore } from '@/stores/modules/plugin-management-views'
-import { errorMessage } from '@/utils/async'
+import { usePluginViewsStore } from '@/stores/modules/plugin-views'
+import { errorMessage } from '@/utils/operation'
 import { configurationStatus, currentPluginInstance, groupInstalledPlugins } from '../utils/catalog'
 import { usePluginInstallation } from './usePluginInstallation'
 import { usePluginUninstall } from './usePluginUninstall'
@@ -43,7 +44,7 @@ export function usePluginManagement() {
   const instances = shallowRef<PluginInstance[]>([])
   const sources = shallowRef<PluginUpdateSourceBinding[]>([])
   const credentials = shallowRef<PluginSourceCredential[]>([])
-  const extensionDirectory = usePluginManagementViewsStore()
+  const extensionDirectory = usePluginViewsStore()
   const { views: extensions } = storeToRefs(extensionDirectory)
   const loading = shallowRef(false)
   const catalog = computed(() => groupInstalledPlugins(artifacts.value, instances.value, sources.value))
@@ -173,13 +174,22 @@ export function usePluginManagement() {
   })
   const updateCheck = usePluginUpdateCheck(credentials, notifyError)
 
-  async function onInstalled({ artifact, defaultInstanceId, configurationRequired }: PluginArtifactMutationResponse) {
+  async function upgradeCheckedPlugin(selection: PluginUpdateSelection) {
+    if (await installation.installUpdate(selection))
+      updateCheck.open.value = false
+  }
+
+  async function onInstalled({ artifact, defaultInstanceId, configurationRequired }: PluginArtifactMutationResponse, switchTarget?: PluginInstance) {
     const artifactIndex = artifacts.value.findIndex(value => value.metadata.sha256 === artifact.metadata.sha256)
     artifacts.value = artifactIndex < 0
       ? [...artifacts.value, artifact]
       : artifacts.value.map((value, index) => index === artifactIndex ? artifact : value)
     selectedPluginId.value = artifact.metadata.pluginId
     await refresh(true)
+    if (switchTarget) {
+      await applyVersionSwitch(switchTarget, artifact)
+      return
+    }
     if (configurationRequired && defaultInstanceId) {
       const instance = instances.value.find(instance => instance.id === defaultInstanceId)
       if (instance) {
@@ -361,6 +371,10 @@ export function usePluginManagement() {
     if (!pendingVersionSwitch.value || busyInstanceId.value)
       return
     const { instance, artifact } = pendingVersionSwitch.value
+    await applyVersionSwitch(instance, artifact)
+  }
+
+  async function applyVersionSwitch(instance: PluginInstance, artifact: PluginArtifact) {
     busyInstanceId.value = instance.id
     try {
       await switchPluginVersion({
@@ -552,6 +566,7 @@ export function usePluginManagement() {
   return {
     ...installation,
     updateCheck,
+    upgradeCheckedPlugin,
     catalog,
     selectedPlugin,
     showDetail,

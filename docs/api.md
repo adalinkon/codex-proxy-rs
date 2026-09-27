@@ -217,6 +217,8 @@ API Key 与 OAuth 共用模拟客户端画像（`User-Agent`、`originator`、`v
 包括会话、线程、Lite 和其他业务扩展头。
 上游认证只来自选中的账号；API Key 不携带 OAuth Cookie、ChatGPT 账号身份或下游的
 `X-OpenAI-Actor-Authorization` 托管认证声明。
+下游的 `x-openai-account-routing-override`、`x-openai-fedramp` 也不透传，
+工作区路由与合规属性不能从原账号继承；请求中间件不能重新注入这些托管身份头。
 
 Responses 也不透传 `x-stainless-*`、`Origin`、`Referer`、`sec-ch-ua*` 和 `sec-fetch-*`
 携带的下游 SDK/浏览器环境或页面来源。过滤规则适用于所有下游客户端，与 User-Agent 无关；
@@ -250,16 +252,37 @@ Codex/OAuth 上游的历史回填按字段形状兼容，不以 User-Agent 品�
 
 请求头过滤不提供客户端匿名化；系统提示词、工具定义、工具结果、工作目录及其他业务 metadata
 保持原有语义，可能包含客户端环境信息。
+`client_metadata.parent_response_id` 是 Guardian 的账号内响应引用，只有归属可信且仍为同一账号时保留；
+切号或归属未知时移除。`x-codex-guardian`、`guardian_credits_requested` 和序列化
+`x-codex-turn-metadata` 内普通扩展的同名 `parent_response_id` 保持原样。
 
-Responses WebSocket 仅接受文本 `response.create`，同一连接串行执行。当前响应期间收到的后续业务帧
+Responses WebSocket 接受文本 `response.create` 和 `response.interrupt`，创建请求在同一连接串行执行。当前响应期间收到的后续业务帧
 留在有界接收队列中，待当前响应完成终结和写出后再逐条校验、准入与执行，不因请求提前到达而断开。
 接收队列容量为 32 个事件，超载仍关闭连接；Ping/Pong、客户端关闭和服务关闭不等待队列中的请求执行。
+活动响应期间会即时处理 `{"type":"response.interrupt","response_id":"当前响应 ID","mode":"discard_partial_items"}`。
+中断只能发送到该执行占用的原上游 WS，不重新选号或创建推理 attempt；重复中断合并为一次发送。
+ID 不匹配、没有可中断响应、实际走 HTTP 或 Provider 不支持控制时返回 `400` 协议错误，原执行继续；
+客户端需要终止这类执行时可关闭连接，后续按既有续接合同恢复。
+中断后继续转发上游事件与终态；只有 `response.incomplete` 的 `incomplete_details.reason` 为
+`interrupted` 时，才按官方中断语义保留原连接续接能力。部分输出是否被丢弃以上游终态为准。
+控制帧发送成功不等于上游已确认中断；若上游仍返回 `response.completed`，按正常完成处理。
 
 OAuth 账号默认 `prefer_websocket`，客户端使用 HTTP/SSE 时仍可能选择上游 WebSocket；
 可将账号上游传输方式设为 `http`，固定使用 HTTP/SSE。API Key 账号默认使用 HTTP/SSE，
 也可配置 `prefer_websocket`。必须依赖 WS 的协议预热、非持久化新链和连接内续接不使用 HTTP-only 账号。
 客户端配置的 `supports_websockets` 只控制第一段连接，不是服务端传输策略开关。
 上游在响应终态前发送 Close 1000 仍属于失败，不能按“正常关闭”计为成功。
+
+Codex OAuth backend 的候选上游为 WS 时，无 `previous_response_id` 的普通新链若规范化
+`response.create` 达到 15 MiB，发送前选择 HTTP/SSE；HTTP 和 WS 入站均适用，下游交付协议不变。
+该阈值为已观察到的上游消息大小边界预留余量，不是网关输入长度上限或 OpenAI 公布的统一限制；
+API Key 账号不使用此大小策略。小请求、显式 warmup、未知外部 previous ID 和持久化续接保持原行为。
+
+OAuth 的大 connection-local WS 续接，以及 HTTP `store=false` 成功后标记为 `ReplayRequired`
+的 WS 增量，均在发送前返回 `status: 400 / previous_response_not_found`。客户端应清除旧 ID，
+携带完整历史及工具调用／输出重试。官方 Codex 支持重连 WS 后完整重发，也可能按自身重试预算
+切到 HTTP；其他客户端需要自行实现此合同。代理不缓存 transcript，不把增量输入当作独立新链，
+不自动重放发送结果不确定的请求；HTTP 链后续步骤可能增加一次恢复信号、重连及全量上传。
 
 已建立模型执行的 Responses、Images 和 Search HTTP 响应按以下规则返回关联 ID：
 `x-gateway-request-id` 为模型执行 ID；`x-request-id` 保留有效上游值，只有上游
@@ -513,6 +536,10 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 - `sortDirection`: `asc`、`desc`。
 
 账号与用量页面使用固定的 OpenAI/xAI 平台选项，省略 `provider` 表示不过滤。
+
+账号视图的 `capacity` 返回查询时的网关并发容量：`usedSlots` 是正在执行的请求占用数，不含排队请求，
+读取运行态失败时为 `null`；`totalSlots` 是应用账号独立配置或全局默认值后的上限，`null` 表示不限。
+该上限不代表上游实际允许的并发数。管理端标记随账号列表查询刷新。
 
 模型目录导出保留上游原生模型对象和能力字段，不包含账号凭据；不支持 Codex 原生目录的账号不能导出。
 管理端下载文件名为 `cpr-model-catalog-<套餐>-<账号名称>.json`，文件正文为 `catalog`，可用于
@@ -845,6 +872,9 @@ OAuth start 使用：
   在该窗口的 `resetAt + 2 分钟` 后主动复核。后台每 30 秒检查触发条件；同一重置边界复核后仍未更新时
   回到 30 分钟重试，避免旧 reset 持续触发请求。各窗口独立确认恢复，时间到期本身不会直接解除账号
   耗尽或将展示用量归零。
+- 账号 `enabled` 控制是否参与请求调度，不控制 OAuth 凭据续期。OpenAI 与 xAI 的停用账号仍按各自刷新
+  策略维护 Token；刷新结果更新凭据状态，但不会启用调度。无 refresh token 或凭据已进入失效、无效、
+  封禁状态的账号不参加后台自动续期。
 - `POST /accounts/recover` 对停用账号只将 `enabled` 改为 `true`，保留已有额度快照、凭据、错误和 Redis
   cooldown；启用后仍按这些事实投影状态，不会把已有错误或耗尽改成正常。对已启用账号则执行强制恢复：
   清除 Redis cooldown 和已保存的额度/错误，恢复为可调度 credential。两条路径均不访问上游；强制恢复
@@ -1114,8 +1144,12 @@ HTTP 请求头及新建 WS 的握手提示按当时的最终出站档位构造�
 `response.create`；空闲连接不占名额，内部重试不重复占用。
 修改 Key 策略对既有 WebSocket 连接的下一次请求同样生效，已开始的请求保持原有快照。
 
-运行设置可以分别启用 Key 与账号的有界排队。Key 并发满时按 Key 等待；账号先使用其它可调度候选，
-适用账号均暂时满载后按账号等待。RPM、金额限额、失效账号和上游冷却不通过排队绕过。
+运行设置可以分别启用 Key 与账号的有界排队。Key 并发满时按 Key 等待；OpenAI 已绑定的会话账号仅因
+本地并发、请求间隔或已有等待者暂忙时，开启账号排队后优先等待原账号，队列满或超时不因此迁移绑定。
+原账号失效、额度耗尽或进入上游冷却时重新选择；显式调度策略选号与智能调度高权重回切仍按各自规则执行。
+没有适用亲和时先使用其它可调度候选，适用账号均暂时满载后按账号等待。
+关闭账号排队时，OpenAI 本地容量不足返回 `503` / `account_capacity_unavailable`，
+与无候选账号的 `no_available_provider` 区分。RPM、金额限额、失效账号和上游冷却不通过排队绕过。
 队列满返回 `429` / `concurrency_queue_full`，排队超时返回 `429` / `concurrency_queue_timeout`；
 WebSocket 使用对应错误事件。等待期间不发送上游请求，取消后释放等待位置，排队重查不重复计入 RPM。
 SSE 在取得有效执行前不发送保活帧，因此此阶段保留 HTTP 错误状态；已开始交付的失败沿用流内错误合同。
@@ -1180,6 +1214,7 @@ concurrencyWaitTimeoutSeconds
 responsesMaxDecompressedBodyBytes
 requestIntervalMs
 rotationStrategy
+smartScheduling
 minCodexDesktopVersion
 minCodexCliVersion
 usageRetentionDays
@@ -1228,6 +1263,35 @@ accountWarmupModel
 
 `rotationStrategy` 可取 `smart`、`quota_reset_priority`、`round_robin`、`sticky`。
 两个 `minCodex*Version` 字段为 `string | null`，只设置最低版本，不存在最大版本字段。
+
+`smartScheduling` 是必填的完整对象，仅在内置 `smart` 策略下生效，切换其他策略时仍保存其值：
+
+```json
+{
+  "loadWeight": 1.0,
+  "quotaWeight": 0.8,
+  "healthWeight": 1.0,
+  "latencyWeight": 0.5,
+  "resetWeight": 0.0,
+  "queueWeight": 0.0,
+  "preferHigherWeight": false
+}
+```
+
+六项系数分别调整负载、剩余额度、健康、首个有效输出延迟、额度重置和排队压力的评分偏好，范围 `0～10`、最多一位小数，
+至少一项大于 `0`。`0` 仅关闭对应评分维度，不放宽账号资格、额度或并发限制；系数不表示流量百分比。
+缺字段、`null`、未知字段及无效数值均返回 `422`，不写入配置。读取设置额外返回只读
+`smartSchedulingDefaults`，内容为上述默认对象，用于恢复默认与自定义状态比较，不可提交到更新接口。
+
+`resetWeight` 越大越偏向即将重置额度的账号，复用已有有效重置时间，未知或已过期时不加分。
+`queueWeight` 只在没有可立即使用的账号、需要选择等待队列时参与评分，越大越偏向等待人数少的账号。
+设为 `0` 时沿用最短队列规则；启用后结合其余五项评分选择队列。队列人数限于当前进程，只有开启账号排队才会生效，
+不影响已入队请求的位置、队内 FIFO、容量上限或等待超时。两项默认均为 `0`。
+
+`preferHigherWeight` 默认关闭。开启后，更高权重账号恢复可用时，后续允许重新选号的请求优先回切；
+同权重且可用的会话亲和继续保留。没有可用亲和时，在最高可用权重层内按配置评分。
+原生续写账号绑定仍是硬约束，不因回切而主动换号或触发历史重放。配置随运行设置原子保存和发布，
+新请求使用新值，已开始请求及其重试沿用原快照，无需重启。
 
 ### 模型定价
 
@@ -1755,7 +1819,7 @@ GitHub 的 `location` 使用 `kind: "github"`、`repository: "owner/repo"`、`ta
 
 查询请求为 `{ "query": { "repository": "owner/repo", "tag": null, "allowPrerelease": false }, "credentialIds": [], "outboundProxyId": null }`。
 `tag: null` 查询最新稳定版；预发行版须指定 tag 并允许预发行。响应包含固定 tag、产物列表、`queriedAt`
-和 `expiresAt`。成功缓存 1 小时，失败缓存 30 秒，同一查询合并并发；限流返回错误，不转换成空列表。
+和 `expiresAt`。显式查询刷新成功结果，同一批并发查询共享结果；下载固定 tag 的产物可复用 1 小时内的元数据，失败缓存 30 秒；限流返回错误，不转换成空列表。
 
 #### 下载认证与代理
 

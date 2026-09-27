@@ -497,7 +497,7 @@ pub fn initialize_plugin_accounts(
     ))
 }
 
-/// 为 Runtime 创建只暴露非秘密 Client Key 目录的窄端口。
+/// 为 Runtime 创建非秘密 Client Key 目录与预算重置的窄端口。
 #[must_use]
 pub fn initialize_plugin_client_keys(
     providers: ports::provider::ProviderAdminRegistry,
@@ -507,6 +507,15 @@ pub fn initialize_plugin_client_keys(
     let service: Arc<dyn ClientKeyService> =
         Arc::new(DefaultClientKeyService::new(store, snapshot, providers));
     Arc::new(use_case::plugin_client_keys::DefaultPluginClientKeyAccess::new(service))
+}
+
+/// 为 Runtime 组合实例自有资源写入；权限和归属在同一存储事务复核。
+#[must_use]
+pub fn initialize_plugin_resources(
+    store: Arc<dyn ports::plugin_resources::PluginResourceStore>,
+    snapshot: Arc<dyn SnapshotControl>,
+) -> Arc<dyn ports::plugin_resources::PluginResourceAccess> {
+    Arc::new(use_case::plugin_resources::DefaultPluginResourceAccess { store, snapshot })
 }
 
 /// Backup Worker 注册：单个可取消 Daemon，owner 固定为 `backup`。

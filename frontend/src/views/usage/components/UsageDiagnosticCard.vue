@@ -4,7 +4,7 @@ import { BaseCard, BaseEmpty, BaseSegmented, BaseTable, defineTableColumns } fro
 
 import { CornerDownRight } from '@lucide/vue'
 import { computed } from 'vue'
-import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/number'
+import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/format'
 
 import { formatDuration, formatPercent, formatUsd } from '../utils/format'
 

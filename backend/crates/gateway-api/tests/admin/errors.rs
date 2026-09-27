@@ -341,7 +341,39 @@ mod provider {
     use super::*;
 
     #[tokio::test]
-    async fn provider_public_errors_survive_import_and_refresh_http_handlers() {
+    async fn unsupported_quota_should_preserve_account_capacity_wire() {
+        let fixture = AdminTestFixture::new().await;
+        fixture.auth.insert_session("valid-session");
+        for (used_slots, total_slots) in [(Some(3), Some(5)), (Some(0), None), (None, Some(10))] {
+            let mut stored = account("openai");
+            stored.capacity = gateway_admin::model::accounts::AccountCapacity {
+                used_slots,
+                total_slots,
+            };
+            *fixture.account.lock().unwrap() = Some(stored);
+            let mut request = request(
+                Method::GET,
+                "/api/admin/accounts/quota?accountId=acct_error_test",
+                Body::empty(),
+            );
+            request
+                .headers_mut()
+                .insert(header::COOKIE, SESSION_COOKIE.parse().unwrap());
+            let response = app(fixture.state()).oneshot(request).await.unwrap();
+            let (status, _, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["data"]["account"]["capacity"],
+                json!({
+                    "usedSlots": used_slots,
+                    "totalSlots": total_slots,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_public_errors_survive_import_credential_and_quota_refresh_handlers() {
         let fixture = AdminTestFixture::new().await;
         fixture.auth.insert_session("valid-session");
         for provider in ["openai", "xai"] {
@@ -386,6 +418,10 @@ mod provider {
                     (
                         "/api/admin/accounts/import",
                         json!({"provider": provider, "data": {"accessToken": "at-synthetic-test"}}),
+                    ),
+                    (
+                        "/api/admin/accounts/quota/refresh",
+                        json!({"accountId": "acct_error_test"}),
                     ),
                 ] {
                     let response = send(&fixture, path, body).await;
@@ -472,6 +508,10 @@ mod provider {
             last_error_message: None,
         };
         AccountPageItem {
+            capacity: gateway_admin::model::accounts::AccountCapacity {
+                used_slots: None,
+                total_slots: None,
+            },
             account: AccountRecord {
                 notes: None,
                 model_access: Default::default(),

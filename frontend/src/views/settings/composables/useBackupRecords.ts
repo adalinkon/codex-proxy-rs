@@ -10,7 +10,7 @@ import {
 } from '@/api'
 import { ApiError } from '@/api/request'
 import { usePagedQuery } from '@/composables/usePagedQuery'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 const ACTIVE_STATUSES: BackupStatus[] = ['queued', 'dumping', 'uploading']
 const POLL_INTERVAL_MS = 2000

@@ -7,7 +7,7 @@ import type {
 import { BaseButton, BaseSegmented } from '@codex-proxy/ui'
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getClientProfileOptions, previewClientProfile } from '@/api/modules/client-profiles'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 import ClientProfilePresetFields from './ClientProfilePresetFields.vue'
 import ClientProfilePreviewPanel from './ClientProfilePreviewPanel.vue'
 
@@ -111,17 +111,15 @@ onMounted(() => load())
         重试
       </BaseButton>
     </div>
-    <p v-if="loading" role="status" class="m-0 text-cp text-cp-text-secondary">
-      正在加载客户端身份…
-    </p>
     <ClientProfilePresetFields
-      v-else-if="!inherited"
+      v-if="!inherited"
       :model-value="effective ?? null"
       :presets="options?.presets ?? []"
       :preview="preview"
       :previewing="previewing"
       :error="previewError"
-      :disabled="disabled"
+      :disabled="disabled || loading"
+      :aria-busy="loading || undefined"
       @update:model-value="model = $event"
     />
     <ClientProfilePreviewPanel

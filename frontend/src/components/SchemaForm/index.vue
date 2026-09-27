@@ -3,7 +3,7 @@ import type { InputField } from './schema'
 import { BaseForm, BaseFormItem, BaseIconButton, BaseInput, BasePopover, BaseSelect, BaseTextarea } from '@codex-proxy/ui'
 import { Braces, Info, List } from '@lucide/vue'
 import { computed, nextTick, shallowRef, useTemplateRef } from 'vue'
-import { jsonObjectError, parseJsonObject } from '@/utils/jsonObject'
+import { jsonObjectError, parseJsonObject } from '@/utils/data'
 import { inputFields } from './schema'
 
 const props = defineProps<{

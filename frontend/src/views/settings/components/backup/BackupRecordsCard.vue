@@ -3,7 +3,7 @@ import type { BackupRecord } from '@/api'
 
 import { BaseButton, BaseCard, BaseConfirmModal, BaseIconButton, BaseTable, BaseTablePagination, defineTableColumns } from '@codex-proxy/ui'
 import { Download, Play, RefreshCw, Trash2 } from '@lucide/vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 import BackupStatusBadge from './BackupStatusBadge.vue'
 

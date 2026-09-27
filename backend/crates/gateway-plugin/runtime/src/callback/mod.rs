@@ -1,4 +1,5 @@
 mod accounts;
+mod admin;
 mod affinity;
 mod data;
 mod http;
@@ -7,6 +8,7 @@ mod log;
 mod middleware;
 mod model;
 pub(crate) mod private_state;
+mod resources;
 mod scope;
 
 use std::{
@@ -16,7 +18,7 @@ use std::{
 };
 
 use futures::future::BoxFuture;
-use gateway_admin::model::{AdminError, plugins::instances::PluginPermissionGrant};
+use gateway_admin::model::AdminError;
 use gateway_core::{account::OutboundProxy, lifecycle::CancellationToken};
 use gateway_host::outbound::{HttpBody, HttpClient, NetworkPolicy};
 use gateway_plugin_sdk::{CallContext, ErrorCode, PluginFault};
@@ -30,6 +32,7 @@ pub(crate) use middleware::{
     MiddlewareBinding, MiddlewareBodyAuthority, MiddlewareCompletionBody, MiddlewareInvocation,
 };
 pub(crate) use model::PluginModelPortSlot;
+pub(crate) use resources::PluginResourcePorts;
 pub(crate) use scope::NetworkScope;
 
 pub(crate) struct PluginCallbackPorts {
@@ -39,6 +42,7 @@ pub(crate) struct PluginCallbackPorts {
     keys: Arc<PluginClientKeyPortSlot>,
     models: Arc<PluginModelPortSlot>,
     affinity: Arc<PluginAffinityPortSlot>,
+    resources: Arc<PluginResourcePorts>,
 }
 
 impl PluginCallbackPorts {
@@ -49,6 +53,7 @@ impl PluginCallbackPorts {
         keys: Arc<PluginClientKeyPortSlot>,
         models: Arc<PluginModelPortSlot>,
         affinity: Arc<PluginAffinityPortSlot>,
+        resources: Arc<PluginResourcePorts>,
     ) -> Self {
         Self {
             http,
@@ -57,15 +62,16 @@ impl PluginCallbackPorts {
             keys,
             models,
             affinity,
+            resources,
         }
     }
 }
 
 pub(crate) struct PluginCallbacks {
     accounts: Arc<accounts::PluginAccounts>,
+    resources: Arc<resources::PluginResources>,
     data: Arc<data::PluginData>,
-    keys: Arc<PluginClientKeyPortSlot>,
-    models_authorized: bool,
+    keys: Arc<keys::PluginClientKeys>,
     affinity: Arc<affinity::PluginAffinity>,
     log: Arc<log::PluginLog>,
     models: Arc<model::PluginModels>,
@@ -117,18 +123,23 @@ impl HttpStream {
 
 impl PluginCallbacks {
     pub(crate) fn new(
-        grants: &[PluginPermissionGrant],
+        instance: &gateway_admin::model::plugins::instances::PluginInstance,
         maximum_payload: usize,
         manifest: &gateway_plugin_sdk::Manifest,
         log_slots: Arc<tokio::sync::Semaphore>,
         private_state: Arc<private_state::PluginPrivateState>,
         ports: PluginCallbackPorts,
     ) -> Result<Self, AdminError> {
+        let grants = &instance.grants;
         Ok(Self {
-            data: Arc::new(data::PluginData::new(ports.accounts.clone(), grants)),
+            resources: Arc::new(resources::PluginResources::new(instance, ports.resources)),
+            data: Arc::new(data::PluginData::new(
+                ports.accounts.clone(),
+                ports.keys.clone(),
+                grants,
+            )),
             accounts: Arc::new(accounts::PluginAccounts::new(ports.accounts, grants)),
-            keys: ports.keys,
-            models_authorized: grants.iter().any(|grant| grant.permission == "models"),
+            keys: Arc::new(keys::PluginClientKeys::new(instance, ports.keys)),
             affinity: Arc::new(affinity::PluginAffinity::new(ports.affinity, grants)),
             log: Arc::new(
                 log::PluginLog::new(manifest, log_slots)
@@ -374,9 +385,9 @@ impl CallbackHandler for PluginCallbacks {
         let log = self.log.clone();
         let private_state = self.private_state.clone();
         let accounts = self.accounts.clone();
+        let resources = self.resources.clone();
         let data = self.data.clone();
         let keys = self.keys.clone();
-        let models_authorized = self.models_authorized;
         let models = self.models.clone();
         let affinity = self.affinity.clone();
         Box::pin(async move {
@@ -417,11 +428,21 @@ impl CallbackHandler for PluginCallbacks {
             if is_private_state {
                 return private_state.call(&method, params, &payload).await;
             }
-            if method == "host.keys.list" {
-                if !models_authorized {
-                    return Err(denied());
-                }
-                return keys.list(params, &payload).await;
+            if matches!(
+                method.as_str(),
+                gateway_plugin_sdk::call::resources::GROUP_ENSURE
+                    | gateway_plugin_sdk::call::resources::GROUP_MEMBERS
+                    | gateway_plugin_sdk::call::resources::KEY_ENSURE
+            ) {
+                return resources.call(&context, &method, params, &payload).await;
+            }
+            if matches!(
+                method.as_str(),
+                "host.keys.list"
+                    | gateway_plugin_sdk::call::key_budgets::GET
+                    | gateway_plugin_sdk::call::key_budgets::UPDATE_LIMITS
+            ) {
+                return keys.call(&context, &method, params, &payload).await;
             }
             if method == "host.models.list" {
                 return models.call(&context, &call, &method, params, payload).await;
@@ -444,7 +465,9 @@ impl CallbackHandler for PluginCallbacks {
             if matches!(
                 method.as_str(),
                 gateway_plugin_sdk::call::data::ACCOUNTS_LIST
+                    | gateway_plugin_sdk::call::data::KEYS_GET
                     | gateway_plugin_sdk::call::data::QUOTA_GET
+                    | gateway_plugin_sdk::call::data::QUOTA_REFRESH
             ) {
                 return data.call(&context, &method, params, &payload).await;
             }

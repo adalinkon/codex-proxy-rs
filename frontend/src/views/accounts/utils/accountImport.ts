@@ -1,4 +1,4 @@
-import { isRecord } from '@/utils/object'
+import { isRecord } from '@/utils/data'
 import { formatProviderLabel, isSupportedProvider } from '@/utils/providers'
 
 export const MAX_ACCOUNT_IMPORT_COUNT = 200

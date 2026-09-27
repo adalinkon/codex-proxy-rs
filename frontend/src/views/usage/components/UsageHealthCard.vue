@@ -8,7 +8,7 @@ import { use } from 'echarts/core'
 import { computed } from 'vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/number'
+import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/format'
 
 import {
   tooltipIndex,

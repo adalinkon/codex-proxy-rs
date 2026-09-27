@@ -32,7 +32,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useId,
 import { useRoute, useRouter } from 'vue-router'
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import { useAuthStore } from '@/stores/modules/auth'
-import { usePluginManagementViewsStore } from '@/stores/modules/plugin-management-views'
+import { usePluginViewsStore } from '@/stores/modules/plugin-views'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useThemeStore } from '@/stores/modules/theme'
 import { pluginPageLocation, shortPluginInstanceId } from '@/views/plugins/utils/navigation'
@@ -57,7 +57,7 @@ const emit = defineEmits<{
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
-const pluginViewsStore = usePluginManagementViewsStore()
+const pluginViewsStore = usePluginViewsStore()
 const systemUpdateStore = useSystemUpdateStore()
 const themeStore = useThemeStore()
 const { pageViews: pluginPageViews } = storeToRefs(pluginViewsStore)

@@ -9,8 +9,8 @@ import { getAccountModels, refreshAccountModels } from '@/api'
 import { API_BASE_URL } from '@/api/constants'
 import { useIdSet } from '@/composables/useIdSet'
 import { useRequestState } from '@/composables/useRequestState'
-import { errorMessage, withMinimumDuration } from '@/utils/async'
-import { formatDateTime, formatTime } from '@/utils/date'
+import { formatDateTime, formatTime } from '@/utils/format'
+import { errorMessage, withMinimumDuration } from '@/utils/operation'
 
 interface ConnectionTestRun {
   accountId: string

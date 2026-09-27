@@ -1,8 +1,7 @@
 import type { Ref, ShallowRef } from 'vue'
 import { computed, shallowRef, watch } from 'vue'
 
-import { buildCodexCcSwitchImportDeeplink } from '@/utils/ccswitchImport'
-import { resolveServiceRootUrl } from '@/utils/serviceUrl'
+import { buildCodexCcSwitchImportDeeplink, resolveServiceRootUrl } from '@/utils/client'
 
 // “使用密钥”弹窗展示明文时，在列表行上补挂 reveal 得到的完整 key。
 interface ApiKeyRow { name: string, prefix: string }

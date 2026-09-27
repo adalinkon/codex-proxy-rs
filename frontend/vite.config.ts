@@ -25,7 +25,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
-      outDir: sourceUi ? '.vite/source-dist' : 'dist',
+      outDir: sourceUi ? 'node_modules/.vite/source-dist' : 'dist',
       assetsDir: 'assets',
       chunkSizeWarningLimit: 600,
       rolldownOptions: {

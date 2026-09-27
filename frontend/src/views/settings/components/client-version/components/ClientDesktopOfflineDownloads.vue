@@ -3,7 +3,7 @@ import type { ClientDownloadPackage, CodexDesktopWindowsDownloads } from '@/api'
 import { BaseButton, BaseEmpty, BaseIconButton, BaseSkeleton } from '@codex-proxy/ui'
 
 import { ArrowDownToLine, PackageOpen, RefreshCw } from '@lucide/vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 import ClientInstallCommandList from './ClientInstallCommandList.vue'
 

@@ -3,11 +3,7 @@ import { BaseButton, BaseIconButton, BaseModal, BaseScrollbar, BaseSegmented, Ba
 
 import { Apple, Copy, Monitor, Upload } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
-import { buildCodexCcSwitchImportDeeplink } from '@/utils/ccswitchImport'
-import {
-  buildCodexConfigFiles,
-  CODEX_WEBSOCKET_ENABLED_BY_DEFAULT,
-} from '@/utils/codexConfig'
+import { buildCodexCcSwitchImportDeeplink, buildCodexConfigFiles, CODEX_WEBSOCKET_ENABLED_BY_DEFAULT } from '@/utils/client'
 
 const props = withDefaults(defineProps<{
   title?: string

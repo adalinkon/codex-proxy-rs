@@ -3,7 +3,7 @@ import { BaseCard, BaseEmpty, BaseSegmented } from '@codex-proxy/ui'
 
 import { Box, CheckCircle2, Monitor, RefreshCw, ShieldCheck, Terminal, TriangleAlert } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 import { formatProviderLabel, isSupportedProvider, providerIcon } from '@/utils/providers'
 
 interface WireProfile {

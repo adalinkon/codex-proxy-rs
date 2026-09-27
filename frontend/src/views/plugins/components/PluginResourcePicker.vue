@@ -3,7 +3,7 @@ import { BaseButton, BaseEmpty, BaseSelect, toast } from '@codex-proxy/ui'
 import { CircleAlert, LoaderCircle } from '@lucide/vue'
 import { computed, onScopeDispose, shallowRef, watch } from 'vue'
 import { getAccountGroups, getApiKeys } from '@/api'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 const props = withDefaults(defineProps<{ kind: 'keys' | 'groups', disabled?: boolean, maxCollapseTags?: number }>(), { maxCollapseTags: 1 })
 const selected = defineModel<string[]>({ required: true })

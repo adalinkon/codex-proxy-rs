@@ -15,7 +15,7 @@ import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useBudgetRollover } from '@/composables/useBudgetRollover'
 import { useRequestState } from '@/composables/useRequestState'
 import { useRequestUsage } from '@/composables/useRequestUsage'
-import { generateRequestId } from '@/utils/uuid'
+import { generateRequestId } from '@/utils/operation'
 import ApiKeyStatusBadge from '@/views/keys/components/ApiKeyStatusBadge.vue'
 
 const users = ref<UserRecord[]>([])

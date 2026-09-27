@@ -22,8 +22,9 @@ use crate::model::{
     },
     auth::{AdminAuditEvent, AdminSession},
     client_keys::{
-        ClientKeyListQuery, ClientKeyPage, ClientKeyRecord, ClientKeySecret, DeleteClientKey,
-        NewClientKey, SetClientKeyEnabled, UpdateClientKey,
+        ClientKeyBudgetMutationOrigin, ClientKeyListQuery, ClientKeyPage, ClientKeyRecord,
+        ClientKeySecret, DeleteClientKey, NewClientKey, SetClientKeyEnabled, UpdateClientKey,
+        UpdateClientKeyBudgetLimits,
     },
     observability::{
         DashboardObservation, DashboardRuntimeSlots, DiagnosticDimension, DiagnosticObservation,
@@ -308,6 +309,14 @@ pub trait RequestUsageStore: Send + Sync {
 /// Client API Key 管理写入。
 #[async_trait]
 pub trait ClientKeyStore: Send + Sync {
+    /// 局部更新预算上限，保留其他策略和账本；无变化时不产生配置版本或审计。
+    async fn update_client_key_budget_limits(
+        &self,
+        command: UpdateClientKeyBudgetLimits,
+        origin: ClientKeyBudgetMutationOrigin,
+        context: &MutationContext,
+    ) -> AdminStoreResult<Option<Revision>>;
+
     async fn mutate_owned_key(
         &self,
         user_id: &str,
@@ -527,9 +536,15 @@ pub struct AdminStorePorts {
     backup: BackupStorePorts,
     plugins: Arc<dyn super::plugins::PluginStore>,
     plugin_state: Arc<dyn super::plugins::PluginStateStore>,
+    plugin_resources: Arc<dyn super::plugin_resources::PluginResourceStore>,
 }
 
 impl AdminStorePorts {
+    #[must_use]
+    pub fn plugin_resources(&self) -> Arc<dyn super::plugin_resources::PluginResourceStore> {
+        self.plugin_resources.clone()
+    }
+
     #[must_use]
     pub fn plugins(&self) -> Arc<dyn super::plugins::PluginStore> {
         Arc::clone(&self.plugins)
@@ -554,6 +569,7 @@ impl AdminStorePorts {
         backup: BackupStorePorts,
         plugins: Arc<dyn super::plugins::PluginStore>,
         plugin_state: Arc<dyn super::plugins::PluginStateStore>,
+        plugin_resources: Arc<dyn super::plugin_resources::PluginResourceStore>,
     ) -> Self {
         Self {
             accounts,
@@ -565,6 +581,7 @@ impl AdminStorePorts {
             request_usage: None,
             plugins,
             plugin_state,
+            plugin_resources,
         }
     }
 

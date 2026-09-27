@@ -3,7 +3,7 @@ import { toast } from '@codex-proxy/ui'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import { getPricing, previewPricingSync, syncPricing, updatePricing } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 import { pricingProviders, pricingRows } from './model'
 
 export function usePricing() {

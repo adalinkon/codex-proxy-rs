@@ -110,6 +110,69 @@ async fn concurrent_queries_share_a_single_fetch_and_return_cache_times() {
 }
 
 #[tokio::test]
+async fn explicit_queries_refresh_a_new_release_before_the_cache_expires() {
+    let server = MockServer::start().await;
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(path("/repos/example/plugins/releases/latest"))
+        .respond_with(move |_: &wiremock::Request| {
+            let mut metadata = release();
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                metadata["tag_name"] = json!("model-trace-v0.1.3");
+            }
+            ResponseTemplate::new(200).set_body_json(metadata)
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let distribution = transport(&server);
+    let previous = distribution
+        .query_release(query(None), vec![], None)
+        .await
+        .unwrap();
+    let latest = distribution
+        .query_release(query(None), vec![], None)
+        .await
+        .unwrap();
+    assert_eq!(previous.tag, "v1.0.0");
+    assert_eq!(latest.tag, "model-trace-v0.1.3");
+    assert!(latest.queried_at < previous.expires_at);
+}
+
+#[tokio::test]
+async fn artifact_downloads_reuse_the_checked_fixed_release() {
+    let server = MockServer::start().await;
+    Mock::given(path("/repos/example/plugins/releases/tags/v1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/example/plugins/releases/assets/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"package"))
+        .mount(&server)
+        .await;
+    let distribution = transport(&server);
+    distribution
+        .query_release(query(Some("v1.0.0")), vec![], None)
+        .await
+        .unwrap();
+    let downloaded = distribution
+        .download(
+            RemotePluginLocation::Github {
+                repository: "example/plugins".into(),
+                tag: "v1.0.0".into(),
+                asset: "example_1.0.0_linux_x86_64.tar.gz".into(),
+                allow_prerelease: false,
+                sha256: None,
+            },
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(downloaded.sha256, digest(b"package"));
+}
+
+#[tokio::test]
 async fn rate_limit_applies_to_other_repositories_using_the_same_identity_and_egress() {
     let server = MockServer::start().await;
     Mock::given(path("/repos/example/plugins/releases/latest"))
@@ -236,55 +299,4 @@ async fn oversized_metadata_is_rejected_before_json_parsing() {
             .await
             .is_err()
     );
-}
-
-#[tokio::test]
-#[ignore = "实际访问 GitHub 公共仓库；通过 --ignored 显式运行"]
-async fn live_github_resolves_latest_then_pins_the_same_release() {
-    let distribution = gateway_host::plugin_distribution::HttpPluginDistribution::new(
-        std::sync::Arc::new(gateway_host::outbound::HttpClient::new().unwrap()),
-    )
-    .unwrap();
-    let mut query = GithubReleaseQuery {
-        repository: "cli/cli".into(),
-        tag: None,
-        allow_prerelease: false,
-    };
-    let latest = distribution
-        .query_release(query.clone(), vec![], None)
-        .await
-        .unwrap();
-    assert!(!latest.prerelease);
-    assert!(!latest.assets.is_empty());
-    query.tag = Some(latest.tag.clone());
-    let pinned = distribution
-        .query_release(query, vec![], None)
-        .await
-        .unwrap();
-    assert_eq!(pinned.tag, latest.tag);
-    let checksums = pinned
-        .assets
-        .iter()
-        .find(|asset| asset.name.ends_with("checksums.txt"))
-        .unwrap();
-    let expected = checksums
-        .sha256
-        .clone()
-        .expect("GitHub Release checksum asset must have a published digest");
-    let downloaded = distribution
-        .download(
-            RemotePluginLocation::Github {
-                repository: pinned.repository,
-                tag: pinned.tag,
-                asset: checksums.name.clone(),
-                allow_prerelease: false,
-                sha256: Some(expected.clone()),
-            },
-            vec![],
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(downloaded.sha256, expected);
-    assert!(!downloaded.archive.is_empty());
 }

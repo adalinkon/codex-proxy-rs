@@ -257,6 +257,7 @@ impl AdminHarness {
                 self.backup,
                 self.plugin_store,
                 Arc::new(plugins::TestPluginPorts),
+                Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
@@ -642,6 +643,15 @@ impl AccountRuntimeStore for UnavailableStore {
 
 #[async_trait]
 impl ClientKeyStore for UnavailableStore {
+    async fn update_client_key_budget_limits(
+        &self,
+        _: gateway_admin::model::client_keys::UpdateClientKeyBudgetLimits,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetMutationOrigin,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Option<Revision>> {
+        Err(unavailable("client key budget limits"))
+    }
+
     async fn mutate_owned_key(
         &self,
         _: &str,

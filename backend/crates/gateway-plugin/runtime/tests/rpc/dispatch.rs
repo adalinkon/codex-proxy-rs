@@ -236,9 +236,18 @@ async fn execution_allows_each_declared_callback_permission() {
 }
 
 #[tokio::test]
-async fn data_callbacks_require_independent_grants_and_management_or_command_stage() {
-    for permissions in [vec![Permission::Accounts], vec![Permission::Data]] {
+async fn fact_callbacks_require_independent_grants_and_control_plane_stages() {
+    for permissions in [
+        vec![],
+        vec![Permission::Accounts],
+        vec![Permission::Keys],
+        vec![Permission::Models],
+        vec![Permission::KeyBudgets],
+        vec![Permission::QuotaObservations],
+        vec![Permission::Data],
+    ] {
         let authorized = permissions.contains(&Permission::Data);
+        let quota_authorized = permissions.contains(&Permission::QuotaObservations);
         let callbacks = Arc::new(Callbacks::default());
         let (_cache, session) = session_with_permissions(Arc::clone(&callbacks), permissions).await;
         for stage in [
@@ -254,10 +263,20 @@ async fn data_callbacks_require_independent_grants_and_management_or_command_sta
             Stage::PublicManagement,
             Stage::Management,
             Stage::CommandLine,
+            Stage::Maintenance,
         ] {
-            for method in ["host.data.accounts.list", "host.data.quota.get"] {
+            for method in [
+                "host.data.accounts.list",
+                "host.data.keys.get",
+                "host.data.quota.get",
+            ] {
                 let reply = invoke_callback(&session, stage, method).await;
-                if authorized && matches!(stage, Stage::Management | Stage::CommandLine) {
+                if (authorized || (quota_authorized && method == "host.data.quota.get"))
+                    && matches!(
+                        stage,
+                        Stage::Management | Stage::CommandLine | Stage::Maintenance
+                    )
+                {
                     assert!(reply.is_ok());
                 } else {
                     assert_permission_denied(reply);
@@ -266,7 +285,13 @@ async fn data_callbacks_require_independent_grants_and_management_or_command_sta
         }
         assert_eq!(
             callbacks.called.load(Ordering::Relaxed),
-            if authorized { 4 } else { 0 }
+            if authorized {
+                9
+            } else if quota_authorized {
+                3
+            } else {
+                0
+            }
         );
         session.shutdown(Duration::from_secs(1)).await;
     }
@@ -288,4 +313,147 @@ async fn retry_stage_allows_only_logs_and_private_state() {
     }
     assert_eq!(callbacks.called.load(Ordering::Relaxed), 2);
     session.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn managed_resources_require_their_domains_and_control_plane_stages() {
+    for (method, permission) in [
+        ("host.groups.ensure", Permission::Groups),
+        ("host.groups.change_members", Permission::Groups),
+        ("host.keys.ensure", Permission::Keys),
+        ("host.keys.get_budget", Permission::KeyBudgets),
+        ("host.keys.update_budget_limits", Permission::KeyBudgets),
+        (
+            "host.quota_observations.refresh",
+            Permission::QuotaObservations,
+        ),
+    ] {
+        for granted in [false, true] {
+            let callbacks = Arc::new(Callbacks::default());
+            let (_cache, session) = session_with_permissions(
+                callbacks.clone(),
+                if granted { vec![permission] } else { vec![] },
+            )
+            .await;
+            for stage in [
+                Stage::Registration,
+                Stage::Configuration,
+                Stage::PublicManagement,
+                Stage::Request,
+                Stage::Observation,
+                Stage::Management,
+                Stage::CommandLine,
+                Stage::Maintenance,
+            ] {
+                let reply = invoke_callback(&session, stage, method).await;
+                if granted
+                    && matches!(
+                        stage,
+                        Stage::Management | Stage::CommandLine | Stage::Maintenance
+                    )
+                {
+                    assert!(reply.is_ok());
+                } else {
+                    assert_permission_denied(reply);
+                }
+            }
+            session.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn maintenance_has_data_and_state_access_but_cannot_execute_models_or_read_credentials() {
+    let callbacks = Arc::new(Callbacks::default());
+    let (_cache, session) = session(callbacks).await;
+    for method in [
+        "host.data.accounts.list",
+        "host.data.keys.get",
+        "host.data.quota.get",
+        "host.keys.list",
+        "host.keys.get_budget",
+        "host.state.put",
+        "host.log",
+    ] {
+        assert!(
+            invoke_callback(&session, Stage::Maintenance, method)
+                .await
+                .is_ok()
+        );
+    }
+    for method in [
+        "host.auth.get",
+        "host.auth.save",
+        "host.http.do",
+        "host.model.execute",
+    ] {
+        assert_permission_denied(invoke_callback(&session, Stage::Maintenance, method).await);
+    }
+    session.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn budget_access_does_not_grant_models_or_key_provisioning_and_models_do_not_grant_reset() {
+    for permission in [Permission::KeyBudgets, Permission::Models, Permission::Keys] {
+        let callbacks = Arc::new(Callbacks::default());
+        let (_cache, session) = session_with_permissions(callbacks, vec![permission]).await;
+        for stage in [
+            Stage::Management,
+            Stage::CommandLine,
+            Stage::Maintenance,
+            Stage::Request,
+            Stage::Attempt,
+            Stage::Observation,
+            Stage::Routing,
+            Stage::Scheduling,
+            Stage::Authentication,
+            Stage::Retry,
+            Stage::Registration,
+            Stage::Configuration,
+            Stage::PublicManagement,
+        ] {
+            let reply = invoke_callback(&session, stage, "host.keys.list").await;
+            let allowed = match permission {
+                Permission::KeyBudgets => matches!(
+                    stage,
+                    Stage::Management | Stage::CommandLine | Stage::Maintenance
+                ),
+                Permission::Models => matches!(
+                    stage,
+                    Stage::Management
+                        | Stage::CommandLine
+                        | Stage::Request
+                        | Stage::Attempt
+                        | Stage::Observation
+                        | Stage::Routing
+                        | Stage::Scheduling
+                        | Stage::Authentication
+                ),
+                _ => false,
+            };
+            if allowed {
+                assert!(reply.is_ok());
+            } else {
+                assert_permission_denied(reply);
+            }
+            if permission != Permission::KeyBudgets {
+                assert_permission_denied(
+                    invoke_callback(&session, stage, "host.keys.get_budget").await,
+                );
+            }
+        }
+        if permission == Permission::KeyBudgets {
+            for method in [
+                "host.model.execute",
+                "host.models.list",
+                "host.keys.ensure",
+                "host.auth.get",
+            ] {
+                assert_permission_denied(
+                    invoke_callback(&session, Stage::Management, method).await,
+                );
+            }
+        }
+        session.shutdown(Duration::from_secs(1)).await;
+    }
 }

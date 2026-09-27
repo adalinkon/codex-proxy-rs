@@ -5,9 +5,9 @@ import { computed, shallowRef, watch } from 'vue'
 import { getPluginManagementViews } from '@/api'
 import { ApiError } from '@/api/request'
 import { useAuthStore } from '@/stores/modules/auth'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
-export const usePluginManagementViewsStore = defineStore('plugin-management-views', () => {
+export const usePluginViewsStore = defineStore('plugin-views', () => {
   const authStore = useAuthStore()
   const views = shallowRef<PluginManagementView[]>([])
   const loading = shallowRef(false)
@@ -88,4 +88,4 @@ export const usePluginManagementViewsStore = defineStore('plugin-management-view
 })
 
 if (import.meta.hot)
-  import.meta.hot.accept(acceptHMRUpdate(usePluginManagementViewsStore, import.meta.hot))
+  import.meta.hot.accept(acceptHMRUpdate(usePluginViewsStore, import.meta.hot))

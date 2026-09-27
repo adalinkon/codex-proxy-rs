@@ -5,7 +5,7 @@ import { computed, onMounted, shallowRef } from 'vue'
 import { getApiKeys } from '@/api'
 import { useBudgetRollover } from '@/composables/useBudgetRollover'
 import { useRequestState } from '@/composables/useRequestState'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 export function useApiKeysQuery(scope: 'admin' | 'user' = 'admin') {
   const searchQuery = shallowRef('')
